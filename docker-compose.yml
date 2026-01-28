@@ -20,3 +20,15 @@ services:
     ports: ["8001:8001"]
     env_file: .env
     depends_on: [redis]
+    environment:
+          - REGISTRY_URL=http://registry:8002
+
+  registry:  # NEW
+      build:
+        context: .
+        dockerfile: registry/Dockerfile
+      ports:
+        - "8002:8002"
+      env_file: .env
+      depends_on:
+        - redis

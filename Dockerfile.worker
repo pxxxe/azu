@@ -1,0 +1,16 @@
+FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+
+WORKDIR /app
+RUN apt-get update && apt-get install -y git curl
+
+# Install deps
+COPY client/worker/requirements.txt .
+RUN pip install -r requirements.txt
+
+# Copy Code
+COPY . .
+
+# Set python path so it can find 'shared' modules
+ENV PYTHONPATH=/app
+
+CMD ["python", "client/worker/main.py"]

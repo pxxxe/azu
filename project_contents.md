@@ -1,5 +1,20 @@
 # Project: azu.cx
 
+## File: .dockerignore
+
+```plaintext
+.env
+.env.local
+.git
+__pycache__
+*.pem
+*.key
+venv/
+registry_data/
+```
+
+---
+
 ## File: .env
 
 ```plaintext
@@ -16,6 +31,61 @@ SCHEDULER_PRIVATE_KEY=[11,22,33,...]
 # INFRA
 REDIS_HOST=redis
 REDIS_PORT=6379
+```
+
+---
+
+## File: Dockerfile.core
+
+```plaintext
+FROM python:3.10-slim
+
+# Install Redis & System deps
+RUN apt-get update && apt-get install -y redis-server git curl
+
+WORKDIR /app
+
+# Copy Requirements
+COPY registry/requirements.txt reqs_reg.txt
+COPY scheduler/requirements.txt reqs_sched.txt
+COPY api/requirements.txt reqs_api.txt
+RUN pip install -r reqs_reg.txt -r reqs_sched.txt -r reqs_api.txt
+
+# Copy Code
+COPY . .
+
+# Startup Script: Runs Redis, Registry, Scheduler, and API in background
+RUN echo "#!/bin/bash\n\
+redis-server --daemonize yes\n\
+uvicorn registry.main:app --host 0.0.0.0 --port 8002 &\n\
+uvicorn scheduler.main:app --host 0.0.0.0 --port 8001 &\n\
+uvicorn api.main:app --host 0.0.0.0 --port 8000\n\
+" > start.sh && chmod +x start.sh
+
+CMD ["./start.sh"]
+```
+
+---
+
+## File: Dockerfile.worker
+
+```plaintext
+FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+
+WORKDIR /app
+RUN apt-get update && apt-get install -y git curl
+
+# Install deps
+COPY client/worker/requirements.txt .
+RUN pip install -r requirements.txt
+
+# Copy Code
+COPY . .
+
+# Set python path so it can find 'shared' modules
+ENV PYTHONPATH=/app
+
+CMD ["python", "client/worker/main.py"]
 ```
 
 ---
@@ -109,6 +179,29 @@ async def submit(req: JobReq):
     await r.rpush("job_queue", json.dumps(job))
 
     return {"job_id": job_id, "status": "queued", "cost": cost}
+
+@app.get("/results/{job_id}")
+async def get_result(job_id: str):
+    """Poll for job result"""
+    result = await r.get(f"result:{job_id}")
+
+    if not result:
+        # Check if job still in queue
+        return {"status": "processing", "job_id": job_id}
+
+    return json.loads(result)
+
+# ALSO UPDATE handle_result in scheduler/main.py:
+async def handle_result(self, wid, result_data):
+    self.workers[wid]['status'] = "IDLE"
+
+    # Store result in Redis
+    job_id = result_data['job_id']
+    await r.setex(
+        f"result:{job_id}",
+        3600,  # 1 hour TTL
+        json.dumps(result_data)
+    )
 ```
 
 ---
@@ -116,6 +209,13 @@ async def submit(req: JobReq):
 ## File: api/requirements.txt
 
 ```plaintext
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+redis>=5.0.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+solana>=0.30.2
+solders>=0.21.0
 ```
 
 ---
@@ -131,9 +231,8 @@ import os
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solana.rpc.async_api import AsyncClient
-from solana.transaction import Transaction
-from solders.system_program import Transfer, TransferParams
-from solders.message import Message
+from solders.system_program import transfer, TransferParams
+from solders.transaction import Transaction
 
 app = typer.Typer()
 
@@ -158,11 +257,26 @@ def deposit(amount_sol: float):
         print(f"💳 Sending {amount_sol} SOL...")
         lamports = int(amount_sol * 1_000_000_000)
 
-        ix = Transfer(TransferParams(from_pubkey=kp.pubkey(), to_pubkey=PLATFORM_WALLET, lamports=lamports))
-        blockhash = await client.get_latest_blockhash()
-        msg = Message([ix], kp.pubkey())
-        tx = Transaction([kp], msg, blockhash.value.blockhash)
+        # Create transfer instruction using the function, not a class
+        ix = transfer(TransferParams(
+            from_pubkey=kp.pubkey(),
+            to_pubkey=PLATFORM_WALLET,
+            lamports=lamports
+        ))
 
+        # Get latest blockhash
+        blockhash_resp = await client.get_latest_blockhash()
+        blockhash = blockhash_resp.value.blockhash
+
+        # Create and sign transaction
+        tx = Transaction.new_signed_with_payer(
+            [ix],
+            kp.pubkey(),
+            [kp],
+            blockhash
+        )
+
+        # Send transaction
         sig = await client.send_transaction(tx)
         print(f"Tx Sent: {sig.value}")
 
@@ -196,119 +310,426 @@ if __name__ == "__main__":
 
 ---
 
-## File: client/worker/main.py
+## File: client/user/requirements.txt
+
+```plaintext
+typer>=0.9.0
+aiohttp>=3.9.0
+solana>=0.30.2
+solders>=0.21.0
+```
+
+---
+
+## File: client/worker/Dockerfile
+
+```plaintext
+FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY client/worker/requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy shared library
+COPY shared/ ./shared/
+
+# Copy worker code
+COPY client/worker/ ./
+
+# Create cache directory
+RUN mkdir -p /app/layer_cache
+
+CMD ["python", "main.py"]
+```
+
+---
+
+## File: client/worker/layer_loader.py
 
 ```python
-import asyncio
-import json
 import torch
 import aiohttp
 import os
-from transformers import AutoModel, AutoConfig
-from huggingface_hub import login
-from solders.keypair import Keypair
+from pathlib import Path
+from transformers import AutoConfig
+# We need these imports to construct the empty shell on the GPU
+# so we can pour the weights into it.
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
+from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 
-# CONFIG
+class LayerLoader:
+    def __init__(self, registry_url, cache_dir="./layer_cache"):
+        self.registry_url = registry_url
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True, parents=True)
+        self.loaded_layers = {} # RAM Cache
+
+    async def _download(self, url: str, path: Path):
+        """Helper to download a file from Registry to Worker Disk"""
+        if path.exists(): return
+
+        print(f"   ⬇️ Downloading {url}...")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    raise Exception(f"Download failed [{resp.status}]: {url}")
+                data = await resp.read()
+
+                # Atomic write
+                temp = path.with_suffix('.tmp')
+                with open(temp, 'wb') as f: f.write(data)
+                os.rename(temp, path)
+
+    def _get_layer_class(self, config):
+        """Map architecture string to actual PyTorch Class"""
+        arch = config.architectures[0]
+        if "Llama" in arch: return LlamaDecoderLayer
+        if "Qwen" in arch: return Qwen2DecoderLayer
+        if "Mistral" in arch: return MistralDecoderLayer
+        if "GPT2" in arch: return GPT2Block
+        raise ValueError(f"Worker does not support architecture: {arch}")
+
+    async def load_layers(self, model_id: str, layer_indices: list, device="cuda"):
+        """
+        1. Download specific shard (layer_x.pt) from Registry.
+        2. Create empty Transformer Layer on GPU.
+        3. Load weights into it.
+        """
+        # RAM Cache check
+        key = f"{model_id}_{tuple(layer_indices)}"
+        if key in self.loaded_layers: return self.loaded_layers[key]
+
+        print(f"📦 Loading layers {layer_indices} for {model_id}...")
+
+        # 1. Get Config (Tiny JSON file)
+        sanitized = model_id.replace("/", "_")
+        config_path = self.cache_dir / f"{sanitized}_config.json"
+        await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+
+        LayerClass = self._get_layer_class(config)
+        modules = []
+
+        for idx in layer_indices:
+            filename = f"layer_{idx}.pt"
+            path = self.cache_dir / f"{sanitized}_{filename}"
+
+            # 2. Download Weights
+            await self._download(f"{self.registry_url}/layers/{sanitized}/{filename}", path)
+
+            # 3. Create Empty Shell on GPU
+            layer = LayerClass(config, layer_idx=idx).to(device).half()
+
+            # 4. Fill with Weights
+            state_dict = torch.load(path, map_location=device)
+            layer.load_state_dict(state_dict)
+            layer.eval()
+            modules.append(layer)
+
+        self.loaded_layers[key] = modules
+        return modules
+
+    async def load_embeddings(self, model_id: str, device="cuda"):
+        sanitized = model_id.replace("/", "_")
+        path = self.cache_dir / f"{sanitized}_embeddings.pt"
+
+        # Download
+        await self._download(f"{self.registry_url}/layers/{sanitized}/embeddings.pt", path)
+
+        # Load
+        config_path = self.cache_dir / f"{sanitized}_config.json"
+        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+
+        emb = torch.nn.Embedding(config.vocab_size, config.hidden_size).to(device).half()
+        emb.load_state_dict(torch.load(path, map_location=device))
+        emb.eval()
+        return emb
+
+    async def load_lm_head(self, model_id: str, device="cuda"):
+        sanitized = model_id.replace("/", "_")
+        path = self.cache_dir / f"{sanitized}_lm_head.pt"
+
+        # Download
+        await self._download(f"{self.registry_url}/layers/{sanitized}/lm_head.pt", path)
+
+        # Load
+        config_path = self.cache_dir / f"{sanitized}_config.json"
+        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+
+        head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False).to(device).half()
+        head.load_state_dict(torch.load(path, map_location=device))
+        head.eval()
+        return head
+```
+
+---
+
+## File: client/worker/main.py
+
+```python
+import torch
+import asyncio
+import websockets
+import aiohttp
+import json
+import base64
+import io
+import os
+import urllib.request
+from aiohttp import web
+from transformers import AutoTokenizer
+
+from layer_loader import LayerLoader
+
+# Load Env
 SCHEDULER_URL = os.getenv("SCHEDULER_URL", "ws://localhost:8001/ws/worker")
+REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:8002")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
-class GPUWorker:
-    def __init__(self, hf_token):
+class ProductionWorker:
+    def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.hf_token = hf_token
-        self.loaded_models = {}
+        self.loader = LayerLoader(REGISTRY_URL)
+        self.input_queue = asyncio.Queue() # For P2P tensors
 
-        # Load Solana Wallet
-        # Assumes ~/.config/solana/id.json exists
+        # State
+        self.active_layers = []
+        self.embeddings = None
+        self.lm_head = None
+
+        print(f"🚀 Worker Initialized on {self.device}")
+
+    def get_public_ip(self):
+        """Determines external IP for P2P connection"""
         try:
-            with open(os.path.expanduser("~/.config/solana/id.json")) as f:
-                self.keypair = Keypair.from_bytes(bytes(json.load(f)))
+            return urllib.request.urlopen('https://api.ipify.org').read().decode('utf8')
         except:
-            print("No wallet found, generating temp one")
-            self.keypair = Keypair()
+            print("⚠️ Could not resolve Public IP, using localhost")
+            return "127.0.0.1"
 
-        login(token=hf_token)
+    # --- P2P SERVER ---
+    async def start_p2p_server(self, port=8003):
+        app = web.Application()
+        # Accept POST requests with binary tensors
+        app.router.add_post('/tensor_in', self.handle_tensor_ingress)
 
-    async def ensure_model(self, model_id):
-        """Lazy loads model to VRAM"""
-        if model_id not in self.loaded_models:
-            print(f"⬇️ Downloading {model_id}...")
-            # Using device_map="auto" for automatic offloading
-            model = AutoModel.from_pretrained(
-                model_id,
-                token=self.hf_token,
-                device_map="auto",
-                torch_dtype=torch.float16,
-                trust_remote_code=True
-            )
-            self.loaded_models[model_id] = model
-            print(f"✅ Loaded {model_id}")
-        return self.loaded_models[model_id]
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        print(f"👂 P2P Tensor Listener active on port {port}")
 
-    def execute_layer(self, model, input_data, layer_idx=None):
-        # SIMPLIFIED: Running full forward pass for demo
-        # In prod: Slicing logic applies here
-        with torch.no_grad():
-            # Mock input tensor creation from input_data string
-            # Real app: Deserialize tensor bytes
-            inputs = torch.randn(1, 10, 4096).to(self.device).half()
+    async def handle_tensor_ingress(self, request):
+        """Receives tensor from previous worker"""
+        try:
+            # Read binary body directly (more efficient than JSON wrapper for large tensors)
+            data = await request.read()
 
-            # Run
-            if hasattr(model, 'layers'):
-                # Run specific layer
-                out = model.layers[layer_idx](inputs)[0]
+            # If wrapped in JSON/base64 (Scheduler might enforce this format)
+            # Let's support the JSON format used in the test harness
+            try:
+                json_data = await request.json()
+                if 'tensor' in json_data:
+                    tensor_bytes = base64.b64decode(json_data['tensor'])
+                    buffer = io.BytesIO(tensor_bytes)
+                    tensor = torch.load(buffer, map_location=self.device)
+                    await self.input_queue.put(tensor)
+                    return web.Response(text="Accepted")
+            except:
+                pass
+
+            # Fallback: Raw binary
+            buffer = io.BytesIO(data)
+            tensor = torch.load(buffer, map_location=self.device)
+            await self.input_queue.put(tensor)
+            return web.Response(text="Accepted")
+
+        except Exception as e:
+            print(f"❌ Error receiving tensor: {e}")
+            return web.Response(status=500, text=str(e))
+
+    # --- INFERENCE LOGIC ---
+    async def process_job(self, job, ws):
+        job_id = job['id']
+        model_id = job['model']
+        layers = job['assigned_layers']
+        is_first = job.get('is_first', False)
+        is_last = job.get('is_last', False)
+        next_worker_url = job.get('next_worker')
+
+        print(f"⚙️ Processing Job {job_id} | Layers {layers}")
+
+        try:
+            # 1. Load Resources (Real weights from disk/net)
+            # Use the correct method name 'load_layers'
+            self.active_layers = await self.loader.load_layers(model_id, layers, self.device)
+
+            if is_first:
+                self.embeddings = await self.loader.load_embeddings(model_id, self.device)
+            if is_last:
+                self.lm_head = await self.loader.load_lm_head(model_id, self.device)
+
+            # 2. Prepare Input
+            hidden_states = None
+
+            if is_first:
+                # Tokenize (Using HF Tokenizer)
+                prompt = job['input']
+                tokenizer = AutoTokenizer.from_pretrained(model_id, token=HF_TOKEN, trust_remote_code=True)
+                input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
+
+                # Embedding Lookup
+                with torch.no_grad():
+                    hidden_states = self.embeddings(input_ids)
             else:
-                # Fallback for generic models
-                out = model(inputs)[0]
+                # Wait for tensor from P2P
+                print(f"⏳ Waiting for tensor input...")
+                hidden_states = await self.input_queue.get()
+                print("   ✅ Input received")
 
-            return out
+            # 3. Execute Layers
+            # Real Torch Compute
+            with torch.no_grad():
+                # Ensure half precision
+                hidden_states = hidden_states.half()
 
-    async def start(self):
-        async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(SCHEDULER_URL) as ws:
+                for i, layer in enumerate(self.active_layers):
+                    # Transformer layers usually return tuple (hidden_states, ...)
+                    out = layer(hidden_states)
+                    if isinstance(out, tuple):
+                        hidden_states = out[0]
+                    else:
+                        hidden_states = out
 
-                # 1. Register
-                print(f"🔐 Authenticating as {self.keypair.pubkey()}")
-                await ws.send_json({
-                    "type": "REGISTER",
-                    "specs": {
-                        "pubkey": str(self.keypair.pubkey()),
-                        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+            # 4. Handle Output
+            if is_last:
+                # LM Head -> Logits -> Text
+                with torch.no_grad():
+                    logits = self.lm_head(hidden_states)
+                    # Simple Greedy Decode for now
+                    next_token = torch.argmax(logits[:, -1, :], dim=-1)
+
+                    # We need the tokenizer again to decode
+                    # (In efficient systems, we'd cache this or send tokens back)
+                    tokenizer = AutoTokenizer.from_pretrained(model_id, token=HF_TOKEN, trust_remote_code=True)
+                    output_text = tokenizer.decode(next_token)
+
+                # Send Final Result to Scheduler
+                await ws.send(json.dumps({
+                    "type": "RESULT",
+                    "job_id": job_id,
+                    "output": output_text,
+                    "status": "completed"
+                }))
+                print(f"🏁 Job {job_id} Completed. Output: {output_text}")
+
+            else:
+                # Send to Next Worker
+                if not next_worker_url:
+                    raise Exception("Not last worker, but no next_worker_url provided")
+
+                print(f"📤 Sending tensor to {next_worker_url}")
+
+                # Serialize
+                buffer = io.BytesIO()
+                torch.save(hidden_states, buffer)
+                tensor_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.post(next_worker_url, json={"tensor": tensor_b64}) as resp:
+                        if resp.status != 200:
+                            raise Exception(f"Next worker rejected tensor: {resp.status}")
+
+                # Notify Scheduler we are done with our part
+                await ws.send(json.dumps({
+                    "type": "RESULT",
+                    "job_id": job_id,
+                    "status": "partial_complete"
+                }))
+
+        except Exception as e:
+            print(f"❌ Job Execution Failed: {e}")
+            import traceback
+            traceback.print_exc()
+            await ws.send(json.dumps({
+                "type": "RESULT",
+                "job_id": job_id,
+                "status": "failed",
+                "error": str(e)
+            }))
+
+    # --- MAIN LOOP ---
+    async def run(self):
+        # 1. Start P2P
+        p2p_port = 8003
+        await self.start_p2p_server(p2p_port)
+
+        # 2. Connect to Scheduler
+        retry_wait = 2
+        while True:
+            try:
+                print(f"🔌 Connecting to Scheduler: {SCHEDULER_URL}")
+                async with websockets.connect(SCHEDULER_URL) as ws:
+                    print("✅ Connected")
+
+                    # Register
+                    specs = {
+                        "pubkey": "Worker_" + os.urandom(4).hex(), # Mock Pubkey for now
+                        "gpu": torch.cuda.get_device_name(0),
+                        "vram_gb": torch.cuda.get_device_properties(0).total_memory / (1024**3),
+                        "public_ip": self.get_public_ip(),
+                        "p2p_port": p2p_port
                     }
-                })
 
-                # 2. Work Loop
-                async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        data = json.loads(msg.data)
+                    await ws.send(json.dumps({
+                        "type": "REGISTER",
+                        "specs": specs
+                    }))
 
-                        if data['type'] == 'EXECUTE':
-                            job = data['job']
-                            print(f"⚡ Executing Job {job['id']} ({job['model']})")
+                    # Msg Loop
+                    async for msg in ws:
+                        data = json.loads(msg)
+                        if data.get('type') == 'EXECUTE':
+                            # Process in background task to not block heartbeat
+                            asyncio.create_task(self.process_job(data['job'], ws))
 
-                            model = await self.ensure_model(job['model'])
-
-                            # Run Compute
-                            # (Layer 0 assumed for demo)
-                            result = self.execute_layer(model, job['input'], 0)
-
-                            # Reply
-                            await ws.send_json({
-                                "type": "RESULT",
-                                "job_id": job['id'],
-                                "cost": job['cost'], # Echo cost for payment calculation
-                                "status": "success"
-                            })
-
-                        elif data['type'] == 'PAYMENT':
-                            print(f"💰 PAID! {data['amount']} Lamports. Tx: {data['sig']}")
+            except Exception as e:
+                print(f"❌ Connection Lost: {e}")
+                await asyncio.sleep(retry_wait)
+                retry_wait = min(retry_wait * 2, 30)
 
 if __name__ == "__main__":
-    if not HF_TOKEN:
-        print("Set HF_TOKEN env var")
-        exit(1)
-    worker = GPUWorker(HF_TOKEN)
-    asyncio.run(worker.start())
+    worker = ProductionWorker()
+    try:
+        asyncio.run(worker.run())
+    except KeyboardInterrupt:
+        pass
+```
+
+---
+
+## File: client/worker/requirements.txt
+
+```plaintext
+torch>=2.1.0
+transformers>=5.0.0
+huggingface-hub>=1.3.0
+aiohttp>=3.9.0
+solana>=0.30.2
+solders>=0.21.0
+websockets>=12.0
 ```
 
 ---
@@ -423,6 +844,50 @@ generate_file_contents "." "$output_file"
 
 ---
 
+## File: docker-compose.test.yml
+
+```yaml
+version: '3.8'
+
+services:
+  # Simulates the "Core" Pod (Redis + API + Scheduler + Registry)
+  core:
+    build:
+      context: .
+      dockerfile: Dockerfile.core
+    ports:
+      - "8000:8000" # API
+      - "8001:8001" # Scheduler WS
+      - "8002:8002" # Registry
+    environment:
+      - REDIS_HOST=localhost
+      - REDIS_PORT=6379
+      - SOLANA_RPC_URL=https://api.devnet.solana.com
+      - PLATFORM_WALLET_PUBKEY=YourPlatformPublicKeyHere
+      - SCHEDULER_PRIVATE_KEY=[1,2,3] # Mock key
+      - HF_TOKEN=${HF_TOKEN} # Reads from your local shell
+    volumes:
+      # Mount local folder so you don't re-download models every time
+      - ./local_registry_data:/data/layers
+
+  # Simulates a Worker Pod
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    environment:
+      - SCHEDULER_URL=ws://core:8001/ws/worker
+      - REGISTRY_URL=http://core:8002
+      - HF_TOKEN=${HF_TOKEN}
+      # If you have a local GPU, remove this line to use it.
+      # If you are on Mac/No-GPU, PyTorch will fallback to CPU (slow but works for logic checks)
+      - CUDA_VISIBLE_DEVICES=""
+    depends_on:
+      - core
+```
+
+---
+
 ## File: docker-compose.yml
 
 ```yaml
@@ -448,6 +913,622 @@ services:
     ports: ["8001:8001"]
     env_file: .env
     depends_on: [redis]
+    environment:
+          - REGISTRY_URL=http://registry:8002
+
+  registry:  # NEW
+      build:
+        context: .
+        dockerfile: registry/Dockerfile
+      ports:
+        - "8002:8002"
+      env_file: .env
+      depends_on:
+        - redis
+```
+
+---
+
+## File: e2etest.sh
+
+```bash
+#!/bin/bash
+
+# Exit on error
+set -e
+
+# Configuration
+export RUNPOD_API_KEY=rpa_ZKZLYZ29PVCVGNVCDH50GWIWU6T4QA5NBDRUJFH1axwo14
+export HF_TOKEN=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
+DOCKER_USERNAME="pxxxe"  # <--- UPDATE WITH YOUR DOCKER HUB USERNAME
+
+echo "=========================================="
+echo "🚀 AZU.CX E2E Test Suite"
+echo "=========================================="
+
+# Step 1: Build Docker Images
+echo ""
+echo "📦 Step 1: Building Docker Images..."
+echo "------------------------------------------"
+
+echo "Building Core Image..."
+docker build -f Dockerfile.core -t ${DOCKER_USERNAME}/azu-core:latest .
+if [ $? -ne 0 ]; then
+    echo "❌ Core build failed!"
+    exit 1
+fi
+echo "✅ Core image built successfully"
+
+echo ""
+echo "Building Worker Image..."
+docker build -f Dockerfile.worker -t ${DOCKER_USERNAME}/azu-worker:latest .
+if [ $? -ne 0 ]; then
+    echo "❌ Worker build failed!"
+    exit 1
+fi
+echo "✅ Worker image built successfully"
+
+# Step 2: Push Images to Registry
+echo ""
+echo "📤 Step 2: Pushing Images to Docker Hub..."
+echo "------------------------------------------"
+
+echo "Pushing Core Image..."
+docker push ${DOCKER_USERNAME}/azu-core:latest
+if [ $? -ne 0 ]; then
+    echo "❌ Core push failed!"
+    exit 1
+fi
+echo "✅ Core image pushed successfully"
+
+echo ""
+echo "Pushing Worker Image..."
+docker push ${DOCKER_USERNAME}/azu-worker:latest
+if [ $? -ne 0 ]; then
+    echo "❌ Worker push failed!"
+    exit 1
+fi
+echo "✅ Worker image pushed successfully"
+
+# Step 3: Run Infrastructure Test
+echo ""
+echo "🧪 Step 3: Running Infrastructure Test..."
+echo "------------------------------------------"
+echo "⚠️  Make sure to edit infra_test.py with:"
+echo "    - Your Volume ID"
+echo "    - Your Docker Hub username in CORE_IMG and WORKER_IMG"
+echo ""
+echo "Press Enter to continue or Ctrl+C to cancel..."
+read
+
+python3 infra_test.py
+
+echo ""
+echo "=========================================="
+echo "✅ E2E Test Complete!"
+echo "=========================================="
+```
+
+---
+
+## File: infra_test.py
+
+```python
+import runpod
+import time
+import requests
+import os
+import sys
+import json
+import asyncio
+
+# === SOLANA IMPORTS ===
+from solana.rpc.api import Client
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.system_program import transfer, TransferParams
+from solders.transaction import Transaction
+
+# ================= CONFIGURATION =================
+API_KEY = os.getenv("RUNPOD_API_KEY")
+HF_TOKEN = os.getenv("HF_TOKEN")
+NETWORK_VOLUME_ID = "vkv0m5g4ef" # <--- PASTE YOUR VOLUME ID
+DATA_CENTER = "EU-RO-1"
+
+CORE_IMG = "pxxxe/azu-core:latest"     # <--- UPDATE USERNAME
+WORKER_IMG = "pxxxe/azu-worker:latest" # <--- UPDATE USERNAME
+
+RPC_URL = "https://devnet.helius-rpc.com/?api-key=1d7ca6e1-7700-42eb-b086-8183fda42d76"
+# =================================================
+
+runpod.api_key = API_KEY
+
+def get_pod_ip(pod_id):
+    print(f"   ⏳ Waiting for IP on {pod_id}...")
+    for _ in range(30):
+        try:
+            pod = runpod.get_pod(pod_id)
+            if pod['runtime'] and pod['runtime']['public_ip']:
+                return pod['runtime']['public_ip']
+        except: pass
+        time.sleep(4)
+    raise Exception("Pod failed to get IP")
+
+def setup_solana_accounts():
+    """Generates wallets and funds them via Devnet Airdrop"""
+    print("\n💰 0. Setting up Solana Wallets...")
+
+    platform_kp = Keypair()
+    scheduler_kp = Keypair()
+    user_kp = Keypair()
+
+    client = Client(RPC_URL)
+
+    accounts = [("Scheduler", scheduler_kp), ("User", user_kp)]
+
+    for name, kp in accounts:
+        balance = 0
+        retries = 3
+        print(f"   💧 Requesting Airdrop for {name} ({kp.pubkey()})...")
+
+        while retries > 0 and balance == 0:
+            try:
+                # 1 SOL
+                client.request_airdrop(kp.pubkey(), 1_000_000_000)
+                for _ in range(10):
+                    time.sleep(2)
+                    bal_resp = client.get_balance(kp.pubkey())
+                    if bal_resp.value > 0:
+                        balance = bal_resp.value
+                        print(f"      ✅ {name} Funded: {balance / 1e9} SOL")
+                        break
+            except Exception as e:
+                print(f"      ⚠️ Retry ({e})...")
+                time.sleep(2)
+            retries -= 1
+
+        if balance == 0:
+            print(f"❌ Failed to fund {name}. If devnet is down, use a private key from Phantom.")
+            sys.exit(1)
+
+    scheduler_priv = json.dumps(list(bytes(scheduler_kp)))
+
+    return {
+        "platform_pub": str(platform_kp.pubkey()),
+        "scheduler_priv": scheduler_priv,
+        "user_kp": user_kp,
+        "scheduler_pub": str(scheduler_kp.pubkey())
+    }
+
+def run_lifecycle():
+    core_id = None
+    worker_ids = []
+
+    try:
+        # STEP 0: WALLETS
+        wallets = setup_solana_accounts()
+        print(f"   🔑 Platform Pubkey: {wallets['platform_pub']}")
+
+        # STEP 1: CORE
+        print("\n🚀 1. Deploying Core...")
+        core = runpod.create_pod(
+            name="azu-core",
+            image_name=CORE_IMG,
+            gpu_type_id="CPU-Only",
+            cloud_type="COMMUNITY",
+            data_center_id=DATA_CENTER,
+            ports="8000/http,8001/http,8002/http",
+            network_volume_id=NETWORK_VOLUME_ID,
+            volume_mount_path="/data/layers",
+            env={
+                "HF_TOKEN": HF_TOKEN,
+                "REDIS_HOST": "localhost",
+                "REDIS_PORT": "6379",
+                "SOLANA_RPC_URL": RPC_URL,
+                "PLATFORM_WALLET_PUBKEY": wallets['platform_pub'],
+                "SCHEDULER_PRIVATE_KEY": wallets['scheduler_priv']
+            }
+        )
+        core_id = core['id']
+        core_ip = get_pod_ip(core_id)
+        print(f"   ✅ Core Online: {core_ip}")
+
+        # STEP 2: SHARDING
+        print("\n⚡ 2. Sharding Model...")
+        requests.post(f"http://{core_ip}:8002/models/shard", json={"model_id": "Qwen/Qwen2.5-0.5B"})
+        time.sleep(5)
+
+        # STEP 3: WORKERS
+        print("\n🚀 3. Deploying 2 GPU Workers...")
+        for i in range(2):
+            w = runpod.create_pod(
+                name=f"azu-worker-{i}",
+                image_name=WORKER_IMG,
+                gpu_type_id="NVIDIA GeForce RTX 3090",
+                data_center_id=DATA_CENTER,
+                ports="8003/http",
+                env={
+                    "SCHEDULER_URL": f"ws://{core_ip}:8001/ws/worker",
+                    "REGISTRY_URL": f"http://{core_ip}:8002",
+                    "HF_TOKEN": HF_TOKEN
+                }
+            )
+            worker_ids.append(w['id'])
+            print(f"   Worker {i} deployed: {w['id']}")
+
+        print("   ⏳ Waiting for Swarm Assembly (60s)...")
+        time.sleep(60)
+
+        # STEP 4: USER DEPOSIT
+        print("\n💳 4. Simulating User Deposit...")
+
+        user_kp = wallets['user_kp']
+        platform_pub = Pubkey.from_string(wallets['platform_pub'])
+        client = Client(RPC_URL)
+
+        # --- MODERN TRANSACTION CONSTRUCTION ---
+        # 1. Create Instruction using transfer function
+        ix = transfer(TransferParams(
+            from_pubkey=user_kp.pubkey(),
+            to_pubkey=platform_pub,
+            lamports=100_000_000
+        ))
+
+        # 2. Get Blockhash
+        blockhash = client.get_latest_blockhash().value.blockhash
+
+        # 3. Create and Sign Transaction
+        tx = Transaction.new_signed_with_payer(
+            [ix],
+            user_kp.pubkey(),
+            [user_kp],
+            blockhash
+        )
+
+        # 5. Send
+        print("   Sending on-chain deposit transaction...")
+        sig = client.send_transaction(tx).value
+        print(f"   Tx Sent: {sig}")
+        time.sleep(10)
+
+        # Notify API
+        print("   Notifying API of deposit...")
+        res = requests.post(f"http://{core_ip}:8000/deposit", json={
+            "tx_sig": str(sig),
+            "user_pubkey": str(user_kp.pubkey())
+        })
+        print(f"   Deposit Result: {res.json()}")
+
+        # STEP 5: INFERENCE
+        print("\n🧪 5. Running Inference Job...")
+        res = requests.post(f"http://{core_ip}:8000/submit", json={
+            "user_pubkey": str(user_kp.pubkey()),
+            "model_id": "Qwen/Qwen2.5-0.5B",
+            "prompt": "Explain quantum physics in one sentence.",
+            "est_tokens": 50
+        })
+        print(f"   Submission: {res.text}")
+
+        if res.status_code != 200:
+            raise Exception(f"Submission failed: {res.text}")
+
+        job_id = res.json()['job_id']
+
+        print("   Polling results...")
+        for _ in range(30):
+            res = requests.get(f"http://{core_ip}:8000/results/{job_id}")
+            data = res.json()
+            if data.get('status') == 'completed':
+                print(f"\n🎉 SUCCESS: {data['output']}\n")
+                return
+            if data.get('status') == 'failed':
+                print(f"\n❌ JOB FAILED: {data.get('error')}\n")
+                return
+            time.sleep(2)
+
+        raise Exception("Test Timed Out")
+
+    except Exception as e:
+        print(f"\n❌ CRITICAL FAIL: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("\n🧹 Tearing Down...")
+        if core_id: runpod.terminate_pod(core_id)
+        for wid in worker_ids: runpod.terminate_pod(wid)
+
+if __name__ == "__main__":
+    run_lifecycle()
+```
+
+---
+
+## File: registry/Dockerfile
+
+```plaintext
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY registry/requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+# Copy shared library
+COPY shared/ ./shared/
+
+# Copy registry code
+COPY registry/ ./
+
+# Create data directory
+RUN mkdir -p /data/layers
+
+# Expose port
+EXPOSE 8002
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8002"]
+```
+
+---
+
+## File: registry/layer_storage.py
+
+```python
+# registry/layer_storage.py
+import torch
+from transformers import AutoModel, AutoConfig
+from pathlib import Path
+import json
+import os
+
+class LayerStore:
+    def __init__(self, storage_path="/data/layers"):
+        self.storage_path = Path(storage_path)
+        self.storage_path.mkdir(exist_ok=True, parents=True)
+
+    def _find_layers(self, model):
+        """
+        Find the transformer layers in the model.
+        Returns the actual layer list object.
+        """
+        # Try common layer attribute names
+        for attr_path in [
+            'model.layers',           # Llama, Mistral, Qwen
+            'transformer.h',          # GPT-2, GPT-Neo
+            'encoder.layer',          # BERT
+            'decoder.layers',         # T5
+            'h',                      # Some GPT models
+            'layers'                  # Generic
+        ]:
+            try:
+                obj = model
+                for part in attr_path.split('.'):
+                    obj = getattr(obj, part)
+
+                # Verify it's a list/ModuleList of layers
+                if hasattr(obj, '__len__') and len(obj) > 0:
+                    return obj
+            except AttributeError:
+                continue
+
+        raise ValueError(f"Could not find transformer layers in model. Available attributes: {dir(model)}")
+
+    def shard_model(self, model_id: str, hf_token: str):
+        """
+        Download model and extract individual layers.
+        Returns number of layers extracted.
+        """
+        print(f"🔪 Sharding {model_id}...")
+
+        # Load full model temporarily (CPU only to save VRAM)
+        model = AutoModel.from_pretrained(
+            model_id,
+            token=hf_token,
+            torch_dtype=torch.float16,
+            device_map="cpu",
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
+        )
+        config = AutoConfig.from_pretrained(model_id, token=hf_token)
+
+        # Find layer structure
+        layers = self._find_layers(model)
+        num_layers = len(layers)
+
+        # Create storage directory
+        model_dir = self.storage_path / model_id.replace("/", "_")
+        model_dir.mkdir(exist_ok=True, parents=True)
+
+        print(f"Found {num_layers} layers, extracting...")
+
+        # Save each layer separately
+        for i, layer in enumerate(layers):
+            layer_path = model_dir / f"layer_{i}.pt"
+
+            # Save layer weights
+            torch.save(layer.state_dict(), layer_path)
+
+            # Calculate size
+            size_mb = layer_path.stat().st_size / (1024**2)
+
+            # Store metadata
+            metadata = {
+                "model_id": model_id,
+                "layer_idx": i,
+                "size_mb": size_mb,
+                "dtype": "float16",
+                "architecture": config.architectures[0] if hasattr(config, 'architectures') else "unknown"
+            }
+
+            with open(model_dir / f"layer_{i}.json", "w") as f:
+                json.dump(metadata, f, indent=2)
+
+            print(f"  Layer {i}/{num_layers-1}: {size_mb:.1f}MB")
+
+        # Save embeddings separately
+        if hasattr(model, 'get_input_embeddings'):
+            emb = model.get_input_embeddings()
+            torch.save(emb.state_dict(), model_dir / "embeddings.pt")
+            print(f"  Embeddings: {(model_dir / 'embeddings.pt').stat().st_size / (1024**2):.1f}MB")
+
+        # Save LM head if exists
+        if hasattr(model, 'lm_head'):
+            torch.save(model.lm_head.state_dict(), model_dir / "lm_head.pt")
+            print(f"  LM Head: {(model_dir / 'lm_head.pt').stat().st_size / (1024**2):.1f}MB")
+
+        # Save config
+        config.save_pretrained(model_dir)
+
+        # Save layer structure info
+        structure_info = {
+            "model_id": model_id,
+            "num_layers": num_layers,
+            "architecture": config.architectures[0] if hasattr(config, 'architectures') else "unknown",
+            "hidden_size": config.hidden_size if hasattr(config, 'hidden_size') else None,
+            "total_size_mb": sum((model_dir / f"layer_{i}.pt").stat().st_size for i in range(num_layers)) / (1024**2)
+        }
+
+        with open(model_dir / "structure.json", "w") as f:
+            json.dump(structure_info, f, indent=2)
+
+        del model  # Free memory
+        torch.cuda.empty_cache()
+
+        print(f"✅ Sharded {model_id} into {num_layers} layers")
+        return num_layers
+
+    def get_layer_path(self, model_id: str, layer_idx: int):
+        """Get filesystem path to a layer file"""
+        model_dir = self.storage_path / model_id.replace("/", "_")
+        return model_dir / f"layer_{layer_idx}.pt"
+
+    def get_layer_metadata(self, model_id: str, layer_idx: int):
+        """Get metadata for a specific layer"""
+        model_dir = self.storage_path / model_id.replace("/", "_")
+        metadata_path = model_dir / f"layer_{layer_idx}.json"
+
+        if not metadata_path.exists():
+            return None
+
+        with open(metadata_path) as f:
+            return json.load(f)
+
+    def get_model_structure(self, model_id: str):
+        """Get overall model structure info"""
+        model_dir = self.storage_path / model_id.replace("/", "_")
+        structure_path = model_dir / "structure.json"
+
+        if not structure_path.exists():
+            return None
+
+        with open(structure_path) as f:
+            return json.load(f)
+
+    def has_model(self, model_id: str):
+        """Check if model is already sharded"""
+        model_dir = self.storage_path / model_id.replace("/", "_")
+        return (model_dir / "structure.json").exists()
+```
+
+---
+
+## File: registry/main.py
+
+```python
+import redis.asyncio as redis
+from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+import json
+import os
+from shared.config import settings
+from .layer_storage import LayerStore
+
+app = FastAPI()
+r = redis.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, decode_responses=True)
+store = LayerStore()
+
+# ---------------------------------------------------------
+# 1. FILE SERVER (Crucial)
+# This allows the Worker's LayerLoader to download files.
+# e.g., GET http://registry:8002/layers/Qwen_.../layer_0.pt
+# ---------------------------------------------------------
+app.mount("/layers", StaticFiles(directory="/data/layers"), name="layers")
+
+# ---------------------------------------------------------
+# 2. SHARDING ENDPOINT
+# The Orchestrator calls this to make the Registry cut up the model.
+# ---------------------------------------------------------
+class ShardRequest(BaseModel):
+    model_id: str
+
+@app.post("/models/shard")
+async def shard_model(req: ShardRequest):
+    hf_token = settings.HF_TOKEN
+    if not hf_token:
+        raise HTTPException(500, "HF_TOKEN not set on Registry")
+
+    try:
+        # Calls the CPU-safe sharding logic in layer_storage.py
+        num = store.shard_model(req.model_id, hf_token)
+        return {"status": "success", "num_layers": num}
+    except Exception as e:
+        print(f"Sharding Error: {e}")
+        raise HTTPException(500, str(e))
+
+@app.get("/models/{model_id}/info")
+async def get_model_info(model_id: str):
+    """Used by Scheduler to know how many layers a model has"""
+    sanitized = model_id.replace("/", "_")
+    # Check if we have the structure file on disk
+    path = f"/data/layers/{sanitized}/structure.json"
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    raise HTTPException(404, "Model not sharded or found")
+
+# ---------------------------------------------------------
+# 3. WORKER DISCOVERY
+# ---------------------------------------------------------
+@app.post("/workers/register")
+async def register_worker(data: dict):
+    # Store worker metadata in Redis for 5 minutes
+    await r.setex(f"worker_meta:{data['worker_id']}", 300, json.dumps(data))
+    return {"status": "ok"}
+
+@app.post("/workers/query")
+async def query_workers(data: dict):
+    # Simple lookup for now
+    keys = await r.keys("worker_meta:*")
+    workers = []
+    for k in keys:
+        w_data = await r.get(k)
+        if w_data:
+            workers.append(json.loads(w_data))
+    return {"workers": workers}
+```
+
+---
+
+## File: registry/requirements.txt
+
+```plaintext
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+redis>=5.0.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+transformers>=5.0.0
+huggingface-hub>=1.3.0
 ```
 
 ---
@@ -475,10 +1556,23 @@ CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
 ## File: scheduler/main.py
 
 ```python
+"""
+ENHANCED SCHEDULER - Multi-Worker Coordination
+
+Features:
+- Queries registry for worker capabilities
+- Splits jobs across multiple workers
+- Coordinates layer execution
+- Handles tensor passing between workers
+"""
+
 import asyncio
 import json
 import redis.asyncio as redis
+import aiohttp
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from typing import Dict, List, Optional
+from dataclasses import dataclass
 from shared.config import settings
 from shared.economics import calculate_worker_share
 from shared.solana_lib import sign_payout
@@ -486,102 +1580,428 @@ from shared.solana_lib import sign_payout
 app = FastAPI()
 r = redis.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, decode_responses=True)
 
-class Scheduler:
-    def __init__(self):
-        # { worker_id: {ws: WebSocket, specs: dict} }
-        self.workers = {}
+@dataclass
+class WorkerInfo:
+    pubkey: str
+    ws: WebSocket
+    specs: dict
+    status: str  # IDLE, BUSY, OFFLINE
+    assigned_layers: Optional[List[int]] = None
 
-    async def register(self, ws, specs):
+@dataclass
+class JobExecution:
+    job_id: str
+    model_id: str
+    assigned_workers: List[str]  # worker pubkeys
+    layer_splits: Dict[str, List[int]]  # worker_pubkey -> [layer_indices]
+    results: Dict[str, any]  # worker_pubkey -> result
+    status: str  # PENDING, IN_PROGRESS, COMPLETED, FAILED
+
+class EnhancedScheduler:
+    def __init__(self, registry_url: str = "http://registry:8002"):
+        self.workers: Dict[str, WorkerInfo] = {}
+        self.jobs: Dict[str, JobExecution] = {}
+        self.registry_url = registry_url
+
+    async def register(self, ws: WebSocket, specs: dict) -> str:
+        """Register worker with scheduler"""
         wid = specs['pubkey']
-        self.workers[wid] = {"ws": ws, "specs": specs, "status": "IDLE"}
-        print(f"Worker {wid[:8]}.. registered with {specs['gpu']}")
+
+        self.workers[wid] = WorkerInfo(
+            pubkey=wid,
+            ws=ws,
+            specs=specs,
+            status="IDLE"
+        )
+
+        print(f"✅ Worker {wid[:8]}.. registered: {specs.get('gpu', 'unknown')} "
+              f"({specs.get('vram_gb', 0)}GB VRAM)")
+
+        # Also register with registry
+        await self._register_worker_with_registry(wid, specs)
+
         return wid
 
-    async def disconnect(self, wid):
+    async def _register_worker_with_registry(self, worker_id: str, specs: dict):
+        """Inform registry about worker capabilities"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.registry_url}/workers/register",
+                    json={
+                        "worker_id": worker_id,
+                        "vram_gb": specs.get('vram_gb', 0),
+                        "gpu": specs.get('gpu', 'unknown'),
+                        "models": specs.get('models', [])
+                    }
+                ) as resp:
+                    if resp.status == 200:
+                        print(f"  ✅ Worker registered with registry")
+        except Exception as e:
+            print(f"  ⚠️ Registry registration failed: {e}")
+
+    async def disconnect(self, wid: str):
+        """Handle worker disconnect"""
         if wid in self.workers:
-            del self.workers[wid]
+            print(f"Worker {wid[:8]}.. disconnected")
+            self.workers[wid].status = "OFFLINE"
+
+            # Notify registry
+            try:
+                async with aiohttp.ClientSession() as session:
+                    await session.delete(f"{self.registry_url}/workers/{wid}")
+            except:
+                pass
+
+    async def query_available_workers(self, model_id: str, required_layers: int) -> List[Dict]:
+        """Query registry for workers that can handle this model"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.registry_url}/workers/query",
+                    json={
+                        "model_id": model_id,
+                        "required_layers": required_layers
+                    }
+                ) as resp:
+                    if resp.status == 200:
+                        result = await resp.json()
+                        return result.get('workers', [])
+                    else:
+                        print(f"Registry query failed: {resp.status}")
+                        return []
+        except Exception as e:
+            print(f"Registry query error: {e}")
+            return []
+
+    def split_layers_across_workers(self, total_layers: int, workers: List[Dict]) -> Dict[str, List[int]]:
+        """Intelligently split layers across available workers"""
+        if not workers:
+            return {}
+
+        # Sort workers by VRAM capacity
+        sorted_workers = sorted(workers, key=lambda w: w.get('vram_gb', 0), reverse=True)
+
+        # Calculate layer distribution based on VRAM
+        total_vram = sum(w.get('vram_gb', 0) for w in sorted_workers)
+
+        splits = {}
+        current_layer = 0
+
+        for worker in sorted_workers:
+            vram_ratio = worker.get('vram_gb', 0) / total_vram
+            num_layers = int(total_layers * vram_ratio)
+
+            # Ensure at least 1 layer per worker
+            if num_layers == 0:
+                num_layers = 1
+
+            # Don't exceed remaining layers
+            num_layers = min(num_layers, total_layers - current_layer)
+
+            if num_layers > 0:
+                layer_range = list(range(current_layer, current_layer + num_layers))
+                splits[worker['worker_id']] = layer_range
+                current_layer += num_layers
+
+            if current_layer >= total_layers:
+                break
+
+        # Assign remaining layers to last worker
+        if current_layer < total_layers:
+            last_worker = sorted_workers[-1]['worker_id']
+            if last_worker in splits:
+                splits[last_worker].extend(range(current_layer, total_layers))
+
+        return splits
 
     async def dispatch_loop(self):
-        print("Scheduler Dispatch Loop Started")
+        """Main job dispatcher loop"""
+        print("🚀 Scheduler Dispatch Loop Started")
+
         while True:
-            # Pop job from Redis (Blocking)
-            task = await r.blpop("job_queue", timeout=1)
-            if not task: continue
+            try:
+                # Pop job from Redis queue (blocking)
+                task = await r.blpop("job_queue", timeout=1)
+                if not task:
+                    continue
 
-            job = json.loads(task[1])
-            print(f"Processing Job {job['id']}")
+                job = json.loads(task[1])
+                job_id = job['id']
 
-            # Find Idle Worker
-            # (V2: Match model/vram requirements)
-            assigned_wid = None
-            for wid, w_data in self.workers.items():
-                if w_data["status"] == "IDLE":
-                    assigned_wid = wid
-                    break
+                print(f"\n📋 Processing Job {job_id}")
+                print(f"  Model: {job['model']}")
+                print(f"  Prompt: {job['input'][:50]}...")
 
-            if assigned_wid:
-                try:
-                    await self.workers[assigned_wid]['ws'].send_json({
-                        "type": "EXECUTE",
-                        "job": job
-                    })
-                    self.workers[assigned_wid]['status'] = "BUSY"
-                except:
-                    # Retry logic would go here
-                    await r.lpush("job_queue", json.dumps(job))
-            else:
-                # No workers, push back
-                await r.rpush("job_queue", json.dumps(job))
-                await asyncio.sleep(1)
+                # Get model info from registry
+                model_info = await self._get_model_info(job['model'])
+                if not model_info:
+                    print(f"  ❌ Model {job['model']} not found in registry")
+                    await self._fail_job(job_id, "Model not available")
+                    continue
 
-    async def handle_result(self, wid, result_data):
-        self.workers[wid]['status'] = "IDLE"
+                total_layers = model_info.get('num_layers', 0)
+                print(f"  Layers: {total_layers}")
 
-        # Calculate Payment
-        job_cost = result_data.get('cost', 0)
-        worker_pay = calculate_worker_share(job_cost)
+                # Query available workers
+                available = await self.query_available_workers(job['model'], total_layers)
 
-        # Credit Worker in Redis
-        unpaid = await r.incrby(f"worker_bal:{wid}", worker_pay)
+                if not available:
+                    print(f"  ⚠️ No workers available, requeueing...")
+                    await r.rpush("job_queue", json.dumps(job))
+                    await asyncio.sleep(2)
+                    continue
 
-        # Check Payout Threshold
-        from shared.economics import MIN_PAYOUT_THRESHOLD
-        if unpaid >= MIN_PAYOUT_THRESHOLD:
-            print(f"Triggering Payout for {wid}")
-            sig = await sign_payout(wid, unpaid)
-            if sig:
-                await r.set(f"worker_bal:{wid}", 0)
-                await self.workers[wid]['ws'].send_json({
-                    "type": "PAYMENT",
-                    "amount": unpaid,
-                    "sig": sig
+                print(f"  ✅ Found {len(available)} workers")
+
+                # Split layers
+                layer_splits = self.split_layers_across_workers(total_layers, available)
+
+                print(f"  📊 Layer distribution:")
+                for wid, layers in layer_splits.items():
+                    print(f"    {wid[:8]}...: layers {layers[0]}-{layers[-1]} ({len(layers)} total)")
+
+                # Create job execution tracker
+                self.jobs[job_id] = JobExecution(
+                    job_id=job_id,
+                    model_id=job['model'],
+                    assigned_workers=list(layer_splits.keys()),
+                    layer_splits=layer_splits,
+                    results={},
+                    status="IN_PROGRESS"
+                )
+
+                # Dispatch to workers
+                await self._dispatch_to_workers(job, layer_splits)
+
+            except Exception as e:
+                print(f"❌ Dispatch error: {e}")
+                import traceback
+                traceback.print_exc()
+
+    async def _get_model_info(self, model_id: str) -> Optional[Dict]:
+        """Get model information from registry"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{self.registry_url}/models/{model_id}/info") as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+        except:
+            pass
+        return None
+
+    async def _dispatch_to_workers(self, job: dict, layer_splits: Dict[str, List[int]]):
+        """Dispatch job to assigned workers"""
+        job_id = job['id']
+
+        # Send to first worker (they'll coordinate)
+        worker_order = list(layer_splits.keys())
+
+        for i, wid in enumerate(worker_order):
+            if wid not in self.workers:
+                continue
+
+            worker = self.workers[wid]
+
+            try:
+                await worker.ws.send_json({
+                    "type": "EXECUTE",
+                    "job": {
+                        **job,
+                        "assigned_layers": layer_splits[wid],
+                        "is_first": i == 0,
+                        "is_last": i == len(worker_order) - 1,
+                        "next_worker": worker_order[i+1] if i < len(worker_order)-1 else None
+                    }
                 })
 
-coord = Scheduler()
+                worker.status = "BUSY"
+                worker.assigned_layers = layer_splits[wid]
+
+                print(f"  ✅ Dispatched to worker {wid[:8]}...")
+
+            except Exception as e:
+                print(f"  ❌ Failed to dispatch to {wid[:8]}: {e}")
+                await self._fail_job(job_id, f"Worker dispatch failed: {e}")
+
+    async def handle_result(self, wid: str, result_data: dict):
+        """Handle result from worker"""
+        job_id = result_data['job_id']
+
+        if wid not in self.workers:
+            return
+
+        worker = self.workers[wid]
+        worker.status = "IDLE"
+        worker.assigned_layers = None
+
+        print(f"  ✅ Received result from worker {wid[:8]}...")
+
+        if job_id not in self.jobs:
+            print(f"  ⚠️ Job {job_id} not found in tracker")
+            return
+
+        job_exec = self.jobs[job_id]
+        job_exec.results[wid] = result_data
+
+        # Check if all workers completed
+        if len(job_exec.results) == len(job_exec.assigned_workers):
+            print(f"  ✅ All workers completed for job {job_id}")
+
+            # Combine results and store
+            final_output = self._combine_worker_results(job_exec)
+
+            await r.setex(
+                f"result:{job_id}",
+                3600,  # 1 hour TTL
+                json.dumps({
+                    "job_id": job_id,
+                    "status": "completed",
+                    "output": final_output,
+                    "workers": len(job_exec.assigned_workers)
+                })
+            )
+
+            # Pay workers
+            await self._pay_workers(job_exec, result_data.get('cost', 0))
+
+            job_exec.status = "COMPLETED"
+            print(f"  🎉 Job {job_id} completed successfully!")
+
+    def _combine_worker_results(self, job_exec: JobExecution) -> str:
+        """Combine results from multiple workers"""
+        # Last worker has the final output
+        worker_order = sorted(
+            job_exec.layer_splits.keys(),
+            key=lambda w: job_exec.layer_splits[w][-1]
+        )
+
+        last_worker = worker_order[-1]
+
+        if last_worker in job_exec.results:
+            return job_exec.results[last_worker].get('output', '')
+
+        return "Error: No output from workers"
+
+    async def _pay_workers(self, job_exec: JobExecution, total_cost: int):
+        """Distribute payment to workers"""
+        worker_share = calculate_worker_share(total_cost)
+        per_worker = worker_share // len(job_exec.assigned_workers)
+
+        for wid in job_exec.assigned_workers:
+            # Credit worker balance
+            unpaid = await r.incrby(f"worker_bal:{wid}", per_worker)
+
+            print(f"  💰 Credited {wid[:8]}... with {per_worker} lamports (total: {unpaid})")
+
+            # Check payout threshold
+            from shared.economics import MIN_PAYOUT_THRESHOLD
+            if unpaid >= MIN_PAYOUT_THRESHOLD:
+                print(f"  💸 Triggering payout for {wid[:8]}...")
+                sig = await sign_payout(wid, unpaid)
+
+                if sig:
+                    await r.set(f"worker_bal:{wid}", 0)
+
+                    # Notify worker
+                    if wid in self.workers and self.workers[wid].ws:
+                        try:
+                            await self.workers[wid].ws.send_json({
+                                "type": "PAYMENT",
+                                "amount": unpaid,
+                                "sig": sig
+                            })
+                            print(f"    ✅ Payment sent: {sig[:16]}...")
+                        except:
+                            pass
+
+    async def _fail_job(self, job_id: str, reason: str):
+        """Mark job as failed"""
+        await r.setex(
+            f"result:{job_id}",
+            3600,
+            json.dumps({
+                "job_id": job_id,
+                "status": "failed",
+                "error": reason
+            })
+        )
+
+        if job_id in self.jobs:
+            self.jobs[job_id].status = "FAILED"
+
+# Initialize scheduler
+scheduler = EnhancedScheduler()
 
 @app.on_event("startup")
 async def start():
-    asyncio.create_task(coord.dispatch_loop())
+    asyncio.create_task(scheduler.dispatch_loop())
 
 @app.websocket("/ws/worker")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     wid = None
-    try:
-        # 1. Auth Handshake (Simplified)
-        # In prod: Challenge/Response signature verification here
-        data = await ws.receive_json()
-        if data['type'] == 'REGISTER':
-            wid = await coord.register(ws, data['specs'])
 
-        # 2. Loop
+    try:
+        # Auth handshake
+        data = await ws.receive_json()
+
+        if data['type'] == 'REGISTER':
+            wid = await scheduler.register(ws, data['specs'])
+
+        # Message loop
         while True:
             msg = await ws.receive_json()
+
             if msg['type'] == 'RESULT':
-                await coord.handle_result(wid, msg)
+                await scheduler.handle_result(wid, msg)
+
+            elif msg['type'] == 'HEARTBEAT':
+                await ws.send_json({"type": "ACK"})
 
     except WebSocketDisconnect:
-        await coord.disconnect(wid)
+        if wid:
+            await scheduler.disconnect(wid)
+
+@app.get("/jobs/{job_id}/status")
+async def get_job_status(job_id: str):
+    """Get job execution status"""
+    if job_id in scheduler.jobs:
+        job_exec = scheduler.jobs[job_id]
+
+        return {
+            "job_id": job_id,
+            "status": job_exec.status,
+            "assigned_workers": [
+                {
+                    "worker_id": wid,
+                    "layer_range": f"{layers[0]}-{layers[-1]}"
+                }
+                for wid, layers in job_exec.layer_splits.items()
+            ],
+            "completed_workers": len(job_exec.results)
+        }
+
+    # Check Redis for completed job
+    result = await r.get(f"result:{job_id}")
+    if result:
+        return json.loads(result)
+
+    return {"job_id": job_id, "status": "not_found"}
+
+@app.get("/workers")
+async def list_workers():
+    """List connected workers"""
+    return [
+        {
+            "pubkey": w.pubkey,
+            "status": w.status,
+            "gpu": w.specs.get('gpu', 'unknown'),
+            "vram_gb": w.specs.get('vram_gb', 0),
+            "assigned_layers": w.assigned_layers
+        }
+        for w in scheduler.workers.values()
+    ]
 ```
 
 ---
@@ -589,6 +2009,15 @@ async def ws_endpoint(ws: WebSocket):
 ## File: scheduler/requirements.txt
 
 ```plaintext
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+redis>=5.0.0
+websockets>=12.0
+solana>=0.30.2
+solders>=0.21.0
+aiohttp>=3.9.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
 ```
 
 ---
@@ -644,10 +2073,9 @@ def calculate_worker_share(job_cost: int) -> int:
 from solders.pubkey import Pubkey
 from solders.signature import Signature
 from solders.keypair import Keypair
-from solders.system_program import Transfer, TransferParams
-from solders.message import Message
+from solders.system_program import transfer, TransferParams
 from solana.rpc.async_api import AsyncClient
-from solana.transaction import Transaction
+from solders.transaction import Transaction
 from .config import settings
 
 client = AsyncClient(settings.SOLANA_RPC_URL)
@@ -708,16 +2136,27 @@ async def sign_payout(worker_pubkey_str: str, lamports: int) -> str:
     """Sends SOL from Scheduler to Worker"""
     try:
         dest = Pubkey.from_string(worker_pubkey_str)
-        ix = Transfer(TransferParams(
+
+        # Use transfer function instead of Transfer class
+        ix = transfer(TransferParams(
             from_pubkey=scheduler_keypair.pubkey(),
             to_pubkey=dest,
             lamports=lamports
         ))
 
-        blockhash = await client.get_latest_blockhash()
-        msg = Message([ix], scheduler_keypair.pubkey())
-        tx = Transaction([scheduler_keypair], msg, blockhash.value.blockhash)
+        # Get latest blockhash
+        blockhash_resp = await client.get_latest_blockhash()
+        blockhash = blockhash_resp.value.blockhash
 
+        # Create and sign transaction
+        tx = Transaction.new_signed_with_payer(
+            [ix],
+            scheduler_keypair.pubkey(),
+            [scheduler_keypair],
+            blockhash
+        )
+
+        # Send transaction
         resp = await client.send_transaction(tx)
         return str(resp.value)
     except Exception as e:

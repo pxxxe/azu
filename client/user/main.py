@@ -6,9 +6,8 @@ import os
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solana.rpc.async_api import AsyncClient
-from solana.transaction import Transaction
-from solders.system_program import Transfer, TransferParams
-from solders.message import Message
+from solders.system_program import transfer, TransferParams
+from solders.transaction import Transaction
 
 app = typer.Typer()
 
@@ -33,11 +32,26 @@ def deposit(amount_sol: float):
         print(f"💳 Sending {amount_sol} SOL...")
         lamports = int(amount_sol * 1_000_000_000)
 
-        ix = Transfer(TransferParams(from_pubkey=kp.pubkey(), to_pubkey=PLATFORM_WALLET, lamports=lamports))
-        blockhash = await client.get_latest_blockhash()
-        msg = Message([ix], kp.pubkey())
-        tx = Transaction([kp], msg, blockhash.value.blockhash)
+        # Create transfer instruction using the function, not a class
+        ix = transfer(TransferParams(
+            from_pubkey=kp.pubkey(),
+            to_pubkey=PLATFORM_WALLET,
+            lamports=lamports
+        ))
 
+        # Get latest blockhash
+        blockhash_resp = await client.get_latest_blockhash()
+        blockhash = blockhash_resp.value.blockhash
+
+        # Create and sign transaction
+        tx = Transaction.new_signed_with_payer(
+            [ix],
+            kp.pubkey(),
+            [kp],
+            blockhash
+        )
+
+        # Send transaction
         sig = await client.send_transaction(tx)
         print(f"Tx Sent: {sig.value}")
 

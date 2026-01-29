@@ -4,8 +4,6 @@
 set -e
 
 # Configuration
-export RUNPOD_API_KEY=rpa_ZKZLYZ29PVCVGNVCDH50GWIWU6T4QA5NBDRUJFH1axwo14
-export HF_TOKEN=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
 DOCKER_USERNAME="pxxxe"
 
 echo "=========================================="

@@ -1,16 +1,27 @@
-FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+# CHANGE FROM 2.1.0 TO 2.2.0
+FROM pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
 
 WORKDIR /app
-RUN apt-get update && apt-get install -y git curl
 
-# Install deps
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
 COPY client/worker/requirements.txt .
-RUN pip install -r requirements.txt
 
-# Copy Code
-COPY . .
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Set python path so it can find 'shared' modules
-ENV PYTHONPATH=/app
+# Copy shared library
+COPY shared/ ./shared/
 
-CMD ["python", "client/worker/main.py"]
+# Copy worker code
+COPY client/worker/ ./
+
+# Create cache directory
+RUN mkdir -p /app/layer_cache
+
+CMD ["python", "main.py"]

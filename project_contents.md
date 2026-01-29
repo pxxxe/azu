@@ -45,16 +45,20 @@ RUN apt-get update && apt-get install -y redis-server git curl
 
 WORKDIR /app
 
-# Copy Requirements
 COPY registry/requirements.txt reqs_reg.txt
 COPY scheduler/requirements.txt reqs_sched.txt
 COPY api/requirements.txt reqs_api.txt
-RUN pip install -r reqs_reg.txt -r reqs_sched.txt -r reqs_api.txt
 
-# Copy Code
+# --- FIX IS HERE ---
+# 1. Install CPU-only Torch first (avoids downloading 4GB of CUDA libs)
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+# 2. Then install the rest (pip will see torch is already installed and skip the huge download)
+RUN pip install --no-cache-dir -r reqs_reg.txt -r reqs_sched.txt -r reqs_api.txt
+
 COPY . .
 
-# Startup Script: Runs Redis, Registry, Scheduler, and API in background
+# Startup Script
 RUN echo "#!/bin/bash\n\
 redis-server --daemonize yes\n\
 uvicorn registry.main:app --host 0.0.0.0 --port 8002 &\n\
@@ -216,120 +220,6 @@ pydantic>=2.5.0
 pydantic-settings>=2.1.0
 solana>=0.30.2
 solders>=0.21.0
-```
-
----
-
-## File: check_funded_account.py
-
-```python
-#!/usr/bin/env python3
-"""
-Quick test to verify your funded account is set up correctly
-Run this BEFORE running the full infra_test.py
-"""
-
-import json
-import os
-import sys
-
-try:
-    from solders.keypair import Keypair
-    from solana.rpc.api import Client
-except ImportError:
-    print("❌ Missing dependencies. Install with:")
-    print("   pip install solana solders")
-    sys.exit(1)
-
-RPC_URL = "https://devnet.helius-rpc.com/?api-key=1d7ca6e1-7700-42eb-b086-8183fda42d76"
-
-def load_funded_account():
-    """Try to load funded account from various sources"""
-
-    # Try environment variable
-    if os.getenv("FUNDED_ACCOUNT_KEY"):
-        print("📂 Checking FUNDED_ACCOUNT_KEY env var...")
-        try:
-            key_bytes = json.loads(os.getenv("FUNDED_ACCOUNT_KEY"))
-            kp = Keypair.from_bytes(bytes(key_bytes))
-            print(f"   ✅ Loaded from env var")
-            return kp
-        except Exception as e:
-            print(f"   ❌ Invalid format: {e}")
-
-    # Try funded_account.json file
-    if os.path.exists("funded_account.json"):
-        print("📂 Checking funded_account.json...")
-        try:
-            with open("funded_account.json") as f:
-                key_bytes = json.load(f)
-                kp = Keypair.from_bytes(bytes(key_bytes))
-                print(f"   ✅ Loaded from file")
-                return kp
-        except Exception as e:
-            print(f"   ❌ Invalid file: {e}")
-
-    # Try Solana CLI wallet
-    solana_config = os.path.expanduser("~/.config/solana/id.json")
-    if os.path.exists(solana_config):
-        print("📂 Checking Solana CLI wallet...")
-        try:
-            with open(solana_config) as f:
-                key_bytes = json.load(f)
-                kp = Keypair.from_bytes(bytes(key_bytes))
-                print(f"   ✅ Loaded from Solana CLI")
-                return kp
-        except Exception as e:
-            print(f"   ❌ Invalid wallet: {e}")
-
-    return None
-
-def main():
-    print("=" * 50)
-    print("🧪 Funded Account Check")
-    print("=" * 50)
-    print()
-
-    # Try to load account
-    kp = load_funded_account()
-
-    if not kp:
-        print("\n❌ FAILED: No funded account found!")
-        print("\nPlease create funded_account.json with your private key:")
-        print('   echo \'[11,22,33,...]\' > funded_account.json')
-        print("\nOR set environment variable:")
-        print('   export FUNDED_ACCOUNT_KEY=\'[11,22,33,...]\'')
-        print("\nOR use Solana CLI wallet at ~/.config/solana/id.json")
-        sys.exit(1)
-
-    # Check balance
-    print(f"\n🔑 Pubkey: {kp.pubkey()}")
-    print("💰 Checking balance on devnet...")
-
-    try:
-        client = Client(RPC_URL)
-        balance_lamports = client.get_balance(kp.pubkey()).value
-        balance_sol = balance_lamports / 1_000_000_000
-
-        print(f"   Balance: {balance_sol} SOL")
-
-        if balance_sol < 0.2:
-            print("\n⚠️  WARNING: Low balance!")
-            print(f"   You need at least 0.2 SOL to run the test")
-            print(f"   Current: {balance_sol} SOL")
-            sys.exit(1)
-
-        print("\n✅ All good! You can run infra_test.py now")
-        print(f"   Sufficient balance: {balance_sol} SOL")
-        print(f"   Test will use: ~0.2 SOL")
-        print(f"   Remaining after: ~{balance_sol - 0.2} SOL")
-
-    except Exception as e:
-        print(f"\n❌ Failed to check balance: {e}")
-        sys.exit(1)
-
-if __name__ == "__main__":
-    main()
 ```
 
 ---
@@ -1032,18 +922,12 @@ from solders.transaction import Transaction
 # ================= CONFIGURATION =================
 API_KEY = os.getenv("RUNPOD_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
-NETWORK_VOLUME_ID = "vkv0m5g4ef" # <--- PASTE YOUR VOLUME ID
-DATA_CENTER = "EU-RO-1"
 
+# NOTE: Volume ID is removed to allow deployment to ANY region with stock
 CORE_IMG = "pxxxe/azu-core:latest"     # <--- UPDATE USERNAME
 WORKER_IMG = "pxxxe/azu-worker:latest" # <--- UPDATE USERNAME
 
 RPC_URL = "https://devnet.helius-rpc.com/?api-key=1d7ca6e1-7700-42eb-b086-8183fda42d76"
-
-# Your funded devnet account (5 SOL)
-# Put your private key JSON array here or in a file
-
-# Amount to distribute to each wallet (in SOL)
 DISTRIBUTION_AMOUNT = 0.1
 # =================================================
 
@@ -1052,82 +936,105 @@ runpod.api_key = API_KEY
 def load_funded_account():
     """Load your funded devnet account keypair"""
     global FUNDED_ACCOUNT_KEY
-
-    # Option 1: Load from environment variable
     if os.getenv("FUNDED_ACCOUNT_KEY"):
         secret = os.getenv("FUNDED_ACCOUNT_KEY", "")
-        FUNDED_ACCOUNT_KEY = Keypair.from_base58_string(secret)
-        print(f"   ✅ Loaded funded account from base58 env: {FUNDED_ACCOUNT_KEY.pubkey()}")
-        return FUNDED_ACCOUNT_KEY
+        try:
+            return Keypair.from_base58_string(secret)
+        except:
+            return Keypair.from_bytes(bytes(json.loads(secret)))
 
-    # Option 2: Load from file (funded_account.json)
     if os.path.exists("funded_account.json"):
         with open("funded_account.json") as f:
-            key_bytes = json.load(f)
-            FUNDED_ACCOUNT_KEY = Keypair.from_bytes(bytes(key_bytes))
-            print(f"   ✅ Loaded funded account from file: {FUNDED_ACCOUNT_KEY.pubkey()}")
-            return FUNDED_ACCOUNT_KEY
+            return Keypair.from_bytes(bytes(json.load(f)))
 
-    # Option 3: Load from Solana CLI default wallet
     solana_config = os.path.expanduser("~/.config/solana/id.json")
     if os.path.exists(solana_config):
         with open(solana_config) as f:
-            key_bytes = json.load(f)
-            FUNDED_ACCOUNT_KEY = Keypair.from_bytes(bytes(key_bytes))
-            print(f"   ✅ Loaded funded account from Solana CLI: {FUNDED_ACCOUNT_KEY.pubkey()}")
-            return FUNDED_ACCOUNT_KEY
+            return Keypair.from_bytes(bytes(json.load(f)))
 
     print("❌ ERROR: No funded account found!")
-    print("   Please create funded_account.json with your private key JSON array")
-    print("   OR set FUNDED_ACCOUNT_KEY environment variable")
-    print("   OR place your key in ~/.config/solana/id.json")
     sys.exit(1)
 
-def get_pod_ip(pod_id):
-    print(f"   ⏳ Waiting for IP on {pod_id}...")
-    for _ in range(30):
+def get_pod_connection_info(pod_id, target_internal_port):
+    """
+    Waits for pod to run and returns the actual Public IP and Public Port
+    mapped to the requested internal port (Handles Community Cloud NAT).
+    """
+    print(f"   ⏳ Waiting for connection info on {pod_id} (internal port {target_internal_port})...")
+
+    for i in range(60): # Wait up to 10 mins
         try:
             pod = runpod.get_pod(pod_id)
-            if pod['runtime'] and pod['runtime']['public_ip']:
-                return pod['runtime']['public_ip']
-        except: pass
-        time.sleep(4)
-    raise Exception("Pod failed to get IP")
+            runtime = pod.get('runtime')
+
+            if runtime:
+                # 1. Get Port Mapping
+                ports = runtime.get('ports', [])
+                found_port = None
+                found_ip = runtime.get('publicIp') or runtime.get('public_ip')
+
+                for p in ports:
+                    if p['privatePort'] == target_internal_port:
+                        found_port = p['publicPort']
+                        # CRITICAL FIX: Grab IP from port object if missing from root
+                        if not found_ip:
+                            found_ip = p.get('ip')
+                        break
+
+                if found_ip and found_port:
+                    print(f"      ✅ Connection found: {found_ip}:{found_port} -> {target_internal_port}")
+                    return found_ip, found_port
+
+            # Debug status if waiting
+            status = pod.get('lastStatus') or pod.get('status') or "Unknown"
+            if i % 3 == 0:
+                print(f"      [{i}/60] Status: {status}...")
+
+        except Exception as e:
+            print(f"      ⚠️ API Polling Error: {e}")
+
+        time.sleep(10)
+
+    print("❌ DUMPING POD DATA FOR DEBUGGING:")
+    try:
+        print(json.dumps(runpod.get_pod(pod_id), indent=2))
+    except:
+        pass
+    raise Exception(f"Pod {pod_id} failed to come online or expose ports.")
+
+def wait_for_http(url, name="Service", retries=30):
+    """Waits for the HTTP service inside the pod to actually start"""
+    print(f"   ⏳ Waiting for {name} to be healthy at {url}...")
+    for i in range(retries):
+        try:
+            # We just check if it connects, even if it returns 404/405 it's "up"
+            requests.get(url, timeout=5)
+            print(f"      ✅ {name} is responding!")
+            return True
+        except:
+            if i % 5 == 0:
+                print(f"      [{i}/{retries}] Service starting...")
+            time.sleep(5)
+    print(f"      ⚠️ {name} did not start in time. Check Pod Logs.")
+    return False
 
 def distribute_sol(funder_kp, recipient_pubkey, amount_sol, client):
     """Transfer SOL from funder to recipient"""
     try:
         lamports = int(amount_sol * 1_000_000_000)
-
-        # Create transfer instruction
-        ix = transfer(TransferParams(
-            from_pubkey=funder_kp.pubkey(),
-            to_pubkey=recipient_pubkey,
-            lamports=lamports
-        ))
-
-        # Get latest blockhash
+        ix = transfer(TransferParams(from_pubkey=funder_kp.pubkey(), to_pubkey=recipient_pubkey, lamports=lamports))
         blockhash = client.get_latest_blockhash().value.blockhash
+        tx = Transaction.new_signed_with_payer([ix], funder_kp.pubkey(), [funder_kp], blockhash)
 
-        # Create and sign transaction
-        tx = Transaction.new_signed_with_payer(
-            [ix],
-            funder_kp.pubkey(),
-            [funder_kp],
-            blockhash
-        )
-
-        # Send transaction
         sig = client.send_transaction(tx).value
         print(f"      📤 Transfer sent: {sig}")
 
-        # Wait for confirmation
-        time.sleep(2)
+        # INCREASED WAIT TIME FOR CONFIRMATION
+        print("      ⏳ Waiting for confirmation...")
+        time.sleep(10)
 
-        # Verify balance
         balance = client.get_balance(recipient_pubkey).value
         print(f"      ✅ Recipient balance: {balance / 1e9} SOL")
-
         return True
     except Exception as e:
         print(f"      ❌ Transfer failed: {e}")
@@ -1136,45 +1043,34 @@ def distribute_sol(funder_kp, recipient_pubkey, amount_sol, client):
 def setup_solana_accounts():
     """Generates wallets and funds them from your funded account"""
     print("\n💰 0. Setting up Solana Wallets...")
-
-    # Load your funded account
     funder_kp = load_funded_account()
-
-    # Check funder balance
     client = Client(RPC_URL)
+
     funder_balance = client.get_balance(funder_kp.pubkey()).value / 1e9
     print(f"   💵 Funder balance: {funder_balance} SOL")
 
-    needed_sol = DISTRIBUTION_AMOUNT * 2  # scheduler + user
+    needed_sol = DISTRIBUTION_AMOUNT * 2
     if funder_balance < needed_sol:
         print(f"❌ Insufficient funds! Need {needed_sol} SOL, have {funder_balance} SOL")
         sys.exit(1)
 
-    # Generate new keypairs
     platform_kp = Keypair()
     scheduler_kp = Keypair()
     user_kp = Keypair()
 
-    print(f"   🔑 Platform: {platform_kp.pubkey()} (no funding needed)")
+    print(f"   🔑 Platform: {platform_kp.pubkey()}")
     print(f"   🔑 Scheduler: {scheduler_kp.pubkey()}")
     print(f"   🔑 User: {user_kp.pubkey()}")
 
-    # Fund scheduler
     print(f"\n   💸 Distributing {DISTRIBUTION_AMOUNT} SOL to Scheduler...")
     if not distribute_sol(funder_kp, scheduler_kp.pubkey(), DISTRIBUTION_AMOUNT, client):
         sys.exit(1)
 
-    # Fund user
     print(f"\n   💸 Distributing {DISTRIBUTION_AMOUNT} SOL to User...")
     if not distribute_sol(funder_kp, user_kp.pubkey(), DISTRIBUTION_AMOUNT, client):
         sys.exit(1)
 
     scheduler_priv = json.dumps(list(bytes(scheduler_kp)))
-
-    # Check remaining funder balance
-    remaining = client.get_balance(funder_kp.pubkey()).value / 1e9
-    print(f"\n   💰 Remaining funder balance: {remaining} SOL")
-
     return {
         "platform_pub": str(platform_kp.pubkey()),
         "scheduler_priv": scheduler_priv,
@@ -1189,19 +1085,15 @@ def run_lifecycle():
     try:
         # STEP 0: WALLETS
         wallets = setup_solana_accounts()
-        print(f"   🔑 Platform Pubkey: {wallets['platform_pub']}")
 
         # STEP 1: CORE
         print("\n🚀 1. Deploying Core...")
         core = runpod.create_pod(
             name="azu-core",
             image_name=CORE_IMG,
-            gpu_type_id="NVIDIA GeForce RTX 4090",
-            cloud_type="SECURE",
-            data_center_id=DATA_CENTER,
+            gpu_type_id="NVIDIA GeForce RTX 5090",
+            cloud_type="COMMUNITY",
             ports="8000/http,8001/http,8002/http",
-            network_volume_id=NETWORK_VOLUME_ID,
-            volume_mount_path="/data/layers",
             env={
                 "HF_TOKEN": HF_TOKEN,
                 "REDIS_HOST": "localhost",
@@ -1212,13 +1104,30 @@ def run_lifecycle():
             }
         )
         core_id = core['id']
-        core_ip = get_pod_ip(core_id)
-        print(f"   ✅ Core Online: {core_ip}")
+
+        # GET CONNECTION INFO
+        core_ip, api_port = get_pod_connection_info(core_id, 8000)
+        _, sched_port = get_pod_connection_info(core_id, 8001)
+        _, reg_port = get_pod_connection_info(core_id, 8002)
+
+        api_url = f"http://{core_ip}:{api_port}"
+        reg_url = f"http://{core_ip}:{reg_port}"
+        sched_url = f"ws://{core_ip}:{sched_port}/ws/worker"
+
+        print(f"   ✅ Core API: {api_url}")
+        print(f"   ✅ Registry: {reg_url}")
+
+        # WAIT FOR SERVER TO START (Install dependencies takes time!)
+        wait_for_http(f"{reg_url}/docs", "Registry")
 
         # STEP 2: SHARDING
         print("\n⚡ 2. Sharding Model...")
-        requests.post(f"http://{core_ip}:8002/models/shard", json={"model_id": "Qwen/Qwen2.5-0.5B"})
-        time.sleep(5)
+        try:
+            requests.post(f"{reg_url}/models/shard", json={"model_id": "Qwen/Qwen2.5-0.5B"}, timeout=60)
+        except Exception as e:
+            print(f"   ⚠️ Sharding request info: {e}")
+
+        time.sleep(10)
 
         # STEP 3: WORKERS
         print("\n🚀 3. Deploying 2 GPU Workers...")
@@ -1226,12 +1135,12 @@ def run_lifecycle():
             w = runpod.create_pod(
                 name=f"azu-worker-{i}",
                 image_name=WORKER_IMG,
-                gpu_type_id="NVIDIA GeForce RTX 4090",
-                data_center_id=DATA_CENTER,
+                gpu_type_id="NVIDIA GeForce RTX 5090",
+                cloud_type="COMMUNITY",
                 ports="8003/http",
                 env={
-                    "SCHEDULER_URL": f"ws://{core_ip}:8001/ws/worker",
-                    "REGISTRY_URL": f"http://{core_ip}:8002",
+                    "SCHEDULER_URL": sched_url,
+                    "REGISTRY_URL": reg_url,
                     "HF_TOKEN": HF_TOKEN
                 }
             )
@@ -1243,39 +1152,22 @@ def run_lifecycle():
 
         # STEP 4: USER DEPOSIT
         print("\n💳 4. Simulating User Deposit...")
-
         user_kp = wallets['user_kp']
         platform_pub = Pubkey.from_string(wallets['platform_pub'])
         client = Client(RPC_URL)
 
-        # --- MODERN TRANSACTION CONSTRUCTION ---
-        # 1. Create Instruction using transfer function
-        ix = transfer(TransferParams(
-            from_pubkey=user_kp.pubkey(),
-            to_pubkey=platform_pub,
-            lamports=100_000_000
-        ))
-
-        # 2. Get Blockhash
+        ix = transfer(TransferParams(from_pubkey=user_kp.pubkey(), to_pubkey=platform_pub, lamports=100_000_000))
         blockhash = client.get_latest_blockhash().value.blockhash
+        tx = Transaction.new_signed_with_payer([ix], user_kp.pubkey(), [user_kp], blockhash)
 
-        # 3. Create and Sign Transaction
-        tx = Transaction.new_signed_with_payer(
-            [ix],
-            user_kp.pubkey(),
-            [user_kp],
-            blockhash
-        )
-
-        # 5. Send
         print("   Sending on-chain deposit transaction...")
         sig = client.send_transaction(tx).value
         print(f"   Tx Sent: {sig}")
         time.sleep(10)
 
-        # Notify API
         print("   Notifying API of deposit...")
-        res = requests.post(f"http://{core_ip}:8000/deposit", json={
+        wait_for_http(f"{api_url}/docs", "API") # Ensure API is up before calling
+        res = requests.post(f"{api_url}/deposit", json={
             "tx_sig": str(sig),
             "user_pubkey": str(user_kp.pubkey())
         })
@@ -1283,7 +1175,7 @@ def run_lifecycle():
 
         # STEP 5: INFERENCE
         print("\n🧪 5. Running Inference Job...")
-        res = requests.post(f"http://{core_ip}:8000/submit", json={
+        res = requests.post(f"{api_url}/submit", json={
             "user_pubkey": str(user_kp.pubkey()),
             "model_id": "Qwen/Qwen2.5-0.5B",
             "prompt": "Explain quantum physics in one sentence.",
@@ -1295,10 +1187,9 @@ def run_lifecycle():
             raise Exception(f"Submission failed: {res.text}")
 
         job_id = res.json()['job_id']
-
         print("   Polling results...")
         for _ in range(30):
-            res = requests.get(f"http://{core_ip}:8000/results/{job_id}")
+            res = requests.get(f"{api_url}/results/{job_id}")
             data = res.json()
             if data.get('status') == 'completed':
                 print(f"\n🎉 SUCCESS: {data['output']}\n")
@@ -1307,7 +1198,6 @@ def run_lifecycle():
                 print(f"\n❌ JOB FAILED: {data.get('error')}\n")
                 return
             time.sleep(2)
-
         raise Exception("Test Timed Out")
 
     except Exception as e:
@@ -1609,8 +1499,9 @@ uvicorn[standard]>=0.30.0
 redis>=5.0.0
 pydantic>=2.5.0
 pydantic-settings>=2.1.0
-transformers>=5.0.0
-huggingface-hub>=1.3.0
+transformers>=4.36.0
+huggingface-hub>=0.19.0
+accelerate>=0.25.0
 ```
 
 ---

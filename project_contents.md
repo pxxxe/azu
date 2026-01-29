@@ -220,6 +220,120 @@ solders>=0.21.0
 
 ---
 
+## File: check_funded_account.py
+
+```python
+#!/usr/bin/env python3
+"""
+Quick test to verify your funded account is set up correctly
+Run this BEFORE running the full infra_test.py
+"""
+
+import json
+import os
+import sys
+
+try:
+    from solders.keypair import Keypair
+    from solana.rpc.api import Client
+except ImportError:
+    print("❌ Missing dependencies. Install with:")
+    print("   pip install solana solders")
+    sys.exit(1)
+
+RPC_URL = "https://devnet.helius-rpc.com/?api-key=1d7ca6e1-7700-42eb-b086-8183fda42d76"
+
+def load_funded_account():
+    """Try to load funded account from various sources"""
+
+    # Try environment variable
+    if os.getenv("FUNDED_ACCOUNT_KEY"):
+        print("📂 Checking FUNDED_ACCOUNT_KEY env var...")
+        try:
+            key_bytes = json.loads(os.getenv("FUNDED_ACCOUNT_KEY"))
+            kp = Keypair.from_bytes(bytes(key_bytes))
+            print(f"   ✅ Loaded from env var")
+            return kp
+        except Exception as e:
+            print(f"   ❌ Invalid format: {e}")
+
+    # Try funded_account.json file
+    if os.path.exists("funded_account.json"):
+        print("📂 Checking funded_account.json...")
+        try:
+            with open("funded_account.json") as f:
+                key_bytes = json.load(f)
+                kp = Keypair.from_bytes(bytes(key_bytes))
+                print(f"   ✅ Loaded from file")
+                return kp
+        except Exception as e:
+            print(f"   ❌ Invalid file: {e}")
+
+    # Try Solana CLI wallet
+    solana_config = os.path.expanduser("~/.config/solana/id.json")
+    if os.path.exists(solana_config):
+        print("📂 Checking Solana CLI wallet...")
+        try:
+            with open(solana_config) as f:
+                key_bytes = json.load(f)
+                kp = Keypair.from_bytes(bytes(key_bytes))
+                print(f"   ✅ Loaded from Solana CLI")
+                return kp
+        except Exception as e:
+            print(f"   ❌ Invalid wallet: {e}")
+
+    return None
+
+def main():
+    print("=" * 50)
+    print("🧪 Funded Account Check")
+    print("=" * 50)
+    print()
+
+    # Try to load account
+    kp = load_funded_account()
+
+    if not kp:
+        print("\n❌ FAILED: No funded account found!")
+        print("\nPlease create funded_account.json with your private key:")
+        print('   echo \'[11,22,33,...]\' > funded_account.json')
+        print("\nOR set environment variable:")
+        print('   export FUNDED_ACCOUNT_KEY=\'[11,22,33,...]\'')
+        print("\nOR use Solana CLI wallet at ~/.config/solana/id.json")
+        sys.exit(1)
+
+    # Check balance
+    print(f"\n🔑 Pubkey: {kp.pubkey()}")
+    print("💰 Checking balance on devnet...")
+
+    try:
+        client = Client(RPC_URL)
+        balance_lamports = client.get_balance(kp.pubkey()).value
+        balance_sol = balance_lamports / 1_000_000_000
+
+        print(f"   Balance: {balance_sol} SOL")
+
+        if balance_sol < 0.2:
+            print("\n⚠️  WARNING: Low balance!")
+            print(f"   You need at least 0.2 SOL to run the test")
+            print(f"   Current: {balance_sol} SOL")
+            sys.exit(1)
+
+        print("\n✅ All good! You can run infra_test.py now")
+        print(f"   Sufficient balance: {balance_sol} SOL")
+        print(f"   Test will use: ~0.2 SOL")
+        print(f"   Remaining after: ~{balance_sol - 0.2} SOL")
+
+    except Exception as e:
+        print(f"\n❌ Failed to check balance: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
 ## File: client/user/main.py
 
 ```python
@@ -844,91 +958,6 @@ generate_file_contents "." "$output_file"
 
 ---
 
-## File: docker-compose.test.yml
-
-```yaml
-version: '3.8'
-
-services:
-  # Simulates the "Core" Pod (Redis + API + Scheduler + Registry)
-  core:
-    build:
-      context: .
-      dockerfile: Dockerfile.core
-    ports:
-      - "8000:8000" # API
-      - "8001:8001" # Scheduler WS
-      - "8002:8002" # Registry
-    environment:
-      - REDIS_HOST=localhost
-      - REDIS_PORT=6379
-      - SOLANA_RPC_URL=https://api.devnet.solana.com
-      - PLATFORM_WALLET_PUBKEY=YourPlatformPublicKeyHere
-      - SCHEDULER_PRIVATE_KEY=[1,2,3] # Mock key
-      - HF_TOKEN=${HF_TOKEN} # Reads from your local shell
-    volumes:
-      # Mount local folder so you don't re-download models every time
-      - ./local_registry_data:/data/layers
-
-  # Simulates a Worker Pod
-  worker:
-    build:
-      context: .
-      dockerfile: Dockerfile.worker
-    environment:
-      - SCHEDULER_URL=ws://core:8001/ws/worker
-      - REGISTRY_URL=http://core:8002
-      - HF_TOKEN=${HF_TOKEN}
-      # If you have a local GPU, remove this line to use it.
-      # If you are on Mac/No-GPU, PyTorch will fallback to CPU (slow but works for logic checks)
-      - CUDA_VISIBLE_DEVICES=""
-    depends_on:
-      - core
-```
-
----
-
-## File: docker-compose.yml
-
-```yaml
-version: '3.8'
-
-services:
-  redis:
-    image: redis:alpine
-    ports: ["6379:6379"]
-
-  api:
-    build:
-      context: .
-      dockerfile: api/Dockerfile
-    ports: ["8000:8000"]
-    env_file: .env
-    depends_on: [redis]
-
-  scheduler:
-    build:
-      context: .
-      dockerfile: scheduler/Dockerfile
-    ports: ["8001:8001"]
-    env_file: .env
-    depends_on: [redis]
-    environment:
-          - REGISTRY_URL=http://registry:8002
-
-  registry:  # NEW
-      build:
-        context: .
-        dockerfile: registry/Dockerfile
-      ports:
-        - "8002:8002"
-      env_file: .env
-      depends_on:
-        - redis
-```
-
----
-
 ## File: e2etest.sh
 
 ```bash
@@ -940,66 +969,26 @@ set -e
 # Configuration
 export RUNPOD_API_KEY=rpa_ZKZLYZ29PVCVGNVCDH50GWIWU6T4QA5NBDRUJFH1axwo14
 export HF_TOKEN=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
-DOCKER_USERNAME="pxxxe"  # <--- UPDATE WITH YOUR DOCKER HUB USERNAME
 
 echo "=========================================="
 echo "🚀 AZU.CX E2E Test Suite"
 echo "=========================================="
-
-# Step 1: Build Docker Images
 echo ""
-echo "📦 Step 1: Building Docker Images..."
-echo "------------------------------------------"
-
-echo "Building Core Image..."
-docker build -f Dockerfile.core -t ${DOCKER_USERNAME}/azu-core:latest .
-if [ $? -ne 0 ]; then
-    echo "❌ Core build failed!"
-    exit 1
-fi
-echo "✅ Core image built successfully"
-
+echo "⚠️  Make sure GitHub Actions has built and pushed your images!"
+echo "   Check: https://github.com/YOUR_USERNAME/azu.cx/actions"
 echo ""
-echo "Building Worker Image..."
-docker build -f Dockerfile.worker -t ${DOCKER_USERNAME}/azu-worker:latest .
-if [ $? -ne 0 ]; then
-    echo "❌ Worker build failed!"
-    exit 1
-fi
-echo "✅ Worker image built successfully"
-
-# Step 2: Push Images to Registry
-echo ""
-echo "📤 Step 2: Pushing Images to Docker Hub..."
-echo "------------------------------------------"
-
-echo "Pushing Core Image..."
-docker push ${DOCKER_USERNAME}/azu-core:latest
-if [ $? -ne 0 ]; then
-    echo "❌ Core push failed!"
-    exit 1
-fi
-echo "✅ Core image pushed successfully"
-
-echo ""
-echo "Pushing Worker Image..."
-docker push ${DOCKER_USERNAME}/azu-worker:latest
-if [ $? -ne 0 ]; then
-    echo "❌ Worker push failed!"
-    exit 1
-fi
-echo "✅ Worker image pushed successfully"
-
-# Step 3: Run Infrastructure Test
-echo ""
-echo "🧪 Step 3: Running Infrastructure Test..."
-echo "------------------------------------------"
-echo "⚠️  Make sure to edit infra_test.py with:"
+echo "⚠️  Make sure infra_test.py has correct config:"
+echo "    - CORE_IMG = 'pxxxe/azu-core:latest'"
+echo "    - WORKER_IMG = 'pxxxe/azu-worker:latest'"
 echo "    - Your Volume ID"
-echo "    - Your Docker Hub username in CORE_IMG and WORKER_IMG"
 echo ""
 echo "Press Enter to continue or Ctrl+C to cancel..."
 read
+
+echo ""
+echo "🚀 Launching RunPod instances..."
+echo "   (RunPod will pull images directly from Docker Hub)"
+echo ""
 
 python3 infra_test.py
 
@@ -1007,6 +996,17 @@ echo ""
 echo "=========================================="
 echo "✅ E2E Test Complete!"
 echo "=========================================="
+```
+
+---
+
+## File: envscript.sh
+
+```bash
+export RUNPOD_API_KEY=rpa_ZKZLYZ29PVCVGNVCDH50GWIWU6T4QA5NBDRUJFH1axwo14
+export HF_TOKEN=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
+export DOCKERHUB_TOKEN=dckr_pat_Lo3j0T60HK03bRY-XXQcIBeK3qs
+export FUNDED_ACCOUNT_KEY=3qW64tsiFGDTVeDCHmWnzJNCwYBUMK4GXgWWn7NWmQc2A9hotHJytdhiqh6XAwqUqZKEZnb3aJPsSSDDSjJ7F761
 ```
 
 ---
@@ -1039,9 +1039,49 @@ CORE_IMG = "pxxxe/azu-core:latest"     # <--- UPDATE USERNAME
 WORKER_IMG = "pxxxe/azu-worker:latest" # <--- UPDATE USERNAME
 
 RPC_URL = "https://devnet.helius-rpc.com/?api-key=1d7ca6e1-7700-42eb-b086-8183fda42d76"
+
+# Your funded devnet account (5 SOL)
+# Put your private key JSON array here or in a file
+
+# Amount to distribute to each wallet (in SOL)
+DISTRIBUTION_AMOUNT = 0.1
 # =================================================
 
 runpod.api_key = API_KEY
+
+def load_funded_account():
+    """Load your funded devnet account keypair"""
+    global FUNDED_ACCOUNT_KEY
+
+    # Option 1: Load from environment variable
+    if os.getenv("FUNDED_ACCOUNT_KEY"):
+        secret = os.getenv("FUNDED_ACCOUNT_KEY", "")
+        FUNDED_ACCOUNT_KEY = Keypair.from_base58_string(secret)
+        print(f"   ✅ Loaded funded account from base58 env: {FUNDED_ACCOUNT_KEY.pubkey()}")
+        return FUNDED_ACCOUNT_KEY
+
+    # Option 2: Load from file (funded_account.json)
+    if os.path.exists("funded_account.json"):
+        with open("funded_account.json") as f:
+            key_bytes = json.load(f)
+            FUNDED_ACCOUNT_KEY = Keypair.from_bytes(bytes(key_bytes))
+            print(f"   ✅ Loaded funded account from file: {FUNDED_ACCOUNT_KEY.pubkey()}")
+            return FUNDED_ACCOUNT_KEY
+
+    # Option 3: Load from Solana CLI default wallet
+    solana_config = os.path.expanduser("~/.config/solana/id.json")
+    if os.path.exists(solana_config):
+        with open(solana_config) as f:
+            key_bytes = json.load(f)
+            FUNDED_ACCOUNT_KEY = Keypair.from_bytes(bytes(key_bytes))
+            print(f"   ✅ Loaded funded account from Solana CLI: {FUNDED_ACCOUNT_KEY.pubkey()}")
+            return FUNDED_ACCOUNT_KEY
+
+    print("❌ ERROR: No funded account found!")
+    print("   Please create funded_account.json with your private key JSON array")
+    print("   OR set FUNDED_ACCOUNT_KEY environment variable")
+    print("   OR place your key in ~/.config/solana/id.json")
+    sys.exit(1)
 
 def get_pod_ip(pod_id):
     print(f"   ⏳ Waiting for IP on {pod_id}...")
@@ -1054,44 +1094,86 @@ def get_pod_ip(pod_id):
         time.sleep(4)
     raise Exception("Pod failed to get IP")
 
+def distribute_sol(funder_kp, recipient_pubkey, amount_sol, client):
+    """Transfer SOL from funder to recipient"""
+    try:
+        lamports = int(amount_sol * 1_000_000_000)
+
+        # Create transfer instruction
+        ix = transfer(TransferParams(
+            from_pubkey=funder_kp.pubkey(),
+            to_pubkey=recipient_pubkey,
+            lamports=lamports
+        ))
+
+        # Get latest blockhash
+        blockhash = client.get_latest_blockhash().value.blockhash
+
+        # Create and sign transaction
+        tx = Transaction.new_signed_with_payer(
+            [ix],
+            funder_kp.pubkey(),
+            [funder_kp],
+            blockhash
+        )
+
+        # Send transaction
+        sig = client.send_transaction(tx).value
+        print(f"      📤 Transfer sent: {sig}")
+
+        # Wait for confirmation
+        time.sleep(2)
+
+        # Verify balance
+        balance = client.get_balance(recipient_pubkey).value
+        print(f"      ✅ Recipient balance: {balance / 1e9} SOL")
+
+        return True
+    except Exception as e:
+        print(f"      ❌ Transfer failed: {e}")
+        return False
+
 def setup_solana_accounts():
-    """Generates wallets and funds them via Devnet Airdrop"""
+    """Generates wallets and funds them from your funded account"""
     print("\n💰 0. Setting up Solana Wallets...")
 
+    # Load your funded account
+    funder_kp = load_funded_account()
+
+    # Check funder balance
+    client = Client(RPC_URL)
+    funder_balance = client.get_balance(funder_kp.pubkey()).value / 1e9
+    print(f"   💵 Funder balance: {funder_balance} SOL")
+
+    needed_sol = DISTRIBUTION_AMOUNT * 2  # scheduler + user
+    if funder_balance < needed_sol:
+        print(f"❌ Insufficient funds! Need {needed_sol} SOL, have {funder_balance} SOL")
+        sys.exit(1)
+
+    # Generate new keypairs
     platform_kp = Keypair()
     scheduler_kp = Keypair()
     user_kp = Keypair()
 
-    client = Client(RPC_URL)
+    print(f"   🔑 Platform: {platform_kp.pubkey()} (no funding needed)")
+    print(f"   🔑 Scheduler: {scheduler_kp.pubkey()}")
+    print(f"   🔑 User: {user_kp.pubkey()}")
 
-    accounts = [("Scheduler", scheduler_kp), ("User", user_kp)]
+    # Fund scheduler
+    print(f"\n   💸 Distributing {DISTRIBUTION_AMOUNT} SOL to Scheduler...")
+    if not distribute_sol(funder_kp, scheduler_kp.pubkey(), DISTRIBUTION_AMOUNT, client):
+        sys.exit(1)
 
-    for name, kp in accounts:
-        balance = 0
-        retries = 3
-        print(f"   💧 Requesting Airdrop for {name} ({kp.pubkey()})...")
-
-        while retries > 0 and balance == 0:
-            try:
-                # 1 SOL
-                client.request_airdrop(kp.pubkey(), 1_000_000_000)
-                for _ in range(10):
-                    time.sleep(2)
-                    bal_resp = client.get_balance(kp.pubkey())
-                    if bal_resp.value > 0:
-                        balance = bal_resp.value
-                        print(f"      ✅ {name} Funded: {balance / 1e9} SOL")
-                        break
-            except Exception as e:
-                print(f"      ⚠️ Retry ({e})...")
-                time.sleep(2)
-            retries -= 1
-
-        if balance == 0:
-            print(f"❌ Failed to fund {name}. If devnet is down, use a private key from Phantom.")
-            sys.exit(1)
+    # Fund user
+    print(f"\n   💸 Distributing {DISTRIBUTION_AMOUNT} SOL to User...")
+    if not distribute_sol(funder_kp, user_kp.pubkey(), DISTRIBUTION_AMOUNT, client):
+        sys.exit(1)
 
     scheduler_priv = json.dumps(list(bytes(scheduler_kp)))
+
+    # Check remaining funder balance
+    remaining = client.get_balance(funder_kp.pubkey()).value / 1e9
+    print(f"\n   💰 Remaining funder balance: {remaining} SOL")
 
     return {
         "platform_pub": str(platform_kp.pubkey()),
@@ -1114,8 +1196,8 @@ def run_lifecycle():
         core = runpod.create_pod(
             name="azu-core",
             image_name=CORE_IMG,
-            gpu_type_id="CPU-Only",
-            cloud_type="COMMUNITY",
+            gpu_type_id="NVIDIA GeForce RTX 4090",
+            cloud_type="SECURE",
             data_center_id=DATA_CENTER,
             ports="8000/http,8001/http,8002/http",
             network_volume_id=NETWORK_VOLUME_ID,
@@ -1144,7 +1226,7 @@ def run_lifecycle():
             w = runpod.create_pod(
                 name=f"azu-worker-{i}",
                 image_name=WORKER_IMG,
-                gpu_type_id="NVIDIA GeForce RTX 3090",
+                gpu_type_id="NVIDIA GeForce RTX 4090",
                 data_center_id=DATA_CENTER,
                 ports="8003/http",
                 env={

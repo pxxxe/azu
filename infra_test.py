@@ -23,59 +23,164 @@ CORE_IMG = "pxxxe/azu-core:latest"     # <--- UPDATE USERNAME
 WORKER_IMG = "pxxxe/azu-worker:latest" # <--- UPDATE USERNAME
 
 RPC_URL = "https://devnet.helius-rpc.com/?api-key=1d7ca6e1-7700-42eb-b086-8183fda42d76"
+
+# Your funded devnet account (5 SOL)
+# Put your private key JSON array here or in a file
+
+# Amount to distribute to each wallet (in SOL)
+DISTRIBUTION_AMOUNT = 0.1
 # =================================================
 
 runpod.api_key = API_KEY
 
+def load_funded_account():
+    """Load your funded devnet account keypair"""
+    global FUNDED_ACCOUNT_KEY
+
+    # Option 1: Load from environment variable
+    if os.getenv("FUNDED_ACCOUNT_KEY"):
+        secret = os.getenv("FUNDED_ACCOUNT_KEY", "")
+        FUNDED_ACCOUNT_KEY = Keypair.from_base58_string(secret)
+        print(f"   ✅ Loaded funded account from base58 env: {FUNDED_ACCOUNT_KEY.pubkey()}")
+        return FUNDED_ACCOUNT_KEY
+
+    # Option 2: Load from file (funded_account.json)
+    if os.path.exists("funded_account.json"):
+        with open("funded_account.json") as f:
+            key_bytes = json.load(f)
+            FUNDED_ACCOUNT_KEY = Keypair.from_bytes(bytes(key_bytes))
+            print(f"   ✅ Loaded funded account from file: {FUNDED_ACCOUNT_KEY.pubkey()}")
+            return FUNDED_ACCOUNT_KEY
+
+    # Option 3: Load from Solana CLI default wallet
+    solana_config = os.path.expanduser("~/.config/solana/id.json")
+    if os.path.exists(solana_config):
+        with open(solana_config) as f:
+            key_bytes = json.load(f)
+            FUNDED_ACCOUNT_KEY = Keypair.from_bytes(bytes(key_bytes))
+            print(f"   ✅ Loaded funded account from Solana CLI: {FUNDED_ACCOUNT_KEY.pubkey()}")
+            return FUNDED_ACCOUNT_KEY
+
+    print("❌ ERROR: No funded account found!")
+    print("   Please create funded_account.json with your private key JSON array")
+    print("   OR set FUNDED_ACCOUNT_KEY environment variable")
+    print("   OR place your key in ~/.config/solana/id.json")
+    sys.exit(1)
+
 def get_pod_ip(pod_id):
     print(f"   ⏳ Waiting for IP on {pod_id}...")
-    for _ in range(30):
+
+    # Increase wait time to ~10 minutes (60 loops * 10 seconds)
+    # Network volumes and large images take time!
+    for i in range(60):
         try:
             pod = runpod.get_pod(pod_id)
-            if pod['runtime'] and pod['runtime']['public_ip']:
-                return pod['runtime']['public_ip']
-        except: pass
-        time.sleep(4)
-    raise Exception("Pod failed to get IP")
+
+            # Check if runtime info exists
+            if pod.get('runtime') and pod['runtime'].get('public_ip'):
+                ip = pod['runtime']['public_ip']
+                print(f"      ✅ Found IP: {ip}")
+                return ip
+
+            # If not, print what the pod is doing currently
+            status = pod.get('desiredStatus', 'Unknown')
+            last_status = pod.get('lastStatus', 'Unknown')
+            print(f"      [{i}/60] Status: {last_status} (Target: {status})...")
+
+        except Exception as e:
+            print(f"      ⚠️ API Error: {e}")
+
+        time.sleep(10)
+
+    # If we fail, dump the whole pod object to debug
+    print("❌ DUMPING POD DATA FOR DEBUGGING:")
+    try:
+        print(json.dumps(runpod.get_pod(pod_id), indent=2))
+    except:
+        pass
+
+    raise Exception(f"Pod {pod_id} failed to get IP after 10 minutes")
+
+def distribute_sol(funder_kp, recipient_pubkey, amount_sol, client):
+    """Transfer SOL from funder to recipient"""
+    try:
+        lamports = int(amount_sol * 1_000_000_000)
+
+        # Create transfer instruction
+        ix = transfer(TransferParams(
+            from_pubkey=funder_kp.pubkey(),
+            to_pubkey=recipient_pubkey,
+            lamports=lamports
+        ))
+
+        # Get latest blockhash
+        blockhash = client.get_latest_blockhash().value.blockhash
+
+        # Create and sign transaction
+        tx = Transaction.new_signed_with_payer(
+            [ix],
+            funder_kp.pubkey(),
+            [funder_kp],
+            blockhash
+        )
+
+        # Send transaction
+        sig = client.send_transaction(tx).value
+        print(f"      📤 Transfer sent: {sig}")
+
+        # Wait for confirmation
+        time.sleep(2)
+
+        # Verify balance
+        balance = client.get_balance(recipient_pubkey).value
+        print(f"      ✅ Recipient balance: {balance / 1e9} SOL")
+
+        return True
+    except Exception as e:
+        print(f"      ❌ Transfer failed: {e}")
+        return False
 
 def setup_solana_accounts():
-    """Generates wallets and funds them via Devnet Airdrop"""
+    """Generates wallets and funds them from your funded account"""
     print("\n💰 0. Setting up Solana Wallets...")
 
+    # Load your funded account
+    funder_kp = load_funded_account()
+
+    # Check funder balance
+    client = Client(RPC_URL)
+    funder_balance = client.get_balance(funder_kp.pubkey()).value / 1e9
+    print(f"   💵 Funder balance: {funder_balance} SOL")
+
+    needed_sol = DISTRIBUTION_AMOUNT * 2  # scheduler + user
+    if funder_balance < needed_sol:
+        print(f"❌ Insufficient funds! Need {needed_sol} SOL, have {funder_balance} SOL")
+        sys.exit(1)
+
+    # Generate new keypairs
     platform_kp = Keypair()
     scheduler_kp = Keypair()
     user_kp = Keypair()
 
-    client = Client(RPC_URL)
+    print(f"   🔑 Platform: {platform_kp.pubkey()} (no funding needed)")
+    print(f"   🔑 Scheduler: {scheduler_kp.pubkey()}")
+    print(f"   🔑 User: {user_kp.pubkey()}")
 
-    accounts = [("Scheduler", scheduler_kp), ("User", user_kp)]
+    # Fund scheduler
+    print(f"\n   💸 Distributing {DISTRIBUTION_AMOUNT} SOL to Scheduler...")
+    if not distribute_sol(funder_kp, scheduler_kp.pubkey(), DISTRIBUTION_AMOUNT, client):
+        sys.exit(1)
 
-    for name, kp in accounts:
-        balance = 0
-        retries = 3
-        print(f"   💧 Requesting Airdrop for {name} ({kp.pubkey()})...")
-
-        while retries > 0 and balance == 0:
-            try:
-                # 1 SOL
-                client.request_airdrop(kp.pubkey(), 1_000_000_000)
-                for _ in range(10):
-                    time.sleep(2)
-                    bal_resp = client.get_balance(kp.pubkey())
-                    if bal_resp.value > 0:
-                        balance = bal_resp.value
-                        print(f"      ✅ {name} Funded: {balance / 1e9} SOL")
-                        break
-            except Exception as e:
-                print(f"      ⚠️ Retry ({e})...")
-                time.sleep(2)
-            retries -= 1
-
-        if balance == 0:
-            print(f"❌ Failed to fund {name}. If devnet is down, use a private key from Phantom.")
-            sys.exit(1)
+    # Fund user
+    print(f"\n   💸 Distributing {DISTRIBUTION_AMOUNT} SOL to User...")
+    if not distribute_sol(funder_kp, user_kp.pubkey(), DISTRIBUTION_AMOUNT, client):
+        sys.exit(1)
 
     scheduler_priv = json.dumps(list(bytes(scheduler_kp)))
+
+    # Check remaining funder balance
+    remaining = client.get_balance(funder_kp.pubkey()).value / 1e9
+    print(f"\n   💰 Remaining funder balance: {remaining} SOL")
 
     return {
         "platform_pub": str(platform_kp.pubkey()),
@@ -98,8 +203,8 @@ def run_lifecycle():
         core = runpod.create_pod(
             name="azu-core",
             image_name=CORE_IMG,
-            gpu_type_id="CPU-Only",
-            cloud_type="COMMUNITY",
+            gpu_type_id="NVIDIA GeForce RTX 4090",
+            cloud_type="SECURE",
             data_center_id=DATA_CENTER,
             ports="8000/http,8001/http,8002/http",
             network_volume_id=NETWORK_VOLUME_ID,
@@ -128,7 +233,7 @@ def run_lifecycle():
             w = runpod.create_pod(
                 name=f"azu-worker-{i}",
                 image_name=WORKER_IMG,
-                gpu_type_id="NVIDIA GeForce RTX 3090",
+                gpu_type_id="NVIDIA GeForce RTX 4090",
                 data_center_id=DATA_CENTER,
                 ports="8003/http",
                 env={

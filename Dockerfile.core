@@ -5,16 +5,20 @@ RUN apt-get update && apt-get install -y redis-server git curl
 
 WORKDIR /app
 
-# Copy Requirements
 COPY registry/requirements.txt reqs_reg.txt
 COPY scheduler/requirements.txt reqs_sched.txt
 COPY api/requirements.txt reqs_api.txt
-RUN pip install -r reqs_reg.txt -r reqs_sched.txt -r reqs_api.txt
 
-# Copy Code
+# --- FIX IS HERE ---
+# 1. Install CPU-only Torch first (avoids downloading 4GB of CUDA libs)
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+# 2. Then install the rest (pip will see torch is already installed and skip the huge download)
+RUN pip install --no-cache-dir -r reqs_reg.txt -r reqs_sched.txt -r reqs_api.txt
+
 COPY . .
 
-# Startup Script: Runs Redis, Registry, Scheduler, and API in background
+# Startup Script
 RUN echo "#!/bin/bash\n\
 redis-server --daemonize yes\n\
 uvicorn registry.main:app --host 0.0.0.0 --port 8002 &\n\

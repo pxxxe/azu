@@ -432,7 +432,7 @@ class EnhancedScheduler:
             self.jobs[job_id].status = "FAILED"
 
 # Initialize scheduler
-scheduler = EnhancedScheduler()
+scheduler = EnhancedScheduler(registry_url="http://localhost:8002")
 
 @app.on_event("startup")
 async def start():

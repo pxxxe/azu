@@ -14,6 +14,8 @@ from solders.pubkey import Pubkey
 from solders.system_program import transfer, TransferParams
 from solders.transaction import Transaction
 
+from urllib.parse import quote
+
 # ================= CONFIGURATION =================
 API_KEY = os.getenv("RUNPOD_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -399,7 +401,7 @@ def run_lifecycle():
         print("\n📦 Triggering workers to preload model...")
         try:
             preload_resp = requests.post(
-                f"{scheduler_base}/preload/{model_id}",
+                f"{scheduler_base}/preload/{quote(model_id, safe='')}",
                 timeout=10
             )
             if preload_resp.status_code == 200:

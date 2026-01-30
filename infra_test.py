@@ -399,8 +399,8 @@ def run_lifecycle():
         job_id = res.json()['job_id']
         print(f"   Polling results for Job {job_id}...")
 
-        # Extended timeout for first JIT run (downloading layers)
-        for i in range(60):
+        # INCREASED TIMEOUT to 300s (5 minutes) for slow JIT downloads
+        for i in range(150):
             res = requests.get(f"{api_url}/results/{job_id}")
             data = res.json()
 
@@ -412,7 +412,7 @@ def run_lifecycle():
                 print(f"\n❌ JOB FAILED: {data.get('error')}\n")
                 return
 
-            if i % 5 == 0:
+            if i % 10 == 0:
                 print(f"   [{i*2}s] Status: {status}...")
             time.sleep(2)
 

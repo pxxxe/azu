@@ -20,7 +20,7 @@ r = redis.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, decode_respo
 class WorkerState:
     pubkey: str
     ws: WebSocket
-    specs: dict  # {gpu: str, vram_gb: float, public_ip: str, p2p_port: int}
+    specs: dict  # {gpu: str, vram_gb: float, p2p_url: str}
     status: str = "IDLE"  # IDLE, BUSY, OFFLINE
     current_model: Optional[str] = None
     loaded_layers: List[int] = field(default_factory=list)
@@ -52,7 +52,7 @@ class ProductionScheduler:
         wid = specs['pubkey']
         async with self.lock:
             self.workers[wid] = WorkerState(pubkey=wid, ws=ws, specs=specs)
-        print(f"✅ [Scheduler] Worker Registered: {wid[:8]} | GPU: {specs.get('gpu')} | VRAM: {specs.get('vram_gb')}GB")
+        print(f"✅ [Scheduler] Worker Registered: {wid[:8]} | GPU: {specs.get('gpu')} | VRAM: {specs.get('vram_gb')}GB | URL: {specs.get('p2p_url')}")
         return wid
 
     async def unregister_worker(self, wid: str):
@@ -126,10 +126,16 @@ class ProductionScheduler:
             start = assigned_layers
             end = assigned_layers + layers_to_take - 1 # Inclusive
 
+            # Use the P2P URL advertised by the worker
+            endpoint = w.specs.get('p2p_url')
+            if not endpoint:
+                # Fallback for old workers (shouldn't happen with new code)
+                endpoint = f"http://{w.specs.get('public_ip', 'localhost')}:{w.specs.get('p2p_port', 8003)}"
+
             plan.append({
                 "worker_id": w.pubkey,
                 "layers": list(range(start, end + 1)),
-                "endpoint": f"http://{w.specs['public_ip']}:{w.specs['p2p_port']}"
+                "endpoint": endpoint
             })
 
             assigned_layers += layers_to_take
@@ -361,7 +367,7 @@ async def list_workers():
             "status": w.status,
             "gpu": w.specs.get("gpu"),
             "vram": w.specs.get("vram_gb"),
-            "ip": w.specs.get("public_ip")
+            "url": w.specs.get("p2p_url")
         }
         for w in scheduler.workers.values()
     ]

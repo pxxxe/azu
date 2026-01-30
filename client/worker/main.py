@@ -42,6 +42,23 @@ class ProductionWorker:
         except:
             return "127.0.0.1"
 
+    def get_p2p_url(self):
+        """
+        Determine the external URL for other workers to reach this one.
+        Prioritizes RunPod Proxy if available to ensure connectivity behind NAT.
+        """
+        # 1. RunPod Environment (Env var is injected by RunPod)
+        if os.getenv("RUNPOD_POD_ID"):
+            pod_id = os.getenv("RUNPOD_POD_ID")
+            # RunPod proxy uses HTTPS for the exposed port
+            url = f"https://{pod_id}-8003.proxy.runpod.net"
+            print(f"🌍 [Net] Detected RunPod. Advertising: {url}")
+            return url
+
+        # 2. Local/Direct Environment
+        ip = self.get_public_ip()
+        return f"http://{ip}:8003"
+
     # --- P2P SERVER ---
     async def start_p2p_server(self, port=8003):
         app = web.Application()
@@ -221,8 +238,7 @@ class ProductionWorker:
                         "pubkey": "Worker_" + os.urandom(4).hex(),
                         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
                         "vram_gb": torch.cuda.get_device_properties(0).total_memory / (1024**3) if torch.cuda.is_available() else 4.0,
-                        "public_ip": self.get_public_ip(),
-                        "p2p_port": p2p_port
+                        "p2p_url": self.get_p2p_url()
                     }
 
                     await ws.send(json.dumps({

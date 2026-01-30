@@ -7,6 +7,7 @@ import base64
 import io
 import os
 import urllib.request
+import traceback
 from aiohttp import web
 from transformers import AutoTokenizer
 
@@ -21,166 +22,179 @@ class ProductionWorker:
     def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.loader = LayerLoader(REGISTRY_URL)
-        self.input_queue = asyncio.Queue() # For P2P tensors
 
         # State
-        self.active_layers = []
+        self.loaded_model_id = None
+        self.active_layers = []  # List of torch modules
+        self.layer_indices = []  # List of ints
         self.embeddings = None
         self.lm_head = None
 
-        print(f"🚀 Worker Initialized on {self.device}")
+        # Concurrency & P2P
+        self.p2p_queue = asyncio.Queue()
+        self.current_job_id = None
+
+        print(f"🚀 [Worker] Initialized on {self.device}")
 
     def get_public_ip(self):
-        """Determines external IP for P2P connection"""
         try:
             return urllib.request.urlopen('https://api.ipify.org').read().decode('utf8')
         except:
-            print("⚠️ Could not resolve Public IP, using localhost")
             return "127.0.0.1"
 
     # --- P2P SERVER ---
     async def start_p2p_server(self, port=8003):
         app = web.Application()
-        # Accept POST requests with binary tensors
         app.router.add_post('/tensor_in', self.handle_tensor_ingress)
-
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, '0.0.0.0', port)
         await site.start()
-        print(f"👂 P2P Tensor Listener active on port {port}")
+        print(f"👂 [P2P] Listener active on port {port}")
 
     async def handle_tensor_ingress(self, request):
-        """Receives tensor from previous worker"""
+        """Receives tensor/hidden_states from the previous worker in the chain."""
         try:
-            # Read binary body directly (more efficient than JSON wrapper for large tensors)
-            data = await request.read()
+            # We accept the connection immediately.
+            # If the worker is busy loading layers, this data sits in the queue.
 
-            # If wrapped in JSON/base64 (Scheduler might enforce this format)
-            # Let's support the JSON format used in the test harness
+            # Support both raw binary and JSON wrapper
             try:
                 json_data = await request.json()
                 if 'tensor' in json_data:
                     tensor_bytes = base64.b64decode(json_data['tensor'])
                     buffer = io.BytesIO(tensor_bytes)
-                    tensor = torch.load(buffer, map_location=self.device)
-                    await self.input_queue.put(tensor)
-                    return web.Response(text="Accepted")
+                else:
+                    raise ValueError("Invalid JSON")
             except:
-                pass
+                # Raw binary fallback
+                data = await request.read()
+                buffer = io.BytesIO(data)
 
-            # Fallback: Raw binary
-            buffer = io.BytesIO(data)
             tensor = torch.load(buffer, map_location=self.device)
-            await self.input_queue.put(tensor)
+
+            # Push to queue to be picked up by execute_job
+            await self.p2p_queue.put(tensor)
+
             return web.Response(text="Accepted")
 
         except Exception as e:
-            print(f"❌ Error receiving tensor: {e}")
+            print(f"❌ [P2P] Error receiving tensor: {e}")
             return web.Response(status=500, text=str(e))
 
-    # --- INFERENCE LOGIC ---
-    async def process_job(self, job, ws):
-        job_id = job['id']
-        model_id = job['model']
-        layers = job['assigned_layers']
-        is_first = job.get('is_first', False)
-        is_last = job.get('is_last', False)
-        next_worker_url = job.get('next_worker')
+    # --- EXECUTION LOGIC ---
 
-        print(f"⚙️ Processing Job {job_id} | Layers {layers}")
+    async def ensure_resources(self, model_id: str, layers: list, is_first: bool, is_last: bool):
+        """JIT Resource Loading. Smart diffing."""
+
+        # Check if we need to flush VRAM
+        if self.loaded_model_id != model_id:
+            print(f"🧹 [Worker] Switching models: {self.loaded_model_id} -> {model_id}")
+            self.active_layers = []
+            self.embeddings = None
+            self.lm_head = None
+            torch.cuda.empty_cache()
+            self.loaded_model_id = model_id
+
+        # Check if layers match
+        if self.layer_indices != layers:
+            print(f"📦 [Worker] Loading layers {layers}...")
+            self.active_layers = await self.loader.load_layers(model_id, layers, self.device)
+            self.layer_indices = layers
+
+        # Check Embeddings (Node 0)
+        if is_first and self.embeddings is None:
+            print(f"📦 [Worker] Loading Embeddings...")
+            self.embeddings = await self.loader.load_embeddings(model_id, self.device)
+
+        # Check Head (Last Node)
+        if is_last and self.lm_head is None:
+            print(f"📦 [Worker] Loading LM Head...")
+            self.lm_head = await self.loader.load_lm_head(model_id, self.device)
+
+    async def execute_job(self, msg, ws):
+        job_id = msg['job_id']
+        model_id = msg['model_id']
+        layers = msg['layers']
+        is_first = msg['is_first']
+        is_last = msg['is_last']
+        next_hop = msg.get('next_hop') # URL of next worker
+
+        print(f"⚙️ [Job {job_id}] Start. Layers: {layers[0]}-{layers[-1]}")
+        self.current_job_id = job_id
 
         try:
-            # 1. Load Resources (skip if already loaded from PRELOAD)
-            if not self.active_layers:
-                self.active_layers = await self.loader.load_layers(model_id, layers, self.device)
+            # 1. Prepare Resources (May take time downloading)
+            await self.ensure_resources(model_id, layers, is_first, is_last)
 
-            if is_first and not self.embeddings:
-                self.embeddings = await self.loader.load_embeddings(model_id, self.device)
-            if is_last and not self.lm_head:
-                self.lm_head = await self.loader.load_lm_head(model_id, self.device)
-
-            # 2. Prepare Input
+            # 2. Get Input
             hidden_states = None
 
             if is_first:
-                # Tokenize (Using HF Tokenizer)
-                prompt = job['input']
+                # Tokenize Prompt
+                prompt = msg['input']
+                # Note: In a real optimized system, tokenizer would be loaded once or passed via API.
+                # For now, we load from HF or Cache.
                 tokenizer = AutoTokenizer.from_pretrained(model_id, token=HF_TOKEN, trust_remote_code=True)
                 input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
 
-                # Embedding Lookup
                 with torch.no_grad():
                     hidden_states = self.embeddings(input_ids)
             else:
-                # Wait for tensor from P2P
-                print(f"⏳ Waiting for tensor input...")
-                hidden_states = await self.input_queue.get()
-                print("   ✅ Input received")
+                # Wait for P2P
+                print(f"⏳ [Job {job_id}] Waiting for upstream tensor...")
+                hidden_states = await self.p2p_queue.get() # Blocks until data arrives
+                print(f"   ✅ [Job {job_id}] Upstream data received")
 
-            # 3. Execute Layers
-            # Real Torch Compute
+            # 3. Compute
             with torch.no_grad():
-                # Ensure half precision
                 hidden_states = hidden_states.half()
-
-                for i, layer in enumerate(self.active_layers):
-                    # Transformer layers usually return tuple (hidden_states, ...)
+                for layer in self.active_layers:
                     out = layer(hidden_states)
-                    if isinstance(out, tuple):
-                        hidden_states = out[0]
-                    else:
-                        hidden_states = out
+                    if isinstance(out, tuple): hidden_states = out[0]
+                    else: hidden_states = out
 
-            # 4. Handle Output
+            # 4. Output or Forward
             if is_last:
-                # LM Head -> Logits -> Text
+                # Decode
                 with torch.no_grad():
                     logits = self.lm_head(hidden_states)
-                    # Simple Greedy Decode for now
                     next_token = torch.argmax(logits[:, -1, :], dim=-1)
-
-                    # We need the tokenizer again to decode
-                    # (In efficient systems, we'd cache this or send tokens back)
                     tokenizer = AutoTokenizer.from_pretrained(model_id, token=HF_TOKEN, trust_remote_code=True)
                     output_text = tokenizer.decode(next_token)
 
-                # Send Final Result to Scheduler
+                # Report to Scheduler
                 await ws.send(json.dumps({
                     "type": "RESULT",
                     "job_id": job_id,
-                    "output": output_text,
-                    "status": "completed"
+                    "status": "completed",
+                    "output": output_text
                 }))
-                print(f"🏁 Job {job_id} Completed. Output: {output_text}")
+                print(f"🏁 [Job {job_id}] Complete. Output sent to Scheduler.")
 
             else:
-                # Send to Next Worker
-                if not next_worker_url:
-                    raise Exception("Not last worker, but no next_worker_url provided")
+                # Forward to Next Worker
+                if not next_hop:
+                    raise Exception("Topology Error: Not last node, but no next_hop")
 
-                print(f"📤 Sending tensor to {next_worker_url}")
+                print(f"📤 [Job {job_id}] Forwarding to {next_hop}...")
 
-                # Serialize
                 buffer = io.BytesIO()
                 torch.save(hidden_states, buffer)
+                # Send raw binary is faster, but let's use the JSON wrapper for compatibility with the ingress handler above
                 tensor_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
 
                 async with aiohttp.ClientSession() as sess:
-                    async with sess.post(next_worker_url, json={"tensor": tensor_b64}) as resp:
+                    async with sess.post(next_hop, json={"tensor": tensor_b64}) as resp:
                         if resp.status != 200:
-                            raise Exception(f"Next worker rejected tensor: {resp.status}")
+                            raise Exception(f"Next hop rejected data: {resp.status}")
 
-                # Notify Scheduler we are done with our part
-                await ws.send(json.dumps({
-                    "type": "RESULT",
-                    "job_id": job_id,
-                    "status": "partial_complete"
-                }))
+                # Tell Scheduler we are done
+                # (Optional, keeps connection alive)
+                # await ws.send(json.dumps({"type": "PARTIAL", "job_id": job_id}))
 
         except Exception as e:
-            print(f"❌ Job Execution Failed: {e}")
-            import traceback
+            print(f"❌ [Job {job_id}] Execution Failed: {e}")
             traceback.print_exc()
             await ws.send(json.dumps({
                 "type": "RESULT",
@@ -191,11 +205,9 @@ class ProductionWorker:
 
     # --- MAIN LOOP ---
     async def run(self):
-        # 1. Start P2P
         p2p_port = 8003
         await self.start_p2p_server(p2p_port)
 
-        # 2. Connect to Scheduler
         retry_wait = 2
         while True:
             try:
@@ -204,10 +216,11 @@ class ProductionWorker:
                     print("✅ Connected")
 
                     # Register
+                    # Generate a stable ID based on hardware? For now random is fine per session.
                     specs = {
-                        "pubkey": "Worker_" + os.urandom(4).hex(), # Mock Pubkey for now
-                        "gpu": torch.cuda.get_device_name(0),
-                        "vram_gb": torch.cuda.get_device_properties(0).total_memory / (1024**3),
+                        "pubkey": "Worker_" + os.urandom(4).hex(),
+                        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
+                        "vram_gb": torch.cuda.get_device_properties(0).total_memory / (1024**3) if torch.cuda.is_available() else 4.0,
                         "public_ip": self.get_public_ip(),
                         "p2p_port": p2p_port
                     }
@@ -217,41 +230,18 @@ class ProductionWorker:
                         "specs": specs
                     }))
 
-                    # Msg Loop
-                    async for msg in ws:
-                        data = json.loads(msg)
-                        msg_type = data.get('type')
+                    # Loop
+                    async for raw_msg in ws:
+                        msg = json.loads(raw_msg)
+                        mtype = msg.get('type')
 
-                        if msg_type == 'PRELOAD':
-                            # Scheduler tells us to preload layers
-                            model_id = data['model_id']
-                            layers = data['layers']
+                        if mtype == 'EXECUTE':
+                            # Fire and forget? No, we await to keep flow control simple for now
+                            # In real prod, this would spawn a task, but GPU is single-stream anyway
+                            await self.execute_job(msg, ws)
 
-                            print(f"📦 Preloading {model_id} layers {layers[0]}-{layers[-1]}...")
-
-                            # Download and load to GPU
-                            self.active_layers = await self.loader.load_layers(model_id, layers, self.device)
-
-                            # Load embeddings if first worker
-                            if data.get('is_first'):
-                                self.embeddings = await self.loader.load_embeddings(model_id, self.device)
-
-                            # Load LM head if last worker
-                            if data.get('is_last'):
-                                self.lm_head = await self.loader.load_lm_head(model_id, self.device)
-
-                            # Broadcast ready
-                            await ws.send(json.dumps({
-                                "type": "READY",
-                                "model_id": model_id,
-                                "layers": layers
-                            }))
-
-                            print(f"✅ Ready with {len(self.active_layers)} layers")
-
-                        elif msg_type == 'EXECUTE':
-                            # Job execution - layers already loaded from PRELOAD
-                            asyncio.create_task(self.process_job(data['job'], ws))
+                        elif mtype == 'PAYMENT':
+                            print(f"💰 Payment Received: {msg['amount']} Lamports. Sig: {msg['sig']}")
 
             except Exception as e:
                 print(f"❌ Connection Lost: {e}")

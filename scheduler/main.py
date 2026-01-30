@@ -1,555 +1,367 @@
-"""
-ENHANCED SCHEDULER - Multi-Worker Coordination
-
-Features:
-- Queries registry for worker capabilities
-- Splits jobs across multiple workers
-- Coordinates layer execution
-- Handles tensor passing between workers
-"""
-
 import asyncio
 import json
 import redis.asyncio as redis
 import aiohttp
+import uuid
+import time
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from typing import Dict, List, Optional
-from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
 from shared.config import settings
 from shared.economics import calculate_worker_share
 from shared.solana_lib import sign_payout
-import os
-from pydantic import BaseModel  # Add this if not already present
 
 app = FastAPI()
 r = redis.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, decode_responses=True)
 
+# --- DATA STRUCTURES ---
+
 @dataclass
-class WorkerInfo:
+class WorkerState:
     pubkey: str
     ws: WebSocket
-    specs: dict
-    status: str  # IDLE, BUSY, OFFLINE, LOADING, READY
-    assigned_layers: Optional[List[int]] = None
-    loaded_model: Optional[str] = None  # NEW: Which model is loaded
-    ready: bool = False  # NEW: Whether layers are loaded
+    specs: dict  # {gpu: str, vram_gb: float, public_ip: str, p2p_port: int}
+    status: str = "IDLE"  # IDLE, BUSY, OFFLINE
+    current_model: Optional[str] = None
+    loaded_layers: List[int] = field(default_factory=list)
+    last_heartbeat: float = field(default_factory=time.time)
 
 @dataclass
-class JobExecution:
-    job_id: str
+class JobState:
+    id: str
     model_id: str
-    assigned_workers: List[str]  # worker pubkeys
-    layer_splits: Dict[str, List[int]]  # worker_pubkey -> [layer_indices]
-    results: Dict[str, any]  # worker_pubkey -> result
-    status: str  # PENDING, IN_PROGRESS, COMPLETED, FAILED
+    input_prompt: str
+    est_tokens: int
+    owner: str
+    cost: int
+    created_at: float
+    status: str = "PENDING"
+    topology: List[dict] = field(default_factory=list) # The execution plan
+    results_buffer: Dict[str, any] = field(default_factory=dict)
 
-class EnhancedScheduler:
-    def __init__(self, registry_url: str = "http://localhost:8002"):
-        self.workers: Dict[str, WorkerInfo] = {}
-        self.jobs: Dict[str, JobExecution] = {}
+class ProductionScheduler:
+    def __init__(self, registry_url: str):
         self.registry_url = registry_url
-        self.ready_workers: List[str] = []  # NEW: Track ready workers
-        self.target_model: Optional[str] = None  # NEW: Model we're preparing for
+        self.workers: Dict[str, WorkerState] = {}
+        self.active_jobs: Dict[str, JobState] = {}
+        self.lock = asyncio.Lock()
 
-    async def register(self, ws: WebSocket, specs: dict) -> str:
-        """Register worker with scheduler"""
+    # --- WORKER MANAGEMENT ---
+
+    async def register_worker(self, ws: WebSocket, specs: dict) -> str:
         wid = specs['pubkey']
-
-        self.workers[wid] = WorkerInfo(
-            pubkey=wid,
-            ws=ws,
-            specs=specs,
-            status="IDLE"
-        )
-
-        print(f"✅ Worker {wid[:8]}.. registered: {specs.get('gpu', 'unknown')} "
-              f"({specs.get('vram_gb', 0)}GB VRAM)")
-
-        # Also register with registry
-        await self._register_worker_with_registry(wid, specs)
-
+        async with self.lock:
+            self.workers[wid] = WorkerState(pubkey=wid, ws=ws, specs=specs)
+        print(f"✅ [Scheduler] Worker Registered: {wid[:8]} | GPU: {specs.get('gpu')} | VRAM: {specs.get('vram_gb')}GB")
         return wid
 
-    async def _register_worker_with_registry(self, worker_id: str, specs: dict):
-        """Inform registry about worker capabilities"""
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.registry_url}/workers/register",
-                    json={
-                        "worker_id": worker_id,
-                        "vram_gb": specs.get('vram_gb', 0),
-                        "gpu": specs.get('gpu', 'unknown'),
-                        "models": specs.get('models', [])
-                    }
-                ) as resp:
-                    if resp.status == 200:
-                        print(f"  ✅ Worker registered with registry")
-        except Exception as e:
-            print(f"  ⚠️ Registry registration failed: {e}")
+    async def unregister_worker(self, wid: str):
+        async with self.lock:
+            if wid in self.workers:
+                del self.workers[wid]
+        print(f"🔌 [Scheduler] Worker Disconnected: {wid[:8]}")
+        # Logic to fail jobs assigned to this worker could go here
 
-    async def disconnect(self, wid: str):
-        """Handle worker disconnect"""
+    async def update_heartbeat(self, wid: str):
         if wid in self.workers:
-            print(f"Worker {wid[:8]}.. disconnected")
-            self.workers[wid].status = "OFFLINE"
+            self.workers[wid].last_heartbeat = time.time()
 
-            # Notify registry
-            try:
-                async with aiohttp.ClientSession() as session:
-                    await session.delete(f"{self.registry_url}/workers/{wid}")
-            except:
-                pass
+    # --- RESOURCE PLANNING ---
 
-    async def query_available_workers(self, model_id: str, required_layers: int) -> List[Dict]:
-        """Query registry for workers that can handle this model"""
+    async def _get_model_structure(self, model_id: str) -> Optional[dict]:
+        """Ask Registry for layer count and size estimates."""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.registry_url}/workers/query",
-                    json={
-                        "model_id": model_id,
-                        "required_layers": required_layers
-                    }
-                ) as resp:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(f"{self.registry_url}/models/info", params={"model_id": model_id}) as resp:
                     if resp.status == 200:
-                        result = await resp.json()
-                        return result.get('workers', [])
-                    else:
-                        print(f"Registry query failed: {resp.status}")
-                        return []
+                        return await resp.json()
         except Exception as e:
-            print(f"Registry query error: {e}")
-            return []
-
-    def split_layers_across_workers(self, total_layers: int, workers: List[Dict]) -> Dict[str, List[int]]:
-        """Intelligently split layers across available workers"""
-        if not workers:
-            return {}
-
-        # Sort workers by VRAM capacity
-        sorted_workers = sorted(workers, key=lambda w: w.get('vram_gb', 0), reverse=True)
-
-        # Calculate layer distribution based on VRAM
-        total_vram = sum(w.get('vram_gb', 0) for w in sorted_workers)
-
-        splits = {}
-        current_layer = 0
-
-        for worker in sorted_workers:
-            vram_ratio = worker.get('vram_gb', 0) / total_vram
-            num_layers = int(total_layers * vram_ratio)
-
-            # Ensure at least 1 layer per worker
-            if num_layers == 0:
-                num_layers = 1
-
-            # Don't exceed remaining layers
-            num_layers = min(num_layers, total_layers - current_layer)
-
-            if num_layers > 0:
-                layer_range = list(range(current_layer, current_layer + num_layers))
-                splits[worker['worker_id']] = layer_range
-                current_layer += num_layers
-
-            if current_layer >= total_layers:
-                break
-
-        # Assign remaining layers to last worker
-        if current_layer < total_layers:
-            last_worker = sorted_workers[-1]['worker_id']
-            if last_worker in splits:
-                splits[last_worker].extend(range(current_layer, total_layers))
-
-        return splits
-
-    async def dispatch_loop(self):
-      """Main job dispatcher loop"""
-      print("🚀 Scheduler Dispatch Loop Started")
-
-      while True:
-        try:
-            task = await r.blpop("job_queue", timeout=1)
-            if not task:
-              continue
-
-            job = json.loads(task[1])
-            job_id = job['id']
-            model_id = job['model']
-
-            print(f"\n📋 Processing Job {job_id}")
-
-            # Check if workers have this model loaded
-            ready_for_model = [
-              w for w in self.workers.values()
-              if w.ready and w.loaded_model == model_id
-            ]
-
-            if len(ready_for_model) < 2:
-              print(f"  ⚠️ Workers not ready for {model_id}, requeueing...")
-              await r.rpush("job_queue", json.dumps(job))
-              await asyncio.sleep(2)
-              continue
-
-            print(f"  ✅ {len(ready_for_model)} workers ready")
-
-            # Get layer splits from worker assignments
-            layer_splits = {}
-            for w in ready_for_model:
-              layer_splits[w.pubkey] = w.assigned_layers
-
-            print(f"  📊 Layer distribution:")
-            for wid, layers in layer_splits.items():
-                print(f"    {wid[:8]}...: layers {layers[0]}-{layers[-1]} ({len(layers)} total)")
-
-            # Create job execution tracker
-            self.jobs[job_id] = JobExecution(
-                job_id=job_id,
-                model_id=job['model'],
-                assigned_workers=list(layer_splits.keys()),
-                layer_splits=layer_splits,
-                results={},
-                status="IN_PROGRESS"
-            )
-
-            # Dispatch to workers
-            await self._dispatch_to_workers(job, layer_splits)
-
-        except Exception as e:
-            print(f"❌ Dispatch error: {e}")
-            import traceback
-            traceback.print_exc()
-
-    async def preload_model_to_workers(self, model_id: str):
-      """
-      Called after model is sharded.
-      Assigns layer ranges to workers and tells them to preload.
-      """
-      # Get model info
-      model_info = await self._get_model_info(model_id)
-      if not model_info:
-          print(f"❌ Model {model_id} not found in registry")
-          return False
-
-      total_layers = model_info['num_layers']
-
-      # Get available workers
-      available = [w for w in self.workers.values() if w.status == "IDLE"]
-      if len(available) < 2:
-          print(f"⚠️ Need at least 2 workers, only {len(available)} available")
-          return False
-
-      # Split layers across workers
-      workers_to_use = available[:2]
-      layers_per_worker = total_layers // 2
-
-      print(f"📋 Preloading {model_id} to {len(workers_to_use)} workers...")
-
-      for i, worker in enumerate(workers_to_use):
-          layer_start = i * layers_per_worker
-          layer_end = (i + 1) * layers_per_worker - 1 if i == 0 else total_layers - 1
-          layers = list(range(layer_start, layer_end + 1))
-
-          worker.status = "LOADING"
-          worker.assigned_layers = layers
-          worker.loaded_model = model_id
-
-          # Tell worker to preload
-          await worker.ws.send_json({
-              "type": "PRELOAD",
-              "model_id": model_id,
-              "layers": layers,
-              "is_first": i == 0,
-              "is_last": i == len(workers_to_use) - 1
-          })
-
-          print(f"  → {worker.pubkey[:8]}...: layers {layer_start}-{layer_end}")
-
-      self.target_model = model_id
-      return True
-
-    async def handle_ready(self, worker_id: str, data: dict):
-      """Worker announces it has loaded layers"""
-      if worker_id not in self.workers:
-          return
-
-      worker = self.workers[worker_id]
-      worker.status = "READY"
-      worker.ready = True
-
-      if worker_id not in self.ready_workers:
-          self.ready_workers.append(worker_id)
-
-      print(f"🚀 Worker {worker_id[:8]}... ready with {worker.loaded_model}")
-
-    async def _get_model_info(self, model_id: str) -> Optional[Dict]:
-        """Get model information from registry"""
-        try:
-          async with aiohttp.ClientSession() as session:
-            async with session.get(
-              f"{self.registry_url}/models/info",
-              params={"model_id": model_id}
-            ) as resp:
-                if resp.status == 200:
-                  return await resp.json()
-        except:
-          pass
+            print(f"⚠️ [Scheduler] Registry lookup failed: {e}")
         return None
 
-    async def _dispatch_to_workers(self, job: dict, layer_splits: Dict[str, List[int]]):
-        """Dispatch job to assigned workers"""
-        job_id = job['id']
+    def _plan_execution(self, model_info: dict) -> Optional[List[dict]]:
+        """
+        The 'Brain'. Determines which workers run which layers.
+        Algorithm: Greedy Best-Fit based on VRAM availability.
+        """
+        total_layers = model_info['num_layers']
+        # Estimate VRAM per layer (Safety margin: 1.2x)
+        # Using the total_size_mb from registry is safer than guessing.
+        total_size_gb = (model_info['total_size_mb'] / 1024) * 1.2
+        gb_per_layer = total_size_gb / total_layers
 
-        # Send to first worker (they'll coordinate)
-        worker_order = list(layer_splits.keys())
+        # Static overhead for context window (KV Cache) - approximate 2GB buffer
+        kv_buffer = 2.0
 
-        for i, wid in enumerate(worker_order):
-            if wid not in self.workers:
-                continue
+        # Filter IDLE workers
+        available_workers = [
+            w for w in self.workers.values()
+            if w.status == "IDLE" and w.ws.client_state.name == "CONNECTED"
+        ]
 
-            worker = self.workers[wid]
+        # Sort by VRAM descending (pack large GPUs first)
+        available_workers.sort(key=lambda w: w.specs['vram_gb'], reverse=True)
 
+        plan = []
+        assigned_layers = 0
+
+        for w in available_workers:
+            if assigned_layers >= total_layers:
+                break
+
+            # Calculate capacity
+            # If worker already has this model loaded, we treat them as highly desirable (affinity)
+            # But for simplicity, we recalculate capacity.
+
+            usable_vram = w.specs['vram_gb'] - kv_buffer
+            if usable_vram <= 0: continue
+
+            can_fit_layers = int(usable_vram / gb_per_layer)
+            if can_fit_layers <= 0: continue
+
+            # Cap at remaining layers
+            layers_to_take = min(can_fit_layers, total_layers - assigned_layers)
+
+            # Create Layer Range
+            start = assigned_layers
+            end = assigned_layers + layers_to_take - 1 # Inclusive
+
+            plan.append({
+                "worker_id": w.pubkey,
+                "layers": list(range(start, end + 1)),
+                "endpoint": f"http://{w.specs['public_ip']}:{w.specs['p2p_port']}"
+            })
+
+            assigned_layers += layers_to_take
+
+        if assigned_layers < total_layers:
+            return None # Impossible to fit model on current grid
+
+        return plan
+
+    # --- JOB EXECUTION ---
+
+    async def process_queue(self):
+        """Main Loop: Pops from Redis, Plans, Dispatches."""
+        print("🚀 [Scheduler] Dispatcher Active")
+        while True:
             try:
-                await worker.ws.send_json({
-                    "type": "EXECUTE",
-                    "job": {
-                        **job,
-                        "assigned_layers": layer_splits[wid],
-                        "is_first": i == 0,
-                        "is_last": i == len(worker_order) - 1,
-                        "next_worker": worker_order[i+1] if i < len(worker_order)-1 else None
-                    }
-                })
+                # 1. Pop Job
+                item = await r.blpop("job_queue", timeout=2)
+                if not item:
+                    continue
 
-                worker.status = "BUSY"
-                worker.assigned_layers = layer_splits[wid]
+                job_data = json.loads(item[1])
+                job = JobState(
+                    id=job_data['id'],
+                    model_id=job_data['model'],
+                    input_prompt=job_data['input'],
+                    est_tokens=job_data['tokens'],
+                    owner=job_data['owner'],
+                    cost=job_data['cost'],
+                    created_at=time.time()
+                )
 
-                print(f"  ✅ Dispatched to worker {wid[:8]}...")
+                print(f"📋 [Scheduler] Processing Job {job.id} ({job.model_id})")
+
+                # 2. Get Model Specs
+                model_info = await self._get_model_structure(job.model_id)
+                if not model_info:
+                    print(f"❌ [Scheduler] Model {job.model_id} unknown or not sharded.")
+                    await self._fail_job(job.id, "Model not found in registry")
+                    continue
+
+                # 3. Create Plan (Retry loop)
+                plan = None
+                for attempt in range(5):
+                    plan = self._plan_execution(model_info)
+                    if plan:
+                        break
+                    print(f"⏳ [Scheduler] Resources busy. Retrying job {job.id} in 2s...")
+                    await asyncio.sleep(2)
+
+                if not plan:
+                    print(f"❌ [Scheduler] Insufficient cluster resources for {job.model_id}")
+                    # Re-queue at head or fail? For now, fail to avoid blocking.
+                    await self._fail_job(job.id, "Insufficient Cluster Resources")
+                    continue
+
+                # 4. Dispatch
+                job.topology = plan
+                self.active_jobs[job.id] = job
+
+                await self._dispatch_job(job)
 
             except Exception as e:
-                print(f"  ❌ Failed to dispatch to {wid[:8]}: {e}")
-                await self._fail_job(job_id, f"Worker dispatch failed: {e}")
+                print(f"💥 [Scheduler] Critical Dispatch Error: {e}")
+                import traceback
+                traceback.print_exc()
 
-    async def handle_result(self, wid: str, result_data: dict):
-        """Handle result from worker"""
-        job_id = result_data['job_id']
+    async def _dispatch_job(self, job: JobState):
+        """Sends commands to all workers in the topology."""
 
-        if wid not in self.workers:
+        # Link the chain
+        # Plan list is [WorkerA, WorkerB, WorkerC]
+        # WorkerA sends to WorkerB
+        # WorkerC sends to Scheduler (via WS)
+
+        for i, node in enumerate(job.topology):
+            worker_id = node['worker_id']
+            worker = self.workers.get(worker_id)
+            if not worker:
+                await self._fail_job(job.id, "Worker vanished during dispatch")
+                return
+
+            worker.status = "BUSY"
+
+            # Determine Next Hop
+            next_hop = None
+            if i < len(job.topology) - 1:
+                next_node = job.topology[i+1]
+                next_hop = f"{next_node['endpoint']}/tensor_in" # The P2P URL
+
+            payload = {
+                "type": "EXECUTE",
+                "job_id": job.id,
+                "model_id": job.model_id,
+                "layers": node['layers'],
+                "input": job.input_prompt if i == 0 else None, # Only first node gets text
+                "next_hop": next_hop,
+                "is_first": (i == 0),
+                "is_last": (i == len(job.topology) - 1)
+            }
+
+            await worker.ws.send_json(payload)
+            print(f"📤 [Scheduler] Sent instruction to {worker_id[:8]} (Layers {node['layers'][0]}-{node['layers'][-1]})")
+
+    # --- RESULT HANDLING ---
+
+    async def handle_worker_result(self, wid: str, data: dict):
+        """Received payload from the LAST worker in the chain via WS."""
+        job_id = data.get('job_id')
+        status = data.get('status')
+
+        worker = self.workers.get(wid)
+        if worker: worker.status = "IDLE"
+
+        if job_id not in self.active_jobs:
             return
 
-        worker = self.workers[wid]
-        worker.status = "IDLE"
-        worker.assigned_layers = None
+        job = self.active_jobs[job_id]
 
-        print(f"  ✅ Received result from worker {wid[:8]}...")
+        if status == "completed":
+            print(f"🎉 [Scheduler] Job {job_id} Finished! Output len: {len(data.get('output', ''))}")
 
-        if job_id not in self.jobs:
-            print(f"  ⚠️ Job {job_id} not found in tracker")
-            return
+            # Save to Redis for API pickup
+            await r.setex(f"result:{job_id}", 3600, json.dumps({
+                "job_id": job_id,
+                "status": "completed",
+                "output": data.get('output'),
+                "model": job.model_id
+            }))
 
-        job_exec = self.jobs[job_id]
-        job_exec.results[wid] = result_data
+            # Process Payment
+            await self._settle_payments(job)
 
-        # Check if all workers completed
-        if len(job_exec.results) == len(job_exec.assigned_workers):
-            print(f"  ✅ All workers completed for job {job_id}")
+            del self.active_jobs[job_id]
 
-            # Combine results and store
-            final_output = self._combine_worker_results(job_exec)
+            # Free up all workers in topology
+            for node in job.topology:
+                w = self.workers.get(node['worker_id'])
+                if w: w.status = "IDLE"
 
-            await r.setex(
-                f"result:{job_id}",
-                3600,  # 1 hour TTL
-                json.dumps({
-                    "job_id": job_id,
-                    "status": "completed",
-                    "output": final_output,
-                    "workers": len(job_exec.assigned_workers)
-                })
-            )
-
-            # Pay workers
-            await self._pay_workers(job_exec, result_data.get('cost', 0))
-
-            job_exec.status = "COMPLETED"
-            print(f"  🎉 Job {job_id} completed successfully!")
-
-    def _combine_worker_results(self, job_exec: JobExecution) -> str:
-        """Combine results from multiple workers"""
-        # Last worker has the final output
-        worker_order = sorted(
-            job_exec.layer_splits.keys(),
-            key=lambda w: job_exec.layer_splits[w][-1]
-        )
-
-        last_worker = worker_order[-1]
-
-        if last_worker in job_exec.results:
-            return job_exec.results[last_worker].get('output', '')
-
-        return "Error: No output from workers"
-
-    async def _pay_workers(self, job_exec: JobExecution, total_cost: int):
-        """Distribute payment to workers"""
-        worker_share = calculate_worker_share(total_cost)
-        per_worker = worker_share // len(job_exec.assigned_workers)
-
-        for wid in job_exec.assigned_workers:
-            # Credit worker balance
-            unpaid = await r.incrby(f"worker_bal:{wid}", per_worker)
-
-            print(f"  💰 Credited {wid[:8]}... with {per_worker} lamports (total: {unpaid})")
-
-            # Check payout threshold
-            from shared.economics import MIN_PAYOUT_THRESHOLD
-            if unpaid >= MIN_PAYOUT_THRESHOLD:
-                print(f"  💸 Triggering payout for {wid[:8]}...")
-                sig = await sign_payout(wid, unpaid)
-
-                if sig:
-                    await r.set(f"worker_bal:{wid}", 0)
-
-                    # Notify worker
-                    if wid in self.workers and self.workers[wid].ws:
-                        try:
-                            await self.workers[wid].ws.send_json({
-                                "type": "PAYMENT",
-                                "amount": unpaid,
-                                "sig": sig
-                            })
-                            print(f"    ✅ Payment sent: {sig[:16]}...")
-                        except:
-                            pass
+        elif status == "failed":
+            error = data.get('error', 'Unknown worker error')
+            await self._fail_job(job_id, error)
 
     async def _fail_job(self, job_id: str, reason: str):
-        """Mark job as failed"""
-        await r.setex(
-            f"result:{job_id}",
-            3600,
-            json.dumps({
-                "job_id": job_id,
-                "status": "failed",
-                "error": reason
-            })
-        )
+        print(f"❌ [Scheduler] Job {job_id} Failed: {reason}")
+        await r.setex(f"result:{job_id}", 3600, json.dumps({
+            "job_id": job_id,
+            "status": "failed",
+            "error": reason
+        }))
 
-        if job_id in self.jobs:
-            self.jobs[job_id].status = "FAILED"
+        # Cleanup
+        if job_id in self.active_jobs:
+            job = self.active_jobs[job_id]
+            for node in job.topology:
+                w = self.workers.get(node['worker_id'])
+                if w: w.status = "IDLE"
+            del self.active_jobs[job_id]
 
-# Initialize scheduler
-REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:8002")
-scheduler = EnhancedScheduler(registry_url="http://localhost:8002")
+    async def _settle_payments(self, job: JobState):
+        """Calculate shares and credit workers."""
+        if not job.topology: return
+
+        # Simple equal split for now, or based on layer count
+        total_layers = sum(len(n['layers']) for n in job.topology)
+        share_pool = calculate_worker_share(job.cost)
+
+        for node in job.topology:
+            w_share = int(share_pool * (len(node['layers']) / total_layers))
+            wid = node['worker_id']
+
+            # Redis increment
+            curr = await r.incrby(f"worker_bal:{wid}", w_share)
+
+            # Check Payout Threshold (e.g. 0.1 SOL)
+            # Threshold logic handles actual on-chain tx
+            if curr >= 100_000_000: # 0.1 SOL
+                sig = await sign_payout(wid, curr)
+                if sig:
+                    await r.set(f"worker_bal:{wid}", 0)
+                    # Notify worker
+                    w = self.workers.get(wid)
+                    if w:
+                        await w.ws.send_json({"type": "PAYMENT", "amount": curr, "sig": sig})
+
+# --- FASTAPI APP ---
+
+scheduler = ProductionScheduler(registry_url=settings.REGISTRY_URL if hasattr(settings, 'REGISTRY_URL') else "http://localhost:8002")
 
 @app.on_event("startup")
-async def start():
-    asyncio.create_task(scheduler.dispatch_loop())
+async def startup_event():
+    asyncio.create_task(scheduler.process_queue())
 
 @app.websocket("/ws/worker")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     wid = None
-
     try:
-        data = await ws.receive_json()
+        # Handshake
+        reg_msg = await ws.receive_json()
+        if reg_msg.get('type') != "REGISTER":
+            await ws.close(code=1008)
+            return
 
-        if data['type'] == 'REGISTER':
-            wid = await scheduler.register(ws, data['specs'])
+        wid = await scheduler.register_worker(ws, reg_msg['specs'])
 
-        # Message loop
+        # Main Loop
         while True:
             msg = await ws.receive_json()
+            msg_type = msg.get('type')
 
-            if msg['type'] == 'READY':  # NEW
-                await scheduler.handle_ready(wid, msg)
-
-            elif msg['type'] == 'RESULT':
-                await scheduler.handle_result(wid, msg)
-
-            elif msg['type'] == 'HEARTBEAT':
-                await ws.send_json({"type": "ACK"})
+            if msg_type == "HEARTBEAT":
+                await scheduler.update_heartbeat(wid)
+            elif msg_type == "RESULT":
+                await scheduler.handle_worker_result(wid, msg)
 
     except WebSocketDisconnect:
-        if wid:
-            await scheduler.disconnect(wid)
-
-@app.get("/jobs/{job_id}/status")
-async def get_job_status(job_id: str):
-    """Get job execution status"""
-    if job_id in scheduler.jobs:
-        job_exec = scheduler.jobs[job_id]
-
-        return {
-            "job_id": job_id,
-            "status": job_exec.status,
-            "assigned_workers": [
-                {
-                    "worker_id": wid,
-                    "layer_range": f"{layers[0]}-{layers[-1]}"
-                }
-                for wid, layers in job_exec.layer_splits.items()
-            ],
-            "completed_workers": len(job_exec.results)
-        }
-
-    # Check Redis for completed job
-    result = await r.get(f"result:{job_id}")
-    if result:
-        return json.loads(result)
-
-    return {"job_id": job_id, "status": "not_found"}
+        if wid: await scheduler.unregister_worker(wid)
+    except Exception as e:
+        print(f"WS Error: {e}")
+        if wid: await scheduler.unregister_worker(wid)
 
 @app.get("/workers")
 async def list_workers():
-    """List connected workers"""
     return [
-      {
-        "pubkey": w.pubkey,
-        "status": w.status,
-        "gpu": w.specs.get('gpu', 'unknown'),
-        "vram_gb": w.specs.get('vram_gb', 0),
-        "assigned_layers": w.assigned_layers
-      }
-      for w in scheduler.workers.values()
+        {
+            "id": w.pubkey,
+            "status": w.status,
+            "gpu": w.specs.get("gpu"),
+            "vram": w.specs.get("vram_gb"),
+            "ip": w.specs.get("public_ip")
+        }
+        for w in scheduler.workers.values()
     ]
-
-@app.get("/workers/ready")
-async def get_ready_status():
-  """Check how many workers are ready"""
-  return {
-    "total": len(scheduler.workers),
-    "ready": len(scheduler.ready_workers),
-    "target_model": scheduler.target_model,
-    "workers": [
-      {
-        "id": w.pubkey[:8] + "...",
-        "status": w.status,
-        "ready": w.ready,
-        "model": w.loaded_model,
-        "layers": f"{w.assigned_layers[0]}-{w.assigned_layers[-1]}" if w.assigned_layers else None
-      }
-      for w in scheduler.workers.values()
-    ]
-  }
-
-# @app.post("/preload/{model_id}")
-# async def trigger_preload(model_id: str):
-#   """Trigger workers to preload model"""
-#   success = await scheduler.preload_model_to_workers(model_id)
-#   if success:
-#       return {"status": "preloading"}
-#   else:
-#       raise HTTPException(status_code=400, detail="Not enough workers or model not found")
-
-# --- REPLACE WITH ---
-
-class PreloadRequest(BaseModel):
-    model_id: str
-
-@app.post("/preload")
-async def trigger_preload(req: PreloadRequest):
-  """Trigger workers to preload model"""
-  success = await scheduler.preload_model_to_workers(req.model_id)
-  if success:
-      return {"status": "preloading", "model_id": req.model_id}
-  else:
-      raise HTTPException(status_code=400, detail="Not enough workers or model not found")

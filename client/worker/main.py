@@ -91,13 +91,13 @@ class ProductionWorker:
         print(f"⚙️ Processing Job {job_id} | Layers {layers}")
 
         try:
-            # 1. Load Resources (Real weights from disk/net)
-            # Use the correct method name 'load_layers'
-            self.active_layers = await self.loader.load_layers(model_id, layers, self.device)
+            # 1. Load Resources (skip if already loaded from PRELOAD)
+            if not self.active_layers:
+                self.active_layers = await self.loader.load_layers(model_id, layers, self.device)
 
-            if is_first:
+            if is_first and not self.embeddings:
                 self.embeddings = await self.loader.load_embeddings(model_id, self.device)
-            if is_last:
+            if is_last and not self.lm_head:
                 self.lm_head = await self.loader.load_lm_head(model_id, self.device)
 
             # 2. Prepare Input
@@ -220,8 +220,37 @@ class ProductionWorker:
                     # Msg Loop
                     async for msg in ws:
                         data = json.loads(msg)
-                        if data.get('type') == 'EXECUTE':
-                            # Process in background task to not block heartbeat
+                        msg_type = data.get('type')
+
+                        if msg_type == 'PRELOAD':
+                            # Scheduler tells us to preload layers
+                            model_id = data['model_id']
+                            layers = data['layers']
+
+                            print(f"📦 Preloading {model_id} layers {layers[0]}-{layers[-1]}...")
+
+                            # Download and load to GPU
+                            self.active_layers = await self.loader.load_layers(model_id, layers, self.device)
+
+                            # Load embeddings if first worker
+                            if data.get('is_first'):
+                                self.embeddings = await self.loader.load_embeddings(model_id, self.device)
+
+                            # Load LM head if last worker
+                            if data.get('is_last'):
+                                self.lm_head = await self.loader.load_lm_head(model_id, self.device)
+
+                            # Broadcast ready
+                            await ws.send(json.dumps({
+                                "type": "READY",
+                                "model_id": model_id,
+                                "layers": layers
+                            }))
+
+                            print(f"✅ Ready with {len(self.active_layers)} layers")
+
+                        elif msg_type == 'EXECUTE':
+                            # Job execution - layers already loaded from PRELOAD
                             asyncio.create_task(self.process_job(data['job'], ws))
 
             except Exception as e:

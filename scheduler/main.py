@@ -27,8 +27,10 @@ class WorkerInfo:
     pubkey: str
     ws: WebSocket
     specs: dict
-    status: str  # IDLE, BUSY, OFFLINE
+    status: str  # IDLE, BUSY, OFFLINE, LOADING, READY
     assigned_layers: Optional[List[int]] = None
+    loaded_model: Optional[str] = None  # NEW: Which model is loaded
+    ready: bool = False  # NEW: Whether layers are loaded
 
 @dataclass
 class JobExecution:
@@ -44,6 +46,8 @@ class EnhancedScheduler:
         self.workers: Dict[str, WorkerInfo] = {}
         self.jobs: Dict[str, JobExecution] = {}
         self.registry_url = registry_url
+        self.ready_workers: List[str] = []  # NEW: Track ready workers
+        self.target_model: Optional[str] = None  # NEW: Model we're preparing for
 
     async def register(self, ws: WebSocket, specs: dict) -> str:
         """Register worker with scheduler"""
@@ -221,6 +225,68 @@ class EnhancedScheduler:
                 import traceback
                 traceback.print_exc()
 
+    async def preload_model_to_workers(self, model_id: str):
+      """
+      Called after model is sharded.
+      Assigns layer ranges to workers and tells them to preload.
+      """
+      # Get model info
+      model_info = await self._get_model_info(model_id)
+      if not model_info:
+          print(f"❌ Model {model_id} not found in registry")
+          return False
+
+      total_layers = model_info['num_layers']
+
+      # Get available workers
+      available = [w for w in self.workers.values() if w.status == "IDLE"]
+      if len(available) < 2:
+          print(f"⚠️ Need at least 2 workers, only {len(available)} available")
+          return False
+
+      # Split layers across workers
+      workers_to_use = available[:2]
+      layers_per_worker = total_layers // 2
+
+      print(f"📋 Preloading {model_id} to {len(workers_to_use)} workers...")
+
+      for i, worker in enumerate(workers_to_use):
+          layer_start = i * layers_per_worker
+          layer_end = (i + 1) * layers_per_worker - 1 if i == 0 else total_layers - 1
+          layers = list(range(layer_start, layer_end + 1))
+
+          worker.status = "LOADING"
+          worker.assigned_layers = layers
+          worker.loaded_model = model_id
+
+          # Tell worker to preload
+          await worker.ws.send_json({
+              "type": "PRELOAD",
+              "model_id": model_id,
+              "layers": layers,
+              "is_first": i == 0,
+              "is_last": i == len(workers_to_use) - 1
+          })
+
+          print(f"  → {worker.pubkey[:8]}...: layers {layer_start}-{layer_end}")
+
+      self.target_model = model_id
+      return True
+
+    async def handle_ready(self, worker_id: str, data: dict):
+      """Worker announces it has loaded layers"""
+      if worker_id not in self.workers:
+          return
+
+      worker = self.workers[worker_id]
+      worker.status = "READY"
+      worker.ready = True
+
+      if worker_id not in self.ready_workers:
+          self.ready_workers.append(worker_id)
+
+      print(f"🚀 Worker {worker_id[:8]}... ready with {worker.loaded_model}")
+
     async def _get_model_info(self, model_id: str) -> Optional[Dict]:
         """Get model information from registry"""
         try:
@@ -385,7 +451,6 @@ async def ws_endpoint(ws: WebSocket):
     wid = None
 
     try:
-        # Auth handshake
         data = await ws.receive_json()
 
         if data['type'] == 'REGISTER':
@@ -395,7 +460,10 @@ async def ws_endpoint(ws: WebSocket):
         while True:
             msg = await ws.receive_json()
 
-            if msg['type'] == 'RESULT':
+            if msg['type'] == 'READY':  # NEW
+                await scheduler.handle_ready(wid, msg)
+
+            elif msg['type'] == 'RESULT':
                 await scheduler.handle_result(wid, msg)
 
             elif msg['type'] == 'HEARTBEAT':
@@ -435,12 +503,31 @@ async def get_job_status(job_id: str):
 async def list_workers():
     """List connected workers"""
     return [
-        {
-            "pubkey": w.pubkey,
-            "status": w.status,
-            "gpu": w.specs.get('gpu', 'unknown'),
-            "vram_gb": w.specs.get('vram_gb', 0),
-            "assigned_layers": w.assigned_layers
-        }
-        for w in scheduler.workers.values()
+      {
+        "pubkey": w.pubkey,
+        "status": w.status,
+        "gpu": w.specs.get('gpu', 'unknown'),
+        "vram_gb": w.specs.get('vram_gb', 0),
+        "assigned_layers": w.assigned_layers
+      }
+      for w in scheduler.workers.values()
     ]
+
+@app.get("/workers/ready")
+async def get_ready_status():
+  """Check how many workers are ready"""
+  return {
+    "total": len(scheduler.workers),
+    "ready": len(scheduler.ready_workers),
+    "target_model": scheduler.target_model,
+    "workers": [
+      {
+        "id": w.pubkey[:8] + "...",
+        "status": w.status,
+        "ready": w.ready,
+        "model": w.loaded_model,
+        "layers": f"{w.assigned_layers[0]}-{w.assigned_layers[-1]}" if w.assigned_layers else None
+      }
+      for w in scheduler.workers.values()
+    ]
+  }

@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     SCHEDULER_PRIVATE_KEY: str
     REDIS_HOST: str
     REDIS_PORT: int
+    HF_TOKEN: str
 
     class Config:
         env_file = ".env"

@@ -74,22 +74,33 @@ CMD ["./start.sh"]
 ## File: Dockerfile.worker
 
 ```plaintext
-FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+# CHANGE FROM 2.1.0 TO 2.2.0
+FROM pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
 
 WORKDIR /app
-RUN apt-get update && apt-get install -y git curl
 
-# Install deps
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
 COPY client/worker/requirements.txt .
-RUN pip install -r requirements.txt
 
-# Copy Code
-COPY . .
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Set python path so it can find 'shared' modules
-ENV PYTHONPATH=/app
+# Copy shared library
+COPY shared/ ./shared/
 
-CMD ["python", "client/worker/main.py"]
+# Copy worker code
+COPY client/worker/ ./
+
+# Create cache directory
+RUN mkdir -p /app/layer_cache
+
+CMD ["python", "main.py"]
 ```
 
 ---
@@ -727,13 +738,14 @@ if __name__ == "__main__":
 ## File: client/worker/requirements.txt
 
 ```plaintext
-torch>=2.1.0
-transformers>=5.0.0
-huggingface-hub>=1.3.0
+torch>=2.2.0
+transformers>=4.38.0
+huggingface-hub>=0.19.0
 aiohttp>=3.9.0
 solana>=0.30.2
 solders>=0.21.0
 websockets>=12.0
+accelerate>=0.27.0
 ```
 
 ---
@@ -923,7 +935,6 @@ from solders.transaction import Transaction
 API_KEY = os.getenv("RUNPOD_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
-# NOTE: Volume ID is removed to allow deployment to ANY region with stock
 CORE_IMG = "pxxxe/azu-core:latest"     # <--- UPDATE USERNAME
 WORKER_IMG = "pxxxe/azu-worker:latest" # <--- UPDATE USERNAME
 
@@ -955,103 +966,97 @@ def load_funded_account():
     print("❌ ERROR: No funded account found!")
     sys.exit(1)
 
-def get_pod_connection_info(pod_id, target_internal_port):
+def get_pod_service_url(pod_id, internal_port):
     """
-    Waits for pod to run and returns the actual Public IP and Public Port
-    mapped to the requested internal port (Handles Community Cloud NAT).
+    Determines the best URL to reach a specific port on the pod.
+    1. Checks for a true Public IP (194.x, etc).
+    2. If IP is private (100.x), returns the RunPod Proxy domain IMMEDIATELY.
     """
-    print(f"   ⏳ Waiting for connection info on {pod_id} (internal port {target_internal_port})...")
+    print(f"   ⏳ Resolving connection for {pod_id} (port {internal_port})...")
 
-    for i in range(60): # Wait up to 10 mins
+    for i in range(12):
         try:
             pod = runpod.get_pod(pod_id)
             runtime = pod.get('runtime')
 
             if runtime:
-                # 1. Get Port Mapping
-                ports = runtime.get('ports', [])
-                found_port = None
                 found_ip = runtime.get('publicIp') or runtime.get('public_ip')
+                found_port = None
 
-                for p in ports:
-                    if p['privatePort'] == target_internal_port:
+                for p in runtime.get('ports', []):
+                    if p['privatePort'] == internal_port:
                         found_port = p['publicPort']
-                        # CRITICAL FIX: Grab IP from port object if missing from root
-                        if not found_ip:
-                            found_ip = p.get('ip')
+                        if not found_ip: found_ip = p.get('ip')
                         break
 
-                if found_ip and found_port:
-                    print(f"      ✅ Connection found: {found_ip}:{found_port} -> {target_internal_port}")
-                    return found_ip, found_port
+                # CASE A: Real Public IP
+                if found_ip and found_port and not (found_ip.startswith("100.") or found_ip.startswith("10.") or found_ip.startswith("192.")):
+                    url = f"{found_ip}:{found_port}"
+                    print(f"      ✅ Found Public IP: {url}")
+                    return url, False
 
-            # Debug status if waiting
-            status = pod.get('lastStatus') or pod.get('status') or "Unknown"
-            if i % 3 == 0:
-                print(f"      [{i}/60] Status: {status}...")
+                # CASE B: Private/CGNAT IP -> Use Proxy
+                if found_ip and (found_ip.startswith("100.") or found_ip.startswith("10.")):
+                    proxy_domain = f"{pod_id}-{internal_port}.proxy.runpod.net"
+                    print(f"      ✅ Detected Private IP ({found_ip}). Using Proxy: {proxy_domain}")
+                    return proxy_domain, True
+
+            status = pod.get('lastStatus') or "Unknown"
+            if i % 2 == 0: print(f"      [{i}/12] Pod Status: {status}...")
 
         except Exception as e:
             print(f"      ⚠️ API Polling Error: {e}")
 
         time.sleep(10)
 
-    print("❌ DUMPING POD DATA FOR DEBUGGING:")
-    try:
-        print(json.dumps(runpod.get_pod(pod_id), indent=2))
-    except:
-        pass
-    raise Exception(f"Pod {pod_id} failed to come online or expose ports.")
+    print("      ⚠️ API Timeout or No IP info. Defaulting to Proxy URL.")
+    return f"{pod_id}-{internal_port}.proxy.runpod.net", True
 
 def wait_for_http(url, name="Service", retries=30):
     """Waits for the HTTP service inside the pod to actually start"""
     print(f"   ⏳ Waiting for {name} to be healthy at {url}...")
     for i in range(retries):
         try:
-            # We just check if it connects, even if it returns 404/405 it's "up"
             requests.get(url, timeout=5)
             print(f"      ✅ {name} is responding!")
             return True
-        except:
+        except Exception as e:
             if i % 5 == 0:
-                print(f"      [{i}/{retries}] Service starting...")
+                print(f"      [{i}/{retries}] Service starting... ({str(e)[:50]})")
             time.sleep(5)
     print(f"      ⚠️ {name} did not start in time. Check Pod Logs.")
     return False
 
-def distribute_sol(funder_kp, recipient_pubkey, amount_sol, client):
-    """Transfer SOL from funder to recipient"""
+def distribute_sol_with_retry(funder_kp, recipient_pubkey, amount_sol, client):
+    lamports = int(amount_sol * 1_000_000_000)
     try:
-        lamports = int(amount_sol * 1_000_000_000)
         ix = transfer(TransferParams(from_pubkey=funder_kp.pubkey(), to_pubkey=recipient_pubkey, lamports=lamports))
         blockhash = client.get_latest_blockhash().value.blockhash
         tx = Transaction.new_signed_with_payer([ix], funder_kp.pubkey(), [funder_kp], blockhash)
-
         sig = client.send_transaction(tx).value
         print(f"      📤 Transfer sent: {sig}")
-
-        # INCREASED WAIT TIME FOR CONFIRMATION
-        print("      ⏳ Waiting for confirmation...")
-        time.sleep(10)
-
-        balance = client.get_balance(recipient_pubkey).value
-        print(f"      ✅ Recipient balance: {balance / 1e9} SOL")
-        return True
     except Exception as e:
         print(f"      ❌ Transfer failed: {e}")
         return False
 
+    print("      ⏳ Waiting for balance update...")
+    for _ in range(20):
+        time.sleep(2)
+        bal = client.get_balance(recipient_pubkey).value / 1e9
+        if bal > 0:
+            print(f"      ✅ Recipient balance confirmed: {bal} SOL")
+            return True
+    return False
+
 def setup_solana_accounts():
-    """Generates wallets and funds them from your funded account"""
     print("\n💰 0. Setting up Solana Wallets...")
     funder_kp = load_funded_account()
     client = Client(RPC_URL)
-
     funder_balance = client.get_balance(funder_kp.pubkey()).value / 1e9
     print(f"   💵 Funder balance: {funder_balance} SOL")
 
-    needed_sol = DISTRIBUTION_AMOUNT * 2
-    if funder_balance < needed_sol:
-        print(f"❌ Insufficient funds! Need {needed_sol} SOL, have {funder_balance} SOL")
+    if funder_balance < 0.2:
+        print(f"❌ Insufficient funds! Need 0.2 SOL, have {funder_balance} SOL")
         sys.exit(1)
 
     platform_kp = Keypair()
@@ -1063,19 +1068,18 @@ def setup_solana_accounts():
     print(f"   🔑 User: {user_kp.pubkey()}")
 
     print(f"\n   💸 Distributing {DISTRIBUTION_AMOUNT} SOL to Scheduler...")
-    if not distribute_sol(funder_kp, scheduler_kp.pubkey(), DISTRIBUTION_AMOUNT, client):
+    if not distribute_sol_with_retry(funder_kp, scheduler_kp.pubkey(), DISTRIBUTION_AMOUNT, client):
         sys.exit(1)
 
     print(f"\n   💸 Distributing {DISTRIBUTION_AMOUNT} SOL to User...")
-    if not distribute_sol(funder_kp, user_kp.pubkey(), DISTRIBUTION_AMOUNT, client):
+    if not distribute_sol_with_retry(funder_kp, user_kp.pubkey(), DISTRIBUTION_AMOUNT, client):
         sys.exit(1)
 
     scheduler_priv = json.dumps(list(bytes(scheduler_kp)))
     return {
         "platform_pub": str(platform_kp.pubkey()),
         "scheduler_priv": scheduler_priv,
-        "user_kp": user_kp,
-        "scheduler_pub": str(scheduler_kp.pubkey())
+        "user_kp": user_kp
     }
 
 def run_lifecycle():
@@ -1105,19 +1109,22 @@ def run_lifecycle():
         )
         core_id = core['id']
 
-        # GET CONNECTION INFO
-        core_ip, api_port = get_pod_connection_info(core_id, 8000)
-        _, sched_port = get_pod_connection_info(core_id, 8001)
-        _, reg_port = get_pod_connection_info(core_id, 8002)
+        # RESOLVE CONNECTION (Proxy vs IP)
+        api_host, api_is_proxy = get_pod_service_url(core_id, 8000)
+        reg_host, reg_is_proxy = get_pod_service_url(core_id, 8002)
+        sched_host, sched_is_proxy = get_pod_service_url(core_id, 8001)
 
-        api_url = f"http://{core_ip}:{api_port}"
-        reg_url = f"http://{core_ip}:{reg_port}"
-        sched_url = f"ws://{core_ip}:{sched_port}/ws/worker"
+        api_scheme = "https" if api_is_proxy else "http"
+        ws_scheme = "wss" if sched_is_proxy else "ws"
+
+        api_url = f"{api_scheme}://{api_host}"
+        reg_url = f"{api_scheme}://{reg_host}"
+        sched_url = f"{ws_scheme}://{sched_host}/ws/worker"
 
         print(f"   ✅ Core API: {api_url}")
         print(f"   ✅ Registry: {reg_url}")
+        print(f"   ✅ Scheduler: {sched_url}")
 
-        # WAIT FOR SERVER TO START (Install dependencies takes time!)
         wait_for_http(f"{reg_url}/docs", "Registry")
 
         # STEP 2: SHARDING
@@ -1126,7 +1133,6 @@ def run_lifecycle():
             requests.post(f"{reg_url}/models/shard", json={"model_id": "Qwen/Qwen2.5-0.5B"}, timeout=60)
         except Exception as e:
             print(f"   ⚠️ Sharding request info: {e}")
-
         time.sleep(10)
 
         # STEP 3: WORKERS
@@ -1147,8 +1153,8 @@ def run_lifecycle():
             worker_ids.append(w['id'])
             print(f"   Worker {i} deployed: {w['id']}")
 
-        print("   ⏳ Waiting for Swarm Assembly (60s)...")
-        time.sleep(60)
+        print("   ⏳ Waiting for Swarm Assembly (100s)...")
+        time.sleep(100)
 
         # STEP 4: USER DEPOSIT
         print("\n💳 4. Simulating User Deposit...")
@@ -1156,17 +1162,26 @@ def run_lifecycle():
         platform_pub = Pubkey.from_string(wallets['platform_pub'])
         client = Client(RPC_URL)
 
-        ix = transfer(TransferParams(from_pubkey=user_kp.pubkey(), to_pubkey=platform_pub, lamports=100_000_000))
+        # FIX: Lower amount to cover fees
+        transfer_amount = 0.05
+        lamports = int(transfer_amount * 1_000_000_000)
+
+        ix = transfer(TransferParams(from_pubkey=user_kp.pubkey(), to_pubkey=platform_pub, lamports=lamports))
         blockhash = client.get_latest_blockhash().value.blockhash
         tx = Transaction.new_signed_with_payer([ix], user_kp.pubkey(), [user_kp], blockhash)
 
-        print("   Sending on-chain deposit transaction...")
+        print(f"   Sending on-chain deposit transaction ({transfer_amount} SOL)...")
         sig = client.send_transaction(tx).value
         print(f"   Tx Sent: {sig}")
-        time.sleep(10)
+
+        # --- CRITICAL FIX: WAIT FOR CONFIRMATION ---
+        print("      ⏳ Waiting 20s for transaction confirmation...")
+        time.sleep(20)
+        # -------------------------------------------
 
         print("   Notifying API of deposit...")
-        wait_for_http(f"{api_url}/docs", "API") # Ensure API is up before calling
+        wait_for_http(f"{api_url}/docs", "API")
+
         res = requests.post(f"{api_url}/deposit", json={
             "tx_sig": str(sig),
             "user_pubkey": str(user_kp.pubkey())
@@ -2007,6 +2022,7 @@ class Settings(BaseSettings):
     SCHEDULER_PRIVATE_KEY: str
     REDIS_HOST: str
     REDIS_PORT: int
+    HF_TOKEN: str
 
     class Config:
         env_file = ".env"

@@ -211,11 +211,25 @@ def run_lifecycle():
 
         # STEP 2: SHARDING
         print("\n⚡ 2. Sharding Model...")
+        model_id = "Qwen/Qwen2.5-0.5B"
+
+        print("   📥 Downloading and sharding (2-3 minutes)...")
         try:
-            requests.post(f"{reg_url}/models/shard", json={"model_id": "Qwen/Qwen2.5-0.5B"}, timeout=60)
+            shard_resp = requests.post(
+                f"{reg_url}/models/shard",
+                json={"model_id": model_id},
+                timeout=300
+            )
+
+            if shard_resp.status_code != 200:
+                raise Exception(f"Sharding failed: {shard_resp.text}")
+
+            data = shard_resp.json()
+            print(f"   ✅ Model sharded: {data['num_layers']} layers")
+
         except Exception as e:
-            print(f"   ⚠️ Sharding request info: {e}")
-        time.sleep(10)
+            print(f"   ❌ Sharding error: {e}")
+            raise
 
         # STEP 3: WORKERS
         print("\n🚀 3. Deploying 2 GPU Workers...")
@@ -235,10 +249,74 @@ def run_lifecycle():
             worker_ids.append(w['id'])
             print(f"   Worker {i} deployed: {w['id']}")
 
-        print("   ⏳ Waiting for Swarm Assembly (100s)...")
-        time.sleep(100)
+        # STEP 3.5: Wait for workers to connect
+        print("\n⏳ Waiting for workers to connect to scheduler...")
+        scheduler_base = f"{api_url.replace('8000', '8001')}"
 
-        # STEP 4: USER DEPOSIT
+        time.sleep(20)  # Give pods time to start
+
+        # Check workers are connected
+        for i in range(12):
+            try:
+                workers_resp = requests.get(f"{scheduler_base}/workers")
+                if workers_resp.status_code == 200:
+                    worker_count = len(workers_resp.json())
+                    if worker_count >= 2:
+                        print(f"   ✅ {worker_count} workers connected")
+                        break
+            except:
+                pass
+            time.sleep(5)
+
+        # STEP 3.6: Trigger preload
+        print("\n📦 Triggering workers to preload model...")
+        try:
+            preload_resp = requests.post(
+                f"{scheduler_base}/preload/{model_id}",
+                timeout=10
+            )
+            if preload_resp.status_code == 200:
+                print("   ✅ Preload triggered")
+            else:
+                print(f"   ⚠️ Preload response: {preload_resp.text}")
+        except Exception as e:
+            print(f"   ⚠️ Preload trigger failed: {e}")
+
+        # STEP 3.7: Poll for worker readiness (NO ARBITRARY WAIT)
+        print("\n⏳ Waiting for workers to load layers...")
+        ready_url = f"{scheduler_base}/workers/ready"
+
+        max_wait = 300  # 5 minutes max
+        start_time = time.time()
+
+        while time.time() - start_time < max_wait:
+            try:
+                ready_resp = requests.get(ready_url, timeout=5)
+                if ready_resp.status_code == 200:
+                    data = ready_resp.json()
+                    total = data['total']
+                    ready = data['ready']
+
+                    # Show status
+                    print(f"   [{int(time.time() - start_time)}s] Workers: {ready}/{total} ready")
+                    for w in data['workers']:
+                        status = w['status']
+                        layers = w['layers'] or 'none'
+                        print(f"     - {w['id']}: {status} (layers: {layers})")
+
+                    # Check if enough workers ready
+                    if ready >= 2:
+                        print(f"   ✅ {ready} workers READY!")
+                        break
+            except Exception as e:
+                print(f"   ⚠️ Poll error: {e}")
+
+            time.sleep(10)
+        else:
+            # Timeout - workers didn't become ready
+            raise Exception(f"Workers not ready after {max_wait}s")
+
+        # STEP 4: USER DEPOSIT (continues as before)
         print("\n💳 4. Simulating User Deposit...")
         user_kp = wallets['user_kp']
         platform_pub = Pubkey.from_string(wallets['platform_pub'])

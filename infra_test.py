@@ -14,8 +14,6 @@ from solders.pubkey import Pubkey
 from solders.system_program import transfer, TransferParams
 from solders.transaction import Transaction
 
-from urllib.parse import quote
-
 # ================= CONFIGURATION =================
 API_KEY = os.getenv("RUNPOD_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -55,7 +53,6 @@ def create_pod_with_retry(
 ):
     """
     Create RunPod pod with retry logic across multiple GPU types.
-    Tries each GPU type in GPU_TYPES list before giving up.
     """
     total_attempts = 0
 
@@ -82,8 +79,6 @@ def create_pod_with_retry(
 
             except runpod.error.QueryError as e:
                 error_msg = str(e)
-
-                # Check if it's a retryable GPU availability error
                 is_gpu_error = (
                     "does not have the resources" in error_msg or
                     "failed to provision" in error_msg.lower() or
@@ -93,15 +88,12 @@ def create_pod_with_retry(
 
                 if is_gpu_error:
                     if attempt < max_attempts_per_gpu:
-                        print(f"   ⚠️  {gpu_type} unavailable: {error_msg[:100]}...")
-                        print(f"   ⏳ Waiting {wait_between_attempts}s before retry...")
+                        print(f"   ⚠️  {gpu_type} unavailable. Waiting {wait_between_attempts}s...")
                         time.sleep(wait_between_attempts)
                     else:
-                        print(f"   ❌ {gpu_type} exhausted after {max_attempts_per_gpu} attempts")
-                        # Break to try next GPU type
+                        print(f"   ❌ {gpu_type} exhausted.")
                         break
                 else:
-                    # Non-retryable error, raise immediately
                     print(f"   ❌ Non-retryable error: {error_msg}")
                     raise
 
@@ -109,11 +101,7 @@ def create_pod_with_retry(
                 print(f"   ❌ Unexpected error: {e}")
                 raise
 
-    # If we get here, all GPU types failed
-    raise Exception(
-        f"Failed to create pod '{name}' after trying {len(GPU_TYPES)} GPU types "
-        f"({total_attempts} total attempts)"
-    )
+    raise Exception(f"Failed to create pod '{name}' after trying {len(GPU_TYPES)} GPU types.")
 
 # ============================================
 
@@ -142,8 +130,6 @@ def load_funded_account():
 def get_pod_service_url(pod_id, internal_port):
     """
     Determines the best URL to reach a specific port on the pod.
-    1. Checks for a true Public IP (194.x, etc).
-    2. If IP is private (100.x), returns the RunPod Proxy domain IMMEDIATELY.
     """
     print(f"   ⏳ Resolving connection for {pod_id} (port {internal_port})...")
 
@@ -263,12 +249,11 @@ def run_lifecycle():
         # STEP 0: WALLETS
         wallets = setup_solana_accounts()
 
-        # STEP 1: CORE (WITH RETRY)
+        # STEP 1: CORE
         print("\n🚀 1. Deploying Core...")
         core = create_pod_with_retry(
             name="azu-core",
             image_name=CORE_IMG,
-            # gpu_type_id="NVIDIA GeForce RTX 4080",
             cloud_type="COMMUNITY",
             ports="8000/http,8001/http,8002/http",
             env={
@@ -294,6 +279,9 @@ def run_lifecycle():
         reg_url = f"{api_scheme}://{reg_host}"
         sched_url = f"{ws_scheme}://{sched_host}/ws/worker"
 
+        # Scheduler HTTP URL for querying worker status
+        sched_api_url = f"{api_scheme}://{sched_host}"
+
         print(f"   ✅ Core API: {api_url}")
         print(f"   ✅ Registry: {reg_url}")
         print(f"   ✅ Scheduler: {sched_url}")
@@ -312,61 +300,23 @@ def run_lifecycle():
                 timeout=300
             )
 
-            print(f"\n   📊 Response Status: {shard_resp.status_code}")
-            print(f"   📊 Response Headers: {dict(shard_resp.headers)}")
-
             if shard_resp.status_code != 200:
-                print(f"\n   ❌ SHARDING FAILED ❌")
-                print(f"   Status Code: {shard_resp.status_code}")
-                print(f"   Response Text:\n{shard_resp.text}")
-
-                # Try to parse JSON error
-                try:
-                    error_data = shard_resp.json()
-                    if 'detail' in error_data:
-                        detail = error_data['detail']
-                        if isinstance(detail, dict):
-                            print(f"\n   🔍 Error Details:")
-                            print(f"      Error: {detail.get('error', 'Unknown')}")
-                            print(f"      Model: {detail.get('model_id', 'Unknown')}")
-                            if 'traceback' in detail:
-                                print(f"\n   📋 Full Traceback:")
-                                print(detail['traceback'])
-                        else:
-                            print(f"\n   Error: {detail}")
-                except:
-                    pass
-
-                raise Exception(f"Sharding failed with status {shard_resp.status_code}: {shard_resp.text}")
+                print(f"\n   ❌ SHARDING FAILED: {shard_resp.text}")
+                raise Exception(f"Sharding failed")
 
             data = shard_resp.json()
             print(f"   ✅ Model sharded: {data['num_layers']} layers")
 
-        except requests.exceptions.Timeout:
-            print(f"\n   ❌ Request timed out after 300 seconds")
-            print(f"   The registry might still be processing. Check pod logs:")
-            print(f"   runpod ssh {core_id}")
-            raise
-
         except Exception as e:
             print(f"\n   ❌ Sharding error: {e}")
-            print(f"\n   🔍 Debugging steps:")
-            print(f"   1. Check registry logs:")
-            print(f"      runpod ssh {core_id}")
-            print(f"      docker logs <container_id>")
-            print(f"   2. Check HF_TOKEN is valid")
-            print(f"   3. Check disk space on pod")
-            print(f"   4. Try manually:")
-            print(f"      curl -X POST {reg_url}/models/shard -H 'Content-Type: application/json' -d '{{'model_id': '{model_id}'}}'")
             raise
 
-        # STEP 3: WORKERS (WITH RETRY)
+        # STEP 3: WORKERS
         print("\n🚀 3. Deploying 2 GPU Workers...")
         for i in range(2):
             w = create_pod_with_retry(
                 name=f"azu-worker-{i}",
                 image_name=WORKER_IMG,
-                # gpu_type_id="NVIDIA GeForce RTX 4080",
                 cloud_type="COMMUNITY",
                 ports="8003/http",
                 env={
@@ -379,80 +329,38 @@ def run_lifecycle():
             print(f"   Worker {i} deployed: {w['id']}")
 
         # STEP 3.5: Wait for workers to connect
-        print("\n⏳ Waiting for workers to connect to scheduler...")
-        scheduler_base = f"{api_url.replace('8000', '8001')}"
+        # NOTE: No explicit preload. Workers connect, Registry has model. Scheduler maps them JIT.
+        print("\n⏳ Waiting for workers to register with Scheduler...")
 
-        time.sleep(20)  # Give pods time to start
+        workers_ready = False
+        start_wait = time.time()
 
-        # Check workers are connected
-        for i in range(12):
+        while time.time() - start_wait < 300: # 5 mins max
             try:
-                workers_resp = requests.get(f"{scheduler_base}/workers")
-                if workers_resp.status_code == 200:
-                    worker_count = len(workers_resp.json())
-                    if worker_count >= 2:
-                        print(f"   ✅ {worker_count} workers connected")
-                        break
-            except:
-                pass
-            time.sleep(5)
+                resp = requests.get(f"{sched_api_url}/workers", timeout=5)
+                if resp.status_code == 200:
+                    workers = resp.json()
+                    count = len(workers)
+                    print(f"   [{int(time.time()-start_wait)}s] Connected Workers: {count}")
 
-        # STEP 3.6: Trigger preload
-        print("\n📦 Triggering workers to preload model...")
-        try:
-          preload_resp = requests.post(
-            f"{scheduler_base}/preload",
-            json={"model_id": model_id},
-            timeout=10
-          )
-          if preload_resp.status_code == 200:
-            print("   ✅ Preload triggered")
-          else:
-            print(f"   ⚠️ Preload response: {preload_resp.text}")
-        except Exception as e:
-            print(f"   ⚠️ Preload trigger failed: {e}")
-
-        # STEP 3.7: Poll for worker readiness (NO ARBITRARY WAIT)
-        print("\n⏳ Waiting for workers to load layers...")
-        ready_url = f"{scheduler_base}/workers/ready"
-
-        max_wait = 300  # 5 minutes max
-        start_time = time.time()
-
-        while time.time() - start_time < max_wait:
-            try:
-                ready_resp = requests.get(ready_url, timeout=5)
-                if ready_resp.status_code == 200:
-                    data = ready_resp.json()
-                    total = data['total']
-                    ready = data['ready']
-
-                    # Show status
-                    print(f"   [{int(time.time() - start_time)}s] Workers: {ready}/{total} ready")
-                    for w in data['workers']:
-                        status = w['status']
-                        layers = w['layers'] or 'none'
-                        print(f"     - {w['id']}: {status} (layers: {layers})")
-
-                    # Check if enough workers ready
-                    if ready >= 2:
-                        print(f"   ✅ {ready} workers READY!")
+                    if count >= 2:
+                        print(f"   ✅ {count} Workers connected and ready for jobs.")
+                        workers_ready = True
                         break
             except Exception as e:
-                print(f"   ⚠️ Poll error: {e}")
+                print(f"   ⚠️ Polling error: {e}")
 
-            time.sleep(10)
-        else:
-            # Timeout - workers didn't become ready
-            raise Exception(f"Workers not ready after {max_wait}s")
+            time.sleep(5)
 
-        # STEP 4: USER DEPOSIT (continues as before)
+        if not workers_ready:
+            raise Exception("Workers failed to connect in time.")
+
+        # STEP 4: USER DEPOSIT
         print("\n💳 4. Simulating User Deposit...")
         user_kp = wallets['user_kp']
         platform_pub = Pubkey.from_string(wallets['platform_pub'])
         client = Client(RPC_URL)
 
-        # FIX: Lower amount to cover fees
         transfer_amount = 0.05
         lamports = int(transfer_amount * 1_000_000_000)
 
@@ -464,13 +372,8 @@ def run_lifecycle():
         sig = client.send_transaction(tx).value
         print(f"   Tx Sent: {sig}")
 
-        # --- CRITICAL FIX: WAIT FOR CONFIRMATION ---
         print("      ⏳ Waiting 20s for transaction confirmation...")
         time.sleep(20)
-        # -------------------------------------------
-
-        print("   Notifying API of deposit...")
-        wait_for_http(f"{api_url}/docs", "API")
 
         res = requests.post(f"{api_url}/deposit", json={
             "tx_sig": str(sig),
@@ -480,6 +383,8 @@ def run_lifecycle():
 
         # STEP 5: INFERENCE
         print("\n🧪 5. Running Inference Job...")
+        print("   (Note: First run will be slower as workers download layers JIT)")
+
         res = requests.post(f"{api_url}/submit", json={
             "user_pubkey": str(user_kp.pubkey()),
             "model_id": "Qwen/Qwen2.5-0.5B",
@@ -492,18 +397,26 @@ def run_lifecycle():
             raise Exception(f"Submission failed: {res.text}")
 
         job_id = res.json()['job_id']
-        print("   Polling results...")
-        for _ in range(30):
+        print(f"   Polling results for Job {job_id}...")
+
+        # Extended timeout for first JIT run (downloading layers)
+        for i in range(60):
             res = requests.get(f"{api_url}/results/{job_id}")
             data = res.json()
-            if data.get('status') == 'completed':
+
+            status = data.get('status')
+            if status == 'completed':
                 print(f"\n🎉 SUCCESS: {data['output']}\n")
                 return
-            if data.get('status') == 'failed':
+            if status == 'failed':
                 print(f"\n❌ JOB FAILED: {data.get('error')}\n")
                 return
+
+            if i % 5 == 0:
+                print(f"   [{i*2}s] Status: {status}...")
             time.sleep(2)
-        raise Exception("Test Timed Out")
+
+        raise Exception("Test Timed Out waiting for inference result")
 
     except Exception as e:
         print(f"\n❌ CRITICAL FAIL: {e}")

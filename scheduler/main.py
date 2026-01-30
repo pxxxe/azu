@@ -12,7 +12,7 @@ import asyncio
 import json
 import redis.asyncio as redis
 import aiohttp
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 from shared.config import settings
@@ -532,4 +532,4 @@ async def trigger_preload(model_id: str):
   if success:
       return {"status": "preloading"}
   else:
-      raise HTTPException(400, "Not enough workers or model not found")
+      raise HTTPException(status_code=400, detail="Not enough workers or model not found")

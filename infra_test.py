@@ -400,14 +400,15 @@ def run_lifecycle():
         # STEP 3.6: Trigger preload
         print("\n📦 Triggering workers to preload model...")
         try:
-            preload_resp = requests.post(
-                f"{scheduler_base}/preload/{quote(model_id, safe='')}",
-                timeout=10
-            )
-            if preload_resp.status_code == 200:
-                print("   ✅ Preload triggered")
-            else:
-                print(f"   ⚠️ Preload response: {preload_resp.text}")
+          preload_resp = requests.post(
+            f"{scheduler_base}/preload",
+            json={"model_id": model_id},
+            timeout=10
+          )
+          if preload_resp.status_code == 200:
+            print("   ✅ Preload triggered")
+          else:
+            print(f"   ⚠️ Preload response: {preload_resp.text}")
         except Exception as e:
             print(f"   ⚠️ Preload trigger failed: {e}")
 

@@ -19,7 +19,7 @@ from shared.config import settings
 from shared.economics import calculate_worker_share
 from shared.solana_lib import sign_payout
 import os
-
+from pydantic import BaseModel  # Add this if not already present
 
 app = FastAPI()
 r = redis.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, decode_responses=True)
@@ -528,11 +528,25 @@ async def get_ready_status():
     ]
   }
 
-@app.post("/preload/{model_id}")
-async def trigger_preload(model_id: str):
+# @app.post("/preload/{model_id}")
+# async def trigger_preload(model_id: str):
+#   """Trigger workers to preload model"""
+#   success = await scheduler.preload_model_to_workers(model_id)
+#   if success:
+#       return {"status": "preloading"}
+#   else:
+#       raise HTTPException(status_code=400, detail="Not enough workers or model not found")
+
+# --- REPLACE WITH ---
+
+class PreloadRequest(BaseModel):
+    model_id: str
+
+@app.post("/preload")
+async def trigger_preload(req: PreloadRequest):
   """Trigger workers to preload model"""
-  success = await scheduler.preload_model_to_workers(model_id)
+  success = await scheduler.preload_model_to_workers(req.model_id)
   if success:
-      return {"status": "preloading"}
+      return {"status": "preloading", "model_id": req.model_id}
   else:
       raise HTTPException(status_code=400, detail="Not enough workers or model not found")

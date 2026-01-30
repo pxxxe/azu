@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from shared.config import settings
 from shared.economics import calculate_worker_share
 from shared.solana_lib import sign_payout
+import os
+
 
 app = FastAPI()
 r = redis.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, decode_responses=True)
@@ -42,7 +44,7 @@ class JobExecution:
     status: str  # PENDING, IN_PROGRESS, COMPLETED, FAILED
 
 class EnhancedScheduler:
-    def __init__(self, registry_url: str = "http://registry:8002"):
+    def __init__(self, registry_url: str = "http://localhost:8002"):
         self.workers: Dict[str, WorkerInfo] = {}
         self.jobs: Dict[str, JobExecution] = {}
         self.registry_url = registry_url
@@ -432,6 +434,7 @@ class EnhancedScheduler:
             self.jobs[job_id].status = "FAILED"
 
 # Initialize scheduler
+REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:8002")
 scheduler = EnhancedScheduler(registry_url="http://localhost:8002")
 
 @app.on_event("startup")

@@ -5,6 +5,7 @@ import os
 import sys
 import json
 import asyncio
+import random
 
 # === SOLANA IMPORTS ===
 from solana.rpc.api import Client
@@ -25,6 +26,94 @@ DISTRIBUTION_AMOUNT = 0.1
 # =================================================
 
 runpod.api_key = API_KEY
+
+# ============================================
+# RETRY LOGIC FOR GPU PROVISIONING
+# ============================================
+
+GPU_TYPES = [
+    "NVIDIA GeForce RTX 4090",      # 24GB, SM_89
+    "NVIDIA GeForce RTX 4080",      # 16GB, SM_89
+    "NVIDIA RTX A5000",             # 24GB, SM_86
+    "NVIDIA GeForce RTX 3090",      # 24GB, SM_86
+    "NVIDIA RTX A4500",             # 20GB, SM_86
+    "NVIDIA GeForce RTX 4070 Ti",   # 12GB, SM_89
+    "NVIDIA RTX A4000",             # 16GB, SM_86
+]
+
+
+def create_pod_with_retry(
+    name,
+    image_name,
+    cloud_type,
+    ports,
+    env,
+    max_attempts_per_gpu=5,
+    wait_between_attempts=5
+):
+    """
+    Create RunPod pod with retry logic across multiple GPU types.
+    Tries each GPU type in GPU_TYPES list before giving up.
+    """
+    total_attempts = 0
+
+    for gpu_type in GPU_TYPES:
+        print(f"\n   🎯 Trying GPU type: {gpu_type}")
+
+        for attempt in range(1, max_attempts_per_gpu + 1):
+            total_attempts += 1
+
+            try:
+                print(f"   🔄 Attempt {attempt}/{max_attempts_per_gpu} with {gpu_type}...")
+
+                pod = runpod.create_pod(
+                    name=name,
+                    image_name=image_name,
+                    gpu_type_id=gpu_type,
+                    cloud_type=cloud_type,
+                    ports=ports,
+                    env=env
+                )
+
+                print(f"   ✅ Pod created successfully on {gpu_type}: {pod['id']}")
+                return pod
+
+            except runpod.error.QueryError as e:
+                error_msg = str(e)
+
+                # Check if it's a retryable GPU availability error
+                is_gpu_error = (
+                    "does not have the resources" in error_msg or
+                    "failed to provision" in error_msg.lower() or
+                    "no longer any instances available" in error_msg.lower() or
+                    "requested specifications" in error_msg.lower()
+                )
+
+                if is_gpu_error:
+                    if attempt < max_attempts_per_gpu:
+                        print(f"   ⚠️  {gpu_type} unavailable: {error_msg[:100]}...")
+                        print(f"   ⏳ Waiting {wait_between_attempts}s before retry...")
+                        time.sleep(wait_between_attempts)
+                    else:
+                        print(f"   ❌ {gpu_type} exhausted after {max_attempts_per_gpu} attempts")
+                        # Break to try next GPU type
+                        break
+                else:
+                    # Non-retryable error, raise immediately
+                    print(f"   ❌ Non-retryable error: {error_msg}")
+                    raise
+
+            except Exception as e:
+                print(f"   ❌ Unexpected error: {e}")
+                raise
+
+    # If we get here, all GPU types failed
+    raise Exception(
+        f"Failed to create pod '{name}' after trying {len(GPU_TYPES)} GPU types "
+        f"({total_attempts} total attempts)"
+    )
+
+# ============================================
 
 def load_funded_account():
     """Load your funded devnet account keypair"""
@@ -172,12 +261,12 @@ def run_lifecycle():
         # STEP 0: WALLETS
         wallets = setup_solana_accounts()
 
-        # STEP 1: CORE
+        # STEP 1: CORE (WITH RETRY)
         print("\n🚀 1. Deploying Core...")
-        core = runpod.create_pod(
+        core = create_pod_with_retry(
             name="azu-core",
             image_name=CORE_IMG,
-            gpu_type_id="NVIDIA GeForce RTX 4090",
+            # gpu_type_id="NVIDIA GeForce RTX 4080",
             cloud_type="COMMUNITY",
             ports="8000/http,8001/http,8002/http",
             env={
@@ -269,13 +358,13 @@ def run_lifecycle():
             print(f"      curl -X POST {reg_url}/models/shard -H 'Content-Type: application/json' -d '{{'model_id': '{model_id}'}}'")
             raise
 
-        # STEP 3: WORKERS
+        # STEP 3: WORKERS (WITH RETRY)
         print("\n🚀 3. Deploying 2 GPU Workers...")
         for i in range(2):
-            w = runpod.create_pod(
+            w = create_pod_with_retry(
                 name=f"azu-worker-{i}",
                 image_name=WORKER_IMG,
-                gpu_type_id="NVIDIA GeForce RTX 4090",
+                # gpu_type_id="NVIDIA GeForce RTX 4080",
                 cloud_type="COMMUNITY",
                 ports="8003/http",
                 env={

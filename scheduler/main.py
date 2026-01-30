@@ -162,68 +162,61 @@ class EnhancedScheduler:
         return splits
 
     async def dispatch_loop(self):
-        """Main job dispatcher loop"""
-        print("🚀 Scheduler Dispatch Loop Started")
+      """Main job dispatcher loop"""
+      print("🚀 Scheduler Dispatch Loop Started")
 
-        while True:
-            try:
-                # Pop job from Redis queue (blocking)
-                task = await r.blpop("job_queue", timeout=1)
-                if not task:
-                    continue
+      while True:
+        try:
+            task = await r.blpop("job_queue", timeout=1)
+            if not task:
+              continue
 
-                job = json.loads(task[1])
-                job_id = job['id']
+            job = json.loads(task[1])
+            job_id = job['id']
+            model_id = job['model']
 
-                print(f"\n📋 Processing Job {job_id}")
-                print(f"  Model: {job['model']}")
-                print(f"  Prompt: {job['input'][:50]}...")
+            print(f"\n📋 Processing Job {job_id}")
 
-                # Get model info from registry
-                model_info = await self._get_model_info(job['model'])
-                if not model_info:
-                    print(f"  ❌ Model {job['model']} not found in registry")
-                    await self._fail_job(job_id, "Model not available")
-                    continue
+            # Check if workers have this model loaded
+            ready_for_model = [
+              w for w in self.workers.values()
+              if w.ready and w.loaded_model == model_id
+            ]
 
-                total_layers = model_info.get('num_layers', 0)
-                print(f"  Layers: {total_layers}")
+            if len(ready_for_model) < 2:
+              print(f"  ⚠️ Workers not ready for {model_id}, requeueing...")
+              await r.rpush("job_queue", json.dumps(job))
+              await asyncio.sleep(2)
+              continue
 
-                # Query available workers
-                available = await self.query_available_workers(job['model'], total_layers)
+            print(f"  ✅ {len(ready_for_model)} workers ready")
 
-                if not available:
-                    print(f"  ⚠️ No workers available, requeueing...")
-                    await r.rpush("job_queue", json.dumps(job))
-                    await asyncio.sleep(2)
-                    continue
+            # Get layer splits from worker assignments
+            layer_splits = {}
+            for w in ready_for_model:
+              layer_splits[w.pubkey] = w.assigned_layers
 
-                print(f"  ✅ Found {len(available)} workers")
+            print(f"  📊 Layer distribution:")
+            for wid, layers in layer_splits.items():
+                print(f"    {wid[:8]}...: layers {layers[0]}-{layers[-1]} ({len(layers)} total)")
 
-                # Split layers
-                layer_splits = self.split_layers_across_workers(total_layers, available)
+            # Create job execution tracker
+            self.jobs[job_id] = JobExecution(
+                job_id=job_id,
+                model_id=job['model'],
+                assigned_workers=list(layer_splits.keys()),
+                layer_splits=layer_splits,
+                results={},
+                status="IN_PROGRESS"
+            )
 
-                print(f"  📊 Layer distribution:")
-                for wid, layers in layer_splits.items():
-                    print(f"    {wid[:8]}...: layers {layers[0]}-{layers[-1]} ({len(layers)} total)")
+            # Dispatch to workers
+            await self._dispatch_to_workers(job, layer_splits)
 
-                # Create job execution tracker
-                self.jobs[job_id] = JobExecution(
-                    job_id=job_id,
-                    model_id=job['model'],
-                    assigned_workers=list(layer_splits.keys()),
-                    layer_splits=layer_splits,
-                    results={},
-                    status="IN_PROGRESS"
-                )
-
-                # Dispatch to workers
-                await self._dispatch_to_workers(job, layer_splits)
-
-            except Exception as e:
-                print(f"❌ Dispatch error: {e}")
-                import traceback
-                traceback.print_exc()
+        except Exception as e:
+            print(f"❌ Dispatch error: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def preload_model_to_workers(self, model_id: str):
       """
@@ -531,3 +524,12 @@ async def get_ready_status():
       for w in scheduler.workers.values()
     ]
   }
+
+@app.post("/preload/{model_id}")
+async def trigger_preload(model_id: str):
+  """Trigger workers to preload model"""
+  success = await scheduler.preload_model_to_workers(model_id)
+  if success:
+      return {"status": "preloading"}
+  else:
+      raise HTTPException(400, "Not enough workers or model not found")

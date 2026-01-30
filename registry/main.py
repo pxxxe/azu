@@ -65,7 +65,7 @@ async def shard_model(req: ShardRequest):
             }
         )
 
-@app.get("/models/{model_id}/info")
+@app.get("/models/info")
 async def get_model_info(model_id: str):
     """Used by Scheduler to know how many layers a model has"""
     sanitized = model_id.replace("/", "_")

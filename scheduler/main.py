@@ -285,12 +285,15 @@ class EnhancedScheduler:
     async def _get_model_info(self, model_id: str) -> Optional[Dict]:
         """Get model information from registry"""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{self.registry_url}/models/{model_id}/info") as resp:
-                    if resp.status == 200:
-                        return await resp.json()
+          async with aiohttp.ClientSession() as session:
+            async with session.get(
+              f"{self.registry_url}/models/info",
+              params={"model_id": model_id}
+            ) as resp:
+                if resp.status == 200:
+                  return await resp.json()
         except:
-            pass
+          pass
         return None
 
     async def _dispatch_to_workers(self, job: dict, layer_splits: Dict[str, List[int]]):

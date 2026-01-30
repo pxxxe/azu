@@ -2,7 +2,7 @@ name: Build Worker Image
 
 on:
   push:
-    branches: [ build-worker ]
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:

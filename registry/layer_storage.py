@@ -1,6 +1,6 @@
 # registry/layer_storage.py
 import torch
-from transformers import AutoModel, AutoConfig
+from transformers import AutoModelForCausalLM, AutoConfig
 from pathlib import Path
 import json
 import os
@@ -17,21 +17,27 @@ class LayerStore:
         Returns the actual layer list object.
         """
         # Try common layer attribute names
+        # Note: With AutoModelForCausalLM, the base model is usually under .model or .transformer
         for attr_path in [
-            'model.layers',           # Llama, Mistral, Qwen
+            'model.layers',           # Llama, Mistral, Qwen (in CausalLM wrapper)
             'transformer.h',          # GPT-2, GPT-Neo
             'encoder.layer',          # BERT
             'decoder.layers',         # T5
             'h',                      # Some GPT models
-            'layers'                  # Generic
+            'layers',                 # Direct access
+            'model.decoder.layers'    # Some seq2seq
         ]:
             try:
                 obj = model
+                found = True
                 for part in attr_path.split('.'):
+                    if not hasattr(obj, part):
+                        found = False
+                        break
                     obj = getattr(obj, part)
 
                 # Verify it's a list/ModuleList of layers
-                if hasattr(obj, '__len__') and len(obj) > 0:
+                if found and hasattr(obj, '__len__') and len(obj) > 0:
                     print(f"   ✅ Found layers at: {attr_path}")
                     return obj
             except AttributeError:
@@ -60,8 +66,9 @@ class LayerStore:
             print(f"\n   📥 Downloading model from HuggingFace...")
             sys.stdout.flush()
 
-            # Load full model temporarily (CPU only to save VRAM)
-            model = AutoModel.from_pretrained(
+            # Load full CausalLM model temporarily (CPU only)
+            # We need CausalLM to ensure lm_head is present
+            model = AutoModelForCausalLM.from_pretrained(
                 model_id,
                 token=hf_token,
                 torch_dtype=torch.float16,
@@ -127,17 +134,25 @@ class LayerStore:
 
         # Save embeddings separately
         print(f"\n   💾 Saving embeddings and heads...")
+
+        # 1. Embeddings
+        # Try get_input_embeddings first (standard HF API)
         if hasattr(model, 'get_input_embeddings'):
             emb = model.get_input_embeddings()
             torch.save(emb.state_dict(), model_dir / "embeddings.pt")
             emb_size = (model_dir / 'embeddings.pt').stat().st_size / (1024**2)
             print(f"      Embeddings: {emb_size:.1f}MB")
+        else:
+            print("      ⚠️ WARNING: Could not find input embeddings!")
 
-        # Save LM head if exists
+        # 2. LM Head
+        # AutoModelForCausalLM usually has 'lm_head'
         if hasattr(model, 'lm_head'):
             torch.save(model.lm_head.state_dict(), model_dir / "lm_head.pt")
             head_size = (model_dir / 'lm_head.pt').stat().st_size / (1024**2)
             print(f"      LM Head: {head_size:.1f}MB")
+        else:
+            print("      ⚠️ WARNING: Could not find lm_head! (Is this a CausalLM?)")
 
         # Save config
         config.save_pretrained(model_dir)

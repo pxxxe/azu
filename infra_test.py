@@ -177,7 +177,7 @@ def run_lifecycle():
         core = runpod.create_pod(
             name="azu-core",
             image_name=CORE_IMG,
-            gpu_type_id="NVIDIA GeForce RTX 5090",
+            gpu_type_id="NVIDIA GeForce RTX 4090",
             cloud_type="COMMUNITY",
             ports="8000/http,8001/http,8002/http",
             env={
@@ -221,14 +221,52 @@ def run_lifecycle():
                 timeout=300
             )
 
+            print(f"\n   📊 Response Status: {shard_resp.status_code}")
+            print(f"   📊 Response Headers: {dict(shard_resp.headers)}")
+
             if shard_resp.status_code != 200:
-                raise Exception(f"Sharding failed: {shard_resp.text}")
+                print(f"\n   ❌ SHARDING FAILED ❌")
+                print(f"   Status Code: {shard_resp.status_code}")
+                print(f"   Response Text:\n{shard_resp.text}")
+
+                # Try to parse JSON error
+                try:
+                    error_data = shard_resp.json()
+                    if 'detail' in error_data:
+                        detail = error_data['detail']
+                        if isinstance(detail, dict):
+                            print(f"\n   🔍 Error Details:")
+                            print(f"      Error: {detail.get('error', 'Unknown')}")
+                            print(f"      Model: {detail.get('model_id', 'Unknown')}")
+                            if 'traceback' in detail:
+                                print(f"\n   📋 Full Traceback:")
+                                print(detail['traceback'])
+                        else:
+                            print(f"\n   Error: {detail}")
+                except:
+                    pass
+
+                raise Exception(f"Sharding failed with status {shard_resp.status_code}: {shard_resp.text}")
 
             data = shard_resp.json()
             print(f"   ✅ Model sharded: {data['num_layers']} layers")
 
+        except requests.exceptions.Timeout:
+            print(f"\n   ❌ Request timed out after 300 seconds")
+            print(f"   The registry might still be processing. Check pod logs:")
+            print(f"   runpod ssh {core_id}")
+            raise
+
         except Exception as e:
-            print(f"   ❌ Sharding error: {e}")
+            print(f"\n   ❌ Sharding error: {e}")
+            print(f"\n   🔍 Debugging steps:")
+            print(f"   1. Check registry logs:")
+            print(f"      runpod ssh {core_id}")
+            print(f"      docker logs <container_id>")
+            print(f"   2. Check HF_TOKEN is valid")
+            print(f"   3. Check disk space on pod")
+            print(f"   4. Try manually:")
+            print(f"      curl -X POST {reg_url}/models/shard -H 'Content-Type: application/json' -d '{{'model_id': '{model_id}'}}'")
             raise
 
         # STEP 3: WORKERS
@@ -237,7 +275,7 @@ def run_lifecycle():
             w = runpod.create_pod(
                 name=f"azu-worker-{i}",
                 image_name=WORKER_IMG,
-                gpu_type_id="NVIDIA GeForce RTX 5090",
+                gpu_type_id="NVIDIA GeForce RTX 4090",
                 cloud_type="COMMUNITY",
                 ports="8003/http",
                 env={

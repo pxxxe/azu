@@ -4,6 +4,7 @@ from transformers import AutoModel, AutoConfig
 from pathlib import Path
 import json
 import os
+import sys
 
 class LayerStore:
     def __init__(self, storage_path="/data/layers"):
@@ -31,6 +32,7 @@ class LayerStore:
 
                 # Verify it's a list/ModuleList of layers
                 if hasattr(obj, '__len__') and len(obj) > 0:
+                    print(f"   ✅ Found layers at: {attr_path}")
                     return obj
             except AttributeError:
                 continue
@@ -42,28 +44,59 @@ class LayerStore:
         Download model and extract individual layers.
         Returns number of layers extracted.
         """
-        print(f"🔪 Sharding {model_id}...")
+        print(f"\n🔪 SHARDING {model_id}")
+        print(f"   Storage path: {self.storage_path}")
+        print(f"   HF Token: {'*' * 10}{hf_token[-4:] if len(hf_token) > 4 else '???'}")
 
-        # Load full model temporarily (CPU only to save VRAM)
-        model = AutoModel.from_pretrained(
-            model_id,
-            token=hf_token,
-            torch_dtype=torch.float16,
-            device_map="cpu",
-            trust_remote_code=True,
-            low_cpu_mem_usage=True
-        )
-        config = AutoConfig.from_pretrained(model_id, token=hf_token)
+        # Check disk space
+        import shutil
+        total, used, free = shutil.disk_usage(self.storage_path)
+        print(f"   💾 Disk: {free // (2**30)}GB free / {total // (2**30)}GB total")
+
+        if free < 5 * (2**30):  # Less than 5GB
+            raise Exception(f"Insufficient disk space: {free // (2**30)}GB free, need at least 5GB")
+
+        try:
+            print(f"\n   📥 Downloading model from HuggingFace...")
+            sys.stdout.flush()
+
+            # Load full model temporarily (CPU only to save VRAM)
+            model = AutoModel.from_pretrained(
+                model_id,
+                token=hf_token,
+                torch_dtype=torch.float16,
+                device_map="cpu",
+                trust_remote_code=True,
+                low_cpu_mem_usage=True
+            )
+            print(f"   ✅ Model downloaded successfully")
+
+            print(f"   📥 Loading config...")
+            config = AutoConfig.from_pretrained(model_id, token=hf_token)
+            print(f"   ✅ Config loaded")
+
+        except Exception as e:
+            print(f"\n   ❌ Failed to download model from HuggingFace")
+            print(f"   Error type: {type(e).__name__}")
+            print(f"   Error message: {str(e)}")
+            raise Exception(f"HuggingFace download failed: {str(e)}")
 
         # Find layer structure
-        layers = self._find_layers(model)
-        num_layers = len(layers)
+        print(f"\n   🔍 Finding layer structure...")
+        try:
+            layers = self._find_layers(model)
+            num_layers = len(layers)
+            print(f"   ✅ Found {num_layers} layers")
+        except Exception as e:
+            print(f"   ❌ Failed to find layers in model")
+            raise Exception(f"Layer detection failed: {str(e)}")
 
         # Create storage directory
         model_dir = self.storage_path / model_id.replace("/", "_")
         model_dir.mkdir(exist_ok=True, parents=True)
+        print(f"   📁 Output directory: {model_dir}")
 
-        print(f"Found {num_layers} layers, extracting...")
+        print(f"\n   💾 Extracting layers...")
 
         # Save each layer separately
         for i, layer in enumerate(layers):
@@ -87,29 +120,36 @@ class LayerStore:
             with open(model_dir / f"layer_{i}.json", "w") as f:
                 json.dump(metadata, f, indent=2)
 
-            print(f"  Layer {i}/{num_layers-1}: {size_mb:.1f}MB")
+            # Progress indicator every 5 layers
+            if (i + 1) % 5 == 0 or i == num_layers - 1:
+                print(f"      Progress: {i+1}/{num_layers} layers ({size_mb:.1f}MB)")
+                sys.stdout.flush()
 
         # Save embeddings separately
+        print(f"\n   💾 Saving embeddings and heads...")
         if hasattr(model, 'get_input_embeddings'):
             emb = model.get_input_embeddings()
             torch.save(emb.state_dict(), model_dir / "embeddings.pt")
-            print(f"  Embeddings: {(model_dir / 'embeddings.pt').stat().st_size / (1024**2):.1f}MB")
+            emb_size = (model_dir / 'embeddings.pt').stat().st_size / (1024**2)
+            print(f"      Embeddings: {emb_size:.1f}MB")
 
         # Save LM head if exists
         if hasattr(model, 'lm_head'):
             torch.save(model.lm_head.state_dict(), model_dir / "lm_head.pt")
-            print(f"  LM Head: {(model_dir / 'lm_head.pt').stat().st_size / (1024**2):.1f}MB")
+            head_size = (model_dir / 'lm_head.pt').stat().st_size / (1024**2)
+            print(f"      LM Head: {head_size:.1f}MB")
 
         # Save config
         config.save_pretrained(model_dir)
 
         # Save layer structure info
+        total_size_mb = sum((model_dir / f"layer_{i}.pt").stat().st_size for i in range(num_layers)) / (1024**2)
         structure_info = {
             "model_id": model_id,
             "num_layers": num_layers,
             "architecture": config.architectures[0] if hasattr(config, 'architectures') else "unknown",
             "hidden_size": config.hidden_size if hasattr(config, 'hidden_size') else None,
-            "total_size_mb": sum((model_dir / f"layer_{i}.pt").stat().st_size for i in range(num_layers)) / (1024**2)
+            "total_size_mb": total_size_mb
         }
 
         with open(model_dir / "structure.json", "w") as f:
@@ -118,7 +158,11 @@ class LayerStore:
         del model  # Free memory
         torch.cuda.empty_cache()
 
-        print(f"✅ Sharded {model_id} into {num_layers} layers")
+        print(f"\n✅ SHARDING COMPLETE")
+        print(f"   Model: {model_id}")
+        print(f"   Layers: {num_layers}")
+        print(f"   Total size: {total_size_mb:.1f}MB")
+
         return num_layers
 
     def get_layer_path(self, model_id: str, layer_idx: int):

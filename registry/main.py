@@ -4,6 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import json
 import os
+import traceback
 from shared.config import settings
 from .layer_storage import LayerStore
 
@@ -28,16 +29,41 @@ class ShardRequest(BaseModel):
 @app.post("/models/shard")
 async def shard_model(req: ShardRequest):
     hf_token = settings.HF_TOKEN
-    if not hf_token:
-        raise HTTPException(500, "HF_TOKEN not set on Registry")
+
+    # Better validation
+    if not hf_token or hf_token == "":
+        error_msg = "HF_TOKEN not set on Registry"
+        print(f"❌ {error_msg}")
+        raise HTTPException(500, error_msg)
+
+    print(f"🔪 Starting shard request for: {req.model_id}")
+    print(f"   HF_TOKEN: {'*' * 10}{hf_token[-4:] if len(hf_token) > 4 else '???'}")
 
     try:
         # Calls the CPU-safe sharding logic in layer_storage.py
         num = store.shard_model(req.model_id, hf_token)
+        print(f"✅ Sharding complete: {num} layers")
         return {"status": "success", "num_layers": num}
+
     except Exception as e:
-        print(f"Sharding Error: {e}")
-        raise HTTPException(500, str(e))
+        # CRITICAL: Actually capture and return the full error
+        error_trace = traceback.format_exc()
+        error_msg = str(e)
+
+        print(f"\n❌ SHARDING FAILED ❌")
+        print(f"Model: {req.model_id}")
+        print(f"Error: {error_msg}")
+        print(f"Full traceback:\n{error_trace}")
+
+        # Return detailed error in response
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": error_msg,
+                "traceback": error_trace,
+                "model_id": req.model_id
+            }
+        )
 
 @app.get("/models/{model_id}/info")
 async def get_model_info(model_id: str):

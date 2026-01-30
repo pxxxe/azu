@@ -75,7 +75,7 @@ CMD ["./start.sh"]
 
 ```plaintext
 # CHANGE FROM 2.1.0 TO 2.2.0
-FROM pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime
 
 WORKDIR /app
 
@@ -89,7 +89,7 @@ RUN apt-get update && apt-get install -y \
 COPY client/worker/requirements.txt .
 
 # Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
 # Copy shared library
 COPY shared/ ./shared/
@@ -1124,7 +1124,7 @@ def run_lifecycle():
         core = runpod.create_pod(
             name="azu-core",
             image_name=CORE_IMG,
-            gpu_type_id="NVIDIA GeForce RTX 5090",
+            gpu_type_id="NVIDIA GeForce RTX 4090",
             cloud_type="COMMUNITY",
             ports="8000/http,8001/http,8002/http",
             env={
@@ -1184,7 +1184,7 @@ def run_lifecycle():
             w = runpod.create_pod(
                 name=f"azu-worker-{i}",
                 image_name=WORKER_IMG,
-                gpu_type_id="NVIDIA GeForce RTX 5090",
+                gpu_type_id="NVIDIA GeForce RTX 4090",
                 cloud_type="COMMUNITY",
                 ports="8003/http",
                 env={

@@ -53,6 +53,7 @@ def create_pod_with_retry(
 ):
     """
     Create RunPod pod with retry logic across multiple GPU types.
+    Tries each GPU type in GPU_TYPES list before giving up.
     """
     total_attempts = 0
 
@@ -79,6 +80,8 @@ def create_pod_with_retry(
 
             except runpod.error.QueryError as e:
                 error_msg = str(e)
+
+                # Check if it's a retryable GPU availability error
                 is_gpu_error = (
                     "does not have the resources" in error_msg or
                     "failed to provision" in error_msg.lower() or
@@ -88,12 +91,15 @@ def create_pod_with_retry(
 
                 if is_gpu_error:
                     if attempt < max_attempts_per_gpu:
-                        print(f"   ⚠️  {gpu_type} unavailable. Waiting {wait_between_attempts}s...")
+                        print(f"   ⚠️  {gpu_type} unavailable: {error_msg[:100]}...")
+                        print(f"   ⏳ Waiting {wait_between_attempts}s before retry...")
                         time.sleep(wait_between_attempts)
                     else:
-                        print(f"   ❌ {gpu_type} exhausted.")
+                        print(f"   ❌ {gpu_type} exhausted after {max_attempts_per_gpu} attempts")
+                        # Break to try next GPU type
                         break
                 else:
+                    # Non-retryable error, raise immediately
                     print(f"   ❌ Non-retryable error: {error_msg}")
                     raise
 
@@ -101,7 +107,11 @@ def create_pod_with_retry(
                 print(f"   ❌ Unexpected error: {e}")
                 raise
 
-    raise Exception(f"Failed to create pod '{name}' after trying {len(GPU_TYPES)} GPU types.")
+    # If we get here, all GPU types failed
+    raise Exception(
+        f"Failed to create pod '{name}' after trying {len(GPU_TYPES)} GPU types "
+        f"({total_attempts} total attempts)"
+    )
 
 # ============================================
 
@@ -130,6 +140,8 @@ def load_funded_account():
 def get_pod_service_url(pod_id, internal_port):
     """
     Determines the best URL to reach a specific port on the pod.
+    1. Checks for a true Public IP (194.x, etc).
+    2. If IP is private (100.x), returns the RunPod Proxy domain IMMEDIATELY.
     """
     print(f"   ⏳ Resolving connection for {pod_id} (port {internal_port})...")
 
@@ -249,7 +261,7 @@ def run_lifecycle():
         # STEP 0: WALLETS
         wallets = setup_solana_accounts()
 
-        # STEP 1: CORE
+        # STEP 1: CORE (WITH RETRY)
         print("\n🚀 1. Deploying Core...")
         core = create_pod_with_retry(
             name="azu-core",
@@ -407,6 +419,8 @@ def run_lifecycle():
             status = data.get('status')
             if status == 'completed':
                 print(f"\n🎉 SUCCESS: {data['output']}\n")
+                print(f"   Cost: {data.get('cost')} Lamports")
+                print(f"   Remaining Balance: {data.get('final_balance')}")
                 return
             if status == 'failed':
                 print(f"\n❌ JOB FAILED: {data.get('error')}\n")
@@ -422,6 +436,14 @@ def run_lifecycle():
         print(f"\n❌ CRITICAL FAIL: {e}")
         import traceback
         traceback.print_exc()
+
+        # --- LOG DUMPING HELPERS ---
+        print("\n📜 TO DEBUG, RUN THESE COMMANDS:")
+        if core_id:
+            print(f"   CORE LOGS:   runpod logs {core_id}")
+        for i, wid in enumerate(worker_ids):
+            print(f"   WORKER {i} LOGS: runpod logs {wid}")
+
     finally:
         print("\n🧹 Tearing Down...")
         if core_id: runpod.terminate_pod(core_id)

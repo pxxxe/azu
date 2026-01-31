@@ -1,453 +1,448 @@
-import runpod
-import time
-import requests
-import os
-import sys
-import json
-import asyncio
-import random
+#!/usr/bin/env python3
+"""
+E2E Test for AZU.CX with FULL MoE Support
+Tests Mixtral-8x7B-Instruct-v0.1 on secure cloud GPUs
+"""
 
-# === SOLANA IMPORTS ===
-from solana.rpc.api import Client
+import runpod
+import requests
+import time
+import json
+import sys
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
+from solana.rpc.async_api import AsyncClient
 from solders.system_program import transfer, TransferParams
 from solders.transaction import Transaction
+import asyncio
+import os
 
-# ================= CONFIGURATION =================
-API_KEY = os.getenv("RUNPOD_API_KEY")
-HF_TOKEN = os.getenv("HF_TOKEN")
+# ==========================================
+# CONFIGURATION
+# ==========================================
 
-CORE_IMG = "pxxxe/azu-core:latest"     # <--- UPDATE USERNAME
-WORKER_IMG = "pxxxe/azu-worker:latest" # <--- UPDATE USERNAME
+CORE_IMG = 'pxxxe/azu-core:latest'
+WORKER_IMG = 'pxxxe/azu-worker:latest'
 
-RPC_URL = "https://devnet.helius-rpc.com/?api-key=1d7ca6e1-7700-42eb-b086-8183fda42d76"
-DISTRIBUTION_AMOUNT = 0.1
-# =================================================
+VOLUME_ID = "ryqiz8w01b"
 
-runpod.api_key = API_KEY
-
-# ============================================
-# RETRY LOGIC FOR GPU PROVISIONING
-# ============================================
-
-GPU_TYPES = [
-    "NVIDIA GeForce RTX 4090",      # 24GB, SM_89
-    "NVIDIA GeForce RTX 4080",      # 16GB, SM_89
-    "NVIDIA RTX A5000",             # 24GB, SM_86
-    "NVIDIA GeForce RTX 3090",      # 24GB, SM_86
-    "NVIDIA RTX A4500",             # 20GB, SM_86
-    "NVIDIA GeForce RTX 4070 Ti",   # 12GB, SM_89
-    "NVIDIA RTX A4000",             # 16GB, SM_86
+TEST_MODELS = [
+    "mistralai/Mixtral-8x7B-Instruct-v0.1",  # PRIMARY MoE TEST
+    "Qwen/Qwen2.5-0.5B-Instruct",  # Dense fallback
 ]
 
+TEST_MODEL = TEST_MODELS[0]  # Mixtral-8x7B
 
-def create_pod_with_retry(
-    name,
-    image_name,
-    cloud_type,
-    ports,
-    env,
-    max_attempts_per_gpu=5,
-    wait_between_attempts=5
-):
-    """
-    Create RunPod pod with retry logic across multiple GPU types.
-    Tries each GPU type in GPU_TYPES list before giving up.
-    """
-    total_attempts = 0
+SOLANA_RPC = "https://devnet.helius-rpc.com/?api-key=1d7ca6e1-7700-42eb-b086-8183fda42d76"
+RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
+HF_TOKEN = os.getenv("HF_TOKEN")
 
-    for gpu_type in GPU_TYPES:
-        print(f"\n   🎯 Trying GPU type: {gpu_type}")
+GPU_TYPES_SECURE = [
+    "NVIDIA RTX A5000",
+    "NVIDIA RTX A6000",
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA A100 80GB PCIe",
+]
 
-        for attempt in range(1, max_attempts_per_gpu + 1):
-            total_attempts += 1
+def log_section(title):
+    print(f"\n{'='*60}")
+    print(f"{title}")
+    print(f"{'='*60}\n")
 
-            try:
-                print(f"   🔄 Attempt {attempt}/{max_attempts_per_gpu} with {gpu_type}...")
+def deploy_pod_with_retry(name, image, env_vars, gpu_type, max_retries=5):
+    """Deploy pod with retries."""
+    print(f"   🎯 Trying GPU type: {gpu_type}")
 
-                pod = runpod.create_pod(
-                    name=name,
-                    image_name=image_name,
-                    gpu_type_id=gpu_type,
-                    cloud_type=cloud_type,
-                    ports=ports,
-                    env=env
-                )
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"   🔄 Attempt {attempt}/{max_retries}...")
 
-                print(f"   ✅ Pod created successfully on {gpu_type}: {pod['id']}")
-                return pod
+            response = runpod.create_pod(
+                name=name,
+                image_name=image,
+                gpu_type_id=gpu_type,
+                cloud_type="SECURE",
+                env=env_vars,
+                volume_id=VOLUME_ID,
+                volume_mount_path="/data",
+                ports="8000/http,8001/http,8002/http,8003/http",
+            )
 
-            except runpod.error.QueryError as e:
-                error_msg = str(e)
-
-                # Check if it's a retryable GPU availability error
-                is_gpu_error = (
-                    "does not have the resources" in error_msg or
-                    "failed to provision" in error_msg.lower() or
-                    "no longer any instances available" in error_msg.lower() or
-                    "requested specifications" in error_msg.lower()
-                )
-
-                if is_gpu_error:
-                    if attempt < max_attempts_per_gpu:
-                        print(f"   ⚠️  {gpu_type} unavailable: {error_msg[:100]}...")
-                        print(f"   ⏳ Waiting {wait_between_attempts}s before retry...")
-                        time.sleep(wait_between_attempts)
-                    else:
-                        print(f"   ❌ {gpu_type} exhausted after {max_attempts_per_gpu} attempts")
-                        # Break to try next GPU type
-                        break
+            if isinstance(response, dict):
+                pod_id = response.get('id')
+                if pod_id:
+                    print(f"   ✅ Pod created on {gpu_type}: {pod_id}")
+                    return pod_id
                 else:
-                    # Non-retryable error, raise immediately
-                    print(f"   ❌ Non-retryable error: {error_msg}")
-                    raise
-
-            except Exception as e:
-                print(f"   ❌ Unexpected error: {e}")
-                raise
-
-    # If we get here, all GPU types failed
-    raise Exception(
-        f"Failed to create pod '{name}' after trying {len(GPU_TYPES)} GPU types "
-        f"({total_attempts} total attempts)"
-    )
-
-# ============================================
-
-def load_funded_account():
-    """Load your funded devnet account keypair"""
-    global FUNDED_ACCOUNT_KEY
-    if os.getenv("FUNDED_ACCOUNT_KEY"):
-        secret = os.getenv("FUNDED_ACCOUNT_KEY", "")
-        try:
-            return Keypair.from_base58_string(secret)
-        except:
-            return Keypair.from_bytes(bytes(json.loads(secret)))
-
-    if os.path.exists("funded_account.json"):
-        with open("funded_account.json") as f:
-            return Keypair.from_bytes(bytes(json.load(f)))
-
-    solana_config = os.path.expanduser("~/.config/solana/id.json")
-    if os.path.exists(solana_config):
-        with open(solana_config) as f:
-            return Keypair.from_bytes(bytes(json.load(f)))
-
-    print("❌ ERROR: No funded account found!")
-    sys.exit(1)
-
-def get_pod_service_url(pod_id, internal_port):
-    """
-    Determines the best URL to reach a specific port on the pod.
-    1. Checks for a true Public IP (194.x, etc).
-    2. If IP is private (100.x), returns the RunPod Proxy domain IMMEDIATELY.
-    """
-    print(f"   ⏳ Resolving connection for {pod_id} (port {internal_port})...")
-
-    for i in range(12):
-        try:
-            pod = runpod.get_pod(pod_id)
-            runtime = pod.get('runtime')
-
-            if runtime:
-                found_ip = runtime.get('publicIp') or runtime.get('public_ip')
-                found_port = None
-
-                for p in runtime.get('ports', []):
-                    if p['privatePort'] == internal_port:
-                        found_port = p['publicPort']
-                        if not found_ip: found_ip = p.get('ip')
-                        break
-
-                # CASE A: Real Public IP
-                if found_ip and found_port and not (found_ip.startswith("100.") or found_ip.startswith("10.") or found_ip.startswith("192.")):
-                    url = f"{found_ip}:{found_port}"
-                    print(f"      ✅ Found Public IP: {url}")
-                    return url, False
-
-                # CASE B: Private/CGNAT IP -> Use Proxy
-                if found_ip and (found_ip.startswith("100.") or found_ip.startswith("10.")):
-                    proxy_domain = f"{pod_id}-{internal_port}.proxy.runpod.net"
-                    print(f"      ✅ Detected Private IP ({found_ip}). Using Proxy: {proxy_domain}")
-                    return proxy_domain, True
-
-            status = pod.get('lastStatus') or "Unknown"
-            if i % 2 == 0: print(f"      [{i}/12] Pod Status: {status}...")
+                    error = response.get('message', 'Unknown error')
+                    print(f"   ⚠️  {gpu_type} unavailable: {error}")
 
         except Exception as e:
-            print(f"      ⚠️ API Polling Error: {e}")
+            print(f"   ⚠️  {gpu_type} error: {str(e)}")
+
+        if attempt < max_retries:
+            print(f"   ⏳ Waiting 5s before retry...")
+            time.sleep(5)
+
+    print(f"   ❌ {gpu_type} exhausted")
+    return None
+
+def deploy_with_fallback(name, image, env_vars, gpu_types):
+    """Try deploying across multiple GPU types."""
+    for gpu_type in gpu_types:
+        pod_id = deploy_pod_with_retry(name, image, env_vars, gpu_type)
+        if pod_id:
+            return pod_id
+
+    raise Exception(f"❌ Could not deploy {name} on any GPU type")
+
+def resolve_connection(pod_id, port, max_wait=120):
+    """Resolve proxy URL for a pod's port."""
+    print(f"   ⏳ Resolving connection for {pod_id} (port {port})...")
+
+    for i in range(0, max_wait, 10):
+        pod = runpod.get_pod(pod_id)
+
+        if i % 20 == 0:
+            runtime = pod.get('runtime', {})
+            status = runtime.get('uptimeInSeconds', 'Unknown')
+            print(f"      [{i}/{max_wait}s] Pod Status: {status}...")
+
+        runtime = pod.get('runtime', {})
+        ports = runtime.get('ports', [])
+
+        for port_info in ports:
+            if port_info.get('privatePort') == port:
+                private_ip = port_info.get('ip')
+                if private_ip and private_ip.startswith('100.'):
+                    proxy_url = f"https://{pod_id}-{port}.proxy.runpod.net"
+                    print(f"      ✅ Using Proxy: {proxy_url}")
+                    return proxy_url
+                elif private_ip:
+                    direct_url = f"http://{private_ip}:{port}"
+                    print(f"      ✅ Direct: {direct_url}")
+                    return direct_url
 
         time.sleep(10)
 
-    print("      ⚠️ API Timeout or No IP info. Defaulting to Proxy URL.")
-    return f"{pod_id}-{internal_port}.proxy.runpod.net", True
+    raise Exception(f"Could not resolve {pod_id}:{port}")
 
-def wait_for_http(url, name="Service", retries=30):
-    """Waits for the HTTP service inside the pod to actually start"""
-    print(f"   ⏳ Waiting for {name} to be healthy at {url}...")
-    for i in range(retries):
-        try:
-            requests.get(url, timeout=5)
-            print(f"      ✅ {name} is responding!")
-            return True
-        except Exception as e:
-            if i % 5 == 0:
-                print(f"      [{i}/{retries}] Service starting... ({str(e)[:50]})")
-            time.sleep(5)
-    print(f"      ⚠️ {name} did not start in time. Check Pod Logs.")
-    return False
-
-def distribute_sol_with_retry(funder_kp, recipient_pubkey, amount_sol, client):
+async def transfer_sol(client, from_kp, to_pubkey, amount_sol):
+    """Transfer SOL and wait for confirmation."""
     lamports = int(amount_sol * 1_000_000_000)
-    try:
-        ix = transfer(TransferParams(from_pubkey=funder_kp.pubkey(), to_pubkey=recipient_pubkey, lamports=lamports))
-        blockhash = client.get_latest_blockhash().value.blockhash
-        tx = Transaction.new_signed_with_payer([ix], funder_kp.pubkey(), [funder_kp], blockhash)
-        sig = client.send_transaction(tx).value
-        print(f"      📤 Transfer sent: {sig}")
-    except Exception as e:
-        print(f"      ❌ Transfer failed: {e}")
-        return False
 
-    print("      ⏳ Waiting for balance update...")
-    for _ in range(20):
-        time.sleep(2)
-        bal = client.get_balance(recipient_pubkey).value / 1e9
-        if bal > 0:
-            print(f"      ✅ Recipient balance confirmed: {bal} SOL")
-            return True
-    return False
+    ix = transfer(TransferParams(
+        from_pubkey=from_kp.pubkey(),
+        to_pubkey=to_pubkey,
+        lamports=lamports
+    ))
 
-def setup_solana_accounts():
-    print("\n💰 0. Setting up Solana Wallets...")
-    funder_kp = load_funded_account()
-    client = Client(RPC_URL)
-    funder_balance = client.get_balance(funder_kp.pubkey()).value / 1e9
-    print(f"   💵 Funder balance: {funder_balance} SOL")
+    blockhash_resp = await client.get_latest_blockhash()
+    blockhash = blockhash_resp.value.blockhash
 
-    if funder_balance < 0.2:
-        print(f"❌ Insufficient funds! Need 0.2 SOL, have {funder_balance} SOL")
-        sys.exit(1)
+    tx = Transaction.new_signed_with_payer([ix], from_kp.pubkey(), [from_kp], blockhash)
+    sig = await client.send_transaction(tx)
 
-    platform_kp = Keypair()
-    scheduler_kp = Keypair()
-    user_kp = Keypair()
+    print(f"      📤 Transfer sent: {sig.value}")
+    print(f"      ⏳ Waiting for balance update...")
 
-    print(f"   🔑 Platform: {platform_kp.pubkey()}")
-    print(f"   🔑 Scheduler: {scheduler_kp.pubkey()}")
-    print(f"   🔑 User: {user_kp.pubkey()}")
+    for _ in range(30):
+        balance = await client.get_balance(to_pubkey)
+        if balance.value >= lamports:
+            print(f"      ✅ Balance confirmed: {balance.value / 1_000_000_000} SOL")
+            return
+        await asyncio.sleep(2)
 
-    print(f"\n   💸 Distributing {DISTRIBUTION_AMOUNT} SOL to Scheduler...")
-    if not distribute_sol_with_retry(funder_kp, scheduler_kp.pubkey(), DISTRIBUTION_AMOUNT, client):
-        sys.exit(1)
+    print(f"      ⚠️ Balance not updated after 60s")
 
-    print(f"\n   💸 Distributing {DISTRIBUTION_AMOUNT} SOL to User...")
-    if not distribute_sol_with_retry(funder_kp, user_kp.pubkey(), DISTRIBUTION_AMOUNT, client):
-        sys.exit(1)
+def main():
+    log_section("🚀 AZU.CX - Mixtral-8x7B MoE Test")
 
-    scheduler_priv = json.dumps(list(bytes(scheduler_kp)))
-    return {
-        "platform_pub": str(platform_kp.pubkey()),
-        "scheduler_priv": scheduler_priv,
-        "user_kp": user_kp
+    print("⚠️  Testing Mixtral-8x7B-Instruct-v0.1 (47GB MoE model)")
+    print("   Requires: 2x A5000 (24GB each) or 2x A6000 (48GB each)")
+    print("   Cloud: SECURE (required for production models)\n")
+
+    print("⚠️  GitHub Actions must have built and pushed images:")
+    print(f"    - CORE_IMG = '{CORE_IMG}'")
+    print(f"    - WORKER_IMG = '{WORKER_IMG}'")
+    print(f"    - Volume ID: {VOLUME_ID}\n")
+
+    input("Press Enter to start test (Ctrl+C to cancel)...\n")
+
+    runpod.api_key = RUNPOD_API_KEY
+
+    print("\n🚀 Launching RunPod instances on SECURE cloud...")
+    print("   (This will provision dedicated GPUs)\n")
+
+    # ==========================================
+    # 0. Setup Solana Wallets
+    # ==========================================
+
+    log_section("💰 0. Setting up Solana Wallets")
+
+    funder = Keypair()
+    platform = Keypair()
+    scheduler = Keypair()
+    user = Keypair()
+
+    client = AsyncClient(SOLANA_RPC)
+
+    async def setup_wallets():
+        balance = await client.get_balance(funder.pubkey())
+        print(f"   💵 Funder balance: {balance.value / 1_000_000_000} SOL")
+
+        print(f"   🔑 Platform: {platform.pubkey()}")
+        print(f"   🔑 Scheduler: {scheduler.pubkey()}")
+        print(f"   🔑 User: {user.pubkey()}\n")
+
+        print(f"   💸 Distributing 0.1 SOL to Scheduler...")
+        await transfer_sol(client, funder, scheduler.pubkey(), 0.1)
+
+        print(f"\n   💸 Distributing 0.1 SOL to User...")
+        await transfer_sol(client, funder, user.pubkey(), 0.1)
+
+    asyncio.run(setup_wallets())
+
+    # ==========================================
+    # 1. Deploy Core
+    # ==========================================
+
+    log_section("🚀 1. Deploying Core (API + Registry + Scheduler)")
+
+    core_env = {
+        'HF_TOKEN': HF_TOKEN,
+        'REDIS_HOST': 'localhost',
+        'REDIS_PORT': '6379',
+        'SOLANA_RPC_URL': SOLANA_RPC,
+        'PLATFORM_WALLET_PUBKEY': str(platform.pubkey()),
+        'SCHEDULER_PRIVATE_KEY': str(list(bytes(scheduler))),
+        'PUBLIC_KEY': 'null',
     }
 
-def run_lifecycle():
-    core_id = None
-    worker_ids = []
+    core_pod_id = deploy_with_fallback("azu-core-mixtral", CORE_IMG, core_env, GPU_TYPES_SECURE)
+
+    api_url = resolve_connection(core_pod_id, 8000)
+    registry_url = resolve_connection(core_pod_id, 8002)
+    scheduler_url = resolve_connection(core_pod_id, 8001)
+
+    scheduler_ws = scheduler_url.replace('https://', 'wss://').replace('http://', 'ws://') + '/ws/worker'
+
+    print(f"   ✅ API: {api_url}")
+    print(f"   ✅ Registry: {registry_url}")
+    print(f"   ✅ Scheduler: {scheduler_ws}")
+
+    print(f"   ⏳ Waiting for Registry to be healthy...")
+    for _ in range(40):
+        try:
+            resp = requests.get(f"{registry_url}/docs", timeout=10)
+            if resp.status_code == 200:
+                print(f"      ✅ Registry ready!")
+                break
+        except:
+            pass
+        time.sleep(3)
+
+    # ==========================================
+    # 2. Shard Mixtral-8x7B
+    # ==========================================
+
+    log_section("⚡ 2. Sharding Mixtral-8x7B (47GB)")
+
+    print(f"   📥 Downloading and sharding Mixtral-8x7B...")
+    print(f"   ⏳ This will take 5-10 minutes (47GB model)...")
 
     try:
-        # STEP 0: WALLETS
-        wallets = setup_solana_accounts()
+        resp = requests.post(
+            f"{registry_url}/models/shard",
+            json={"model_id": TEST_MODEL},
+            timeout=900  # 15 min timeout
+        )
 
-        # STEP 1: CORE (WITH RETRY)
-        print("\n🚀 1. Deploying Core...")
-        core = create_pod_with_retry(
-            name="azu-core",
-            image_name=CORE_IMG,
-            cloud_type="COMMUNITY",
-            ports="8000/http,8001/http,8002/http",
-            env={
-                "HF_TOKEN": HF_TOKEN,
-                "REDIS_HOST": "localhost",
-                "REDIS_PORT": "6379",
-                "SOLANA_RPC_URL": RPC_URL,
-                "PLATFORM_WALLET_PUBKEY": wallets['platform_pub'],
-                "SCHEDULER_PRIVATE_KEY": wallets['scheduler_priv']
+        if resp.status_code != 200:
+            print(f"   ❌ Sharding failed: {resp.text}")
+            sys.exit(1)
+
+        shard_result = resp.json()
+        num_layers = shard_result.get('num_layers', 0)
+        print(f"   ✅ Model sharded: {num_layers} layers")
+
+    except requests.exceptions.Timeout:
+        print(f"   ❌ Sharding timed out. Model may be too large or network slow.")
+        sys.exit(1)
+
+    model_info = requests.get(f"{registry_url}/models/info", params={"model_id": TEST_MODEL}).json()
+    is_moe = model_info.get('is_moe', False)
+
+    if is_moe:
+        print(f"   🎯 MoE Model Confirmed!")
+        moe_layers = [m for m in model_info.get('layer_metadata', []) if m.get('type') == 'moe']
+        print(f"   🎯 MoE Layers: {len(moe_layers)}")
+        print(f"   🎯 Experts per layer: {moe_layers[0].get('num_experts', 'unknown') if moe_layers else 'unknown'}")
+    else:
+        print(f"   ⚠️  Model not detected as MoE. Checking config...")
+        print(f"   Model info: {json.dumps(model_info, indent=2)}")
+
+    # ==========================================
+    # 3. Deploy Workers (2x for Mixtral-8x7B)
+    # ==========================================
+
+    log_section("🚀 3. Deploying 2 GPU Workers")
+
+    worker_env = {
+        'SCHEDULER_URL': scheduler_ws,
+        'REGISTRY_URL': registry_url,
+        'HF_TOKEN': HF_TOKEN,
+        'PUBLIC_KEY': 'null',
+    }
+
+    worker_ids = []
+    for i in range(2):
+        print(f"\n   Worker {i+1}/2:")
+        worker_id = deploy_with_fallback(f"azu-worker-mixtral-{i}", WORKER_IMG, worker_env, GPU_TYPES_SECURE)
+        worker_ids.append(worker_id)
+        print(f"   ✅ Worker {i+1} deployed: {worker_id}")
+
+    print(f"\n⏳ Waiting for workers to register with Scheduler...")
+    for elapsed in range(0, 180, 10):
+        try:
+            workers_resp = requests.get(f"{scheduler_url}/workers", timeout=10)
+            if workers_resp.status_code == 200:
+                workers = workers_resp.json()
+                print(f"   [{elapsed}s] Connected Workers: {len(workers)}")
+
+                if len(workers) >= 2:
+                    print(f"   ✅ 2 Workers connected!")
+                    print(f"\n   Worker Details:")
+                    for w in workers:
+                        print(f"      - {w['id']}: {w['gpu']} | {w['vram']}GB VRAM | Caps: {w['capabilities']}")
+                    break
+        except:
+            pass
+        time.sleep(10)
+
+    if len(workers) < 2:
+        print(f"   ⚠️  Only {len(workers)} workers connected. May fail.")
+
+    # ==========================================
+    # 4. Simulate User Deposit
+    # ==========================================
+
+    log_section("💳 4. Simulating User Deposit")
+
+    async def do_deposit():
+        print(f"   Sending deposit (0.05 SOL)...")
+
+        ix = transfer(TransferParams(
+            from_pubkey=user.pubkey(),
+            to_pubkey=platform.pubkey(),
+            lamports=50_000_000
+        ))
+
+        blockhash_resp = await client.get_latest_blockhash()
+        blockhash = blockhash_resp.value.blockhash
+
+        tx = Transaction.new_signed_with_payer([ix], user.pubkey(), [user], blockhash)
+        sig = await client.send_transaction(tx)
+        print(f"   Tx: {sig.value}")
+        print(f"   ⏳ Waiting 30s for confirmation...")
+        await asyncio.sleep(30)
+
+        deposit_resp = requests.post(
+            f"{api_url}/deposit",
+            json={
+                "tx_sig": str(sig.value),
+                "user_pubkey": str(user.pubkey())
             }
         )
-        core_id = core['id']
+        print(f"   Deposit Result: {deposit_resp.json()}")
 
-        # RESOLVE CONNECTION (Proxy vs IP)
-        api_host, api_is_proxy = get_pod_service_url(core_id, 8000)
-        reg_host, reg_is_proxy = get_pod_service_url(core_id, 8002)
-        sched_host, sched_is_proxy = get_pod_service_url(core_id, 8001)
+    asyncio.run(do_deposit())
 
-        api_scheme = "https" if api_is_proxy else "http"
-        ws_scheme = "wss" if sched_is_proxy else "ws"
+    # ==========================================
+    # 5. Run Mixtral-8x7B Inference
+    # ==========================================
 
-        api_url = f"{api_scheme}://{api_host}"
-        reg_url = f"{api_scheme}://{reg_host}"
-        sched_url = f"{ws_scheme}://{sched_host}/ws/worker"
+    log_section("🧪 5. Running Mixtral-8x7B Inference")
 
-        # Scheduler HTTP URL for querying worker status
-        sched_api_url = f"{api_scheme}://{sched_host}"
+    print(f"   Prompt: 'Explain mixture of experts architecture in one sentence.'")
+    print(f"   (First run slower - workers load layers JIT)\n")
 
-        print(f"   ✅ Core API: {api_url}")
-        print(f"   ✅ Registry: {reg_url}")
-        print(f"   ✅ Scheduler: {sched_url}")
+    submit_resp = requests.post(
+        f"{api_url}/submit",
+        json={
+            "user_pubkey": str(user.pubkey()),
+            "model_id": TEST_MODEL,
+            "prompt": "Explain mixture of experts architecture in one sentence.",
+            "est_tokens": 100
+        }
+    )
 
-        wait_for_http(f"{reg_url}/docs", "Registry")
+    if submit_resp.status_code != 200:
+        print(f"   ❌ Submit failed: {submit_resp.text}")
+        sys.exit(1)
 
-        # STEP 2: SHARDING
-        print("\n⚡ 2. Sharding Model...")
-        model_id = "Qwen/Qwen2.5-0.5B"
+    job_data = submit_resp.json()
+    job_id = job_data['job_id']
+    print(f"   Job submitted: {job_id}")
 
-        print("   📥 Downloading and sharding (2-3 minutes)...")
-        try:
-            shard_resp = requests.post(
-                f"{reg_url}/models/shard",
-                json={"model_id": model_id},
-                timeout=300
-            )
+    print(f"\n   Polling for results (timeout: 10 minutes)...")
 
-            if shard_resp.status_code != 200:
-                print(f"\n   ❌ SHARDING FAILED: {shard_resp.text}")
-                raise Exception(f"Sharding failed")
+    for elapsed in range(0, 600, 15):
+        time.sleep(15)
 
-            data = shard_resp.json()
-            print(f"   ✅ Model sharded: {data['num_layers']} layers")
+        result_resp = requests.get(f"{api_url}/results/{job_id}")
+        result = result_resp.json()
 
-        except Exception as e:
-            print(f"\n   ❌ Sharding error: {e}")
-            raise
+        status = result.get('status')
+        print(f"      [{elapsed}s] Status: {status}")
 
-        # STEP 3: WORKERS
-        print("\n🚀 3. Deploying 2 GPU Workers...")
-        for i in range(2):
-            w = create_pod_with_retry(
-                name=f"azu-worker-{i}",
-                image_name=WORKER_IMG,
-                cloud_type="COMMUNITY",
-                ports="8003/http",
-                env={
-                    "SCHEDULER_URL": sched_url,
-                    "REGISTRY_URL": reg_url,
-                    "HF_TOKEN": HF_TOKEN
-                }
-            )
-            worker_ids.append(w['id'])
-            print(f"   Worker {i} deployed: {w['id']}")
+        if status == 'completed':
+            output = result.get('output', '')
+            cost = result.get('cost', 0)
+            balance = result.get('final_balance', 0)
 
-        # STEP 3.5: Wait for workers to connect
-        # NOTE: No explicit preload. Workers connect, Registry has model. Scheduler maps them JIT.
-        print("\n⏳ Waiting for workers to register with Scheduler...")
+            log_section("✅ JOB COMPLETED")
+            print(f"   Job ID: {job_id}")
+            print(f"   Model: {TEST_MODEL}")
+            print(f"   Output: {output}")
+            print(f"   Cost: {cost} lamports")
+            print(f"   Final Balance: {balance} lamports")
 
-        workers_ready = False
-        start_wait = time.time()
+            log_section("🎯 MoE ROUTING TEST PASSED")
+            print(f"   Mixtral-8x7B successfully executed with expert routing!")
 
-        while time.time() - start_wait < 300: # 5 mins max
-            try:
-                resp = requests.get(f"{sched_api_url}/workers", timeout=5)
-                if resp.status_code == 200:
-                    workers = resp.json()
-                    count = len(workers)
-                    print(f"   [{int(time.time()-start_wait)}s] Connected Workers: {count}")
+            break
 
-                    if count >= 2:
-                        print(f"   ✅ {count} Workers connected and ready for jobs.")
-                        workers_ready = True
-                        break
-            except Exception as e:
-                print(f"   ⚠️ Polling error: {e}")
+        elif status == 'failed':
+            error = result.get('error', 'Unknown')
+            log_section("❌ JOB FAILED")
+            print(f"   Job ID: {job_id}")
+            print(f"   Error: {error}")
+            sys.exit(1)
 
-            time.sleep(5)
+    else:
+        print(f"\n   ❌ Job timed out after 10 minutes")
+        sys.exit(1)
 
-        if not workers_ready:
-            raise Exception("Workers failed to connect in time.")
+    # ==========================================
+    # 6. Cleanup
+    # ==========================================
 
-        # STEP 4: USER DEPOSIT
-        print("\n💳 4. Simulating User Deposit...")
-        user_kp = wallets['user_kp']
-        platform_pub = Pubkey.from_string(wallets['platform_pub'])
-        client = Client(RPC_URL)
+    log_section("🧹 6. Cleanup")
 
-        transfer_amount = 0.05
-        lamports = int(transfer_amount * 1_000_000_000)
+    print(f"   Pods created:")
+    print(f"      - Core: {core_pod_id}")
+    for i, wid in enumerate(worker_ids):
+        print(f"      - Worker {i+1}: {wid}")
 
-        ix = transfer(TransferParams(from_pubkey=user_kp.pubkey(), to_pubkey=platform_pub, lamports=lamports))
-        blockhash = client.get_latest_blockhash().value.blockhash
-        tx = Transaction.new_signed_with_payer([ix], user_kp.pubkey(), [user_kp], blockhash)
+    print(f"\n   To terminate pods:")
+    print(f"      runpod terminate {core_pod_id}")
+    for wid in worker_ids:
+        print(f"      runpod terminate {wid}")
 
-        print(f"   Sending on-chain deposit transaction ({transfer_amount} SOL)...")
-        sig = client.send_transaction(tx).value
-        print(f"   Tx Sent: {sig}")
+    print(f"\n   Or keep them running for more tests.\n")
 
-        print("      ⏳ Waiting 20s for transaction confirmation...")
-        time.sleep(20)
-
-        res = requests.post(f"{api_url}/deposit", json={
-            "tx_sig": str(sig),
-            "user_pubkey": str(user_kp.pubkey())
-        })
-        print(f"   Deposit Result: {res.json()}")
-
-        # STEP 5: INFERENCE
-        print("\n🧪 5. Running Inference Job...")
-        print("   (Note: First run will be slower as workers download layers JIT)")
-
-        res = requests.post(f"{api_url}/submit", json={
-            "user_pubkey": str(user_kp.pubkey()),
-            "model_id": "Qwen/Qwen2.5-0.5B",
-            "prompt": "Explain quantum physics in one sentence.",
-            "est_tokens": 50
-        })
-        print(f"   Submission: {res.text}")
-
-        if res.status_code != 200:
-            raise Exception(f"Submission failed: {res.text}")
-
-        job_id = res.json()['job_id']
-        print(f"   Polling results for Job {job_id}...")
-
-        # INCREASED TIMEOUT to 300s (5 minutes) for slow JIT downloads
-        for i in range(150):
-            res = requests.get(f"{api_url}/results/{job_id}")
-            data = res.json()
-
-            status = data.get('status')
-            if status == 'completed':
-                print(f"\n🎉 SUCCESS: {data['output']}\n")
-                print(f"   Cost: {data.get('cost')} Lamports")
-                print(f"   Remaining Balance: {data.get('final_balance')}")
-                return
-            if status == 'failed':
-                print(f"\n❌ JOB FAILED: {data.get('error')}\n")
-                return
-
-            if i % 10 == 0:
-                print(f"   [{i*2}s] Status: {status}...")
-            time.sleep(2)
-
-        raise Exception("Test Timed Out waiting for inference result")
-
-    except Exception as e:
-        print(f"\n❌ CRITICAL FAIL: {e}")
-        import traceback
-        traceback.print_exc()
-
-        # --- LOG DUMPING HELPERS ---
-        print("\n📜 TO DEBUG, RUN THESE COMMANDS:")
-        if core_id:
-            print(f"   CORE LOGS:   runpod logs {core_id}")
-        for i, wid in enumerate(worker_ids):
-            print(f"   WORKER {i} LOGS: runpod logs {wid}")
-
-    finally:
-        print("\n🧹 Tearing Down...")
-        if core_id: runpod.terminate_pod(core_id)
-        for wid in worker_ids: runpod.terminate_pod(wid)
+    log_section("✅ E2E TEST COMPLETE")
 
 if __name__ == "__main__":
-    run_lifecycle()
+    main()

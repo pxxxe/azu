@@ -144,9 +144,17 @@ class ProductionWorker:
                 hidden_states = hidden_states.half()
                 for layer in self.active_layers:
                     out = layer(hidden_states)
-                    if isinstance(out, tuple):
+
+                    # FIX: Properly extract hidden states from various output types
+                    # HuggingFace layers return BaseModelOutputWithPast (not plain tuple!)
+                    if hasattr(out, 'last_hidden_state'):
+                        # BaseModelOutputWithPast has .last_hidden_state attribute
+                        hidden_states = out.last_hidden_state
+                    elif isinstance(out, (tuple, list)):
+                        # Plain tuple/list - take first element
                         hidden_states = out[0]
                     else:
+                        # Plain tensor
                         hidden_states = out
 
             # 4. OUTPUT / FORWARD

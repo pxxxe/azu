@@ -2,6 +2,8 @@ import torch
 import os
 import sys
 import json
+import gc
+import shutil
 from pathlib import Path
 from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -145,24 +147,17 @@ class LayerStore:
         Returns number of layers extracted.
         """
         print(f"\n🔪 SHARDING {model_id}")
-        print(f"   Storage path: {self.storage_path}")
-        print(f"   HF Token: {'*' * 10}{hf_token[-4:] if len(hf_token) > 4 else '???'}")
 
         # Check disk space
-        import shutil
         total, used, free = shutil.disk_usage(self.storage_path)
         print(f"   💾 Disk: {free // (2**30)}GB free / {total // (2**30)}GB total")
-
-        if free < 5 * (2**30):
-            raise Exception(f"Insufficient disk space: {free // (2**30)}GB free, need at least 5GB")
 
         try:
             print(f"\n   📥 Downloading model from HuggingFace...")
             sys.stdout.flush()
 
-            # Load config first to check if MoE
+            # Load config first
             config = AutoConfig.from_pretrained(model_id, token=hf_token, trust_remote_code=True)
-            print(f"   ✅ Config loaded")
 
             # Check for MoE indicators
             is_moe = False
@@ -176,134 +171,118 @@ class LayerStore:
 
             if hasattr(config, 'num_experts_per_tok'):
                 num_experts_per_tok = config.num_experts_per_tok
-                print(f"   🎯 Top-{num_experts_per_tok} expert routing")
 
             # Load full model
+            # WARNING: This loads entire weights into RAM.
+            # Ideally we would use Lazy Loading with accelerate, but for simple splitting
+            # of arbitrary architectures, loading fully is the most robust method for now.
             model = AutoModelForCausalLM.from_pretrained(
                 model_id,
                 token=hf_token,
                 torch_dtype=torch.float16,
-                device_map="cpu",
+                device_map="cpu", # Force CPU to avoid GPU OOM during simple splitting
                 trust_remote_code=True,
                 low_cpu_mem_usage=True
             )
             print(f"   ✅ Model downloaded successfully")
 
         except Exception as e:
-            print(f"\n   ❌ Failed to download model from HuggingFace")
-            print(f"   Error type: {type(e).__name__}")
-            print(f"   Error message: {str(e)}")
-            raise Exception(f"HuggingFace download failed: {str(e)}")
-
-        # Find layer structure
-        print(f"\n   🔍 Finding layer structure...")
-        try:
-            layers = self._find_layers(model)
-            num_layers = len(layers)
-            print(f"   ✅ Found {num_layers} layers")
-        except Exception as e:
-            print(f"   ❌ Failed to find layers in model")
-            raise Exception(f"Layer detection failed: {str(e)}")
+            print(f"\n   ❌ Failed to download model: {str(e)}")
+            raise
 
         # Create storage directory
         model_dir = self.storage_path / model_id.replace("/", "_")
         model_dir.mkdir(exist_ok=True, parents=True)
-        print(f"   📁 Output directory: {model_dir}")
 
-        print(f"\n   💾 Extracting layers...")
+        try:
+            # Find layer structure
+            layers = self._find_layers(model)
+            num_layers = len(layers)
 
-        layer_metadata = []
-        total_size_mb = 0
+            layer_metadata = []
+            total_size_mb = 0
 
-        # Save each layer
-        for i, layer in enumerate(layers):
-            # Check if this is an MoE layer
-            is_moe_layer, moe_path = self._is_moe_layer(layer, config)
+            print(f"\n   💾 Extracting {num_layers} layers...")
 
-            if is_moe_layer:
-                # Extract MoE experts separately
-                num_experts = self._extract_moe_experts(layer, i, model_dir, moe_path)
-                layer_type = "moe"
+            # Save each layer
+            for i, layer in enumerate(layers):
+                is_moe_layer, moe_path = self._is_moe_layer(layer, config)
 
-                # Calculate total size of all expert files
-                expert_files = list(model_dir.glob(f"layer_{i}_expert_*.pt"))
-                layer_size = sum(f.stat().st_size for f in expert_files) / (1024**2)
+                if is_moe_layer:
+                    num_experts = self._extract_moe_experts(layer, i, model_dir, moe_path)
+                    layer_type = "moe"
+                    # Approximate size calc based on file outputs would be better,
+                    # but for metadata we track what we extracted.
+                    expert_files = list(model_dir.glob(f"layer_{i}_expert_*.pt"))
+                    layer_size = sum(f.stat().st_size for f in expert_files) / (1024**2)
+                else:
+                    layer_path = model_dir / f"layer_{i}_dense.pt"
+                    torch.save(layer.state_dict(), layer_path)
+                    layer_size = layer_path.stat().st_size / (1024**2)
+                    layer_type = "dense"
+                    num_experts = 0
 
-            else:
-                # Regular dense layer - save whole thing
-                layer_path = model_dir / f"layer_{i}_dense.pt"
-                torch.save(layer.state_dict(), layer_path)
-                layer_size = layer_path.stat().st_size / (1024**2)
-                layer_type = "dense"
-                num_experts = 0
+                total_size_mb += layer_size
 
-            total_size_mb += layer_size
+                layer_metadata.append({
+                    "layer_idx": i,
+                    "type": layer_type,
+                    "size_mb": layer_size,
+                    "num_experts": num_experts
+                })
 
-            metadata = {
-                "layer_idx": i,
-                "type": layer_type,
-                "size_mb": layer_size,
-                "num_experts": num_experts if is_moe_layer else 0
+                # Progress + Aggressive GC during loop for massive models?
+                # No, standard GC usually handles iterative assignment,
+                # but clearing `layer` variable explicitly helps.
+                if (i + 1) % 5 == 0:
+                    print(f"      Progress: {i+1}/{num_layers} layers")
+                    sys.stdout.flush()
+
+            # Save embeddings/heads
+            if hasattr(model, 'get_input_embeddings'):
+                emb = model.get_input_embeddings()
+                torch.save(emb.state_dict(), model_dir / "embeddings.pt")
+
+            if hasattr(model, 'lm_head'):
+                torch.save(model.lm_head.state_dict(), model_dir / "lm_head.pt")
+
+            config.save_pretrained(model_dir)
+
+            structure_info = {
+                "model_id": model_id,
+                "num_layers": num_layers,
+                "architecture": config.architectures[0] if hasattr(config, 'architectures') else "unknown",
+                "hidden_size": config.hidden_size if hasattr(config, 'hidden_size') else None,
+                "total_size_mb": total_size_mb,
+                "is_moe": is_moe,
+                "num_experts_per_tok": num_experts_per_tok,
+                "layer_metadata": layer_metadata
             }
-            layer_metadata.append(metadata)
 
-            # Progress indicator
-            if (i + 1) % 5 == 0 or i == num_layers - 1:
-                print(f"      Progress: {i+1}/{num_layers} layers ({total_size_mb:.1f}MB total)")
-                sys.stdout.flush()
+            with open(model_dir / "structure.json", "w") as f:
+                json.dump(structure_info, f, indent=2)
 
-        # Save embeddings and heads
-        print(f"\n   💾 Saving embeddings and heads...")
+            return num_layers
 
-        # 1. Embeddings
-        if hasattr(model, 'get_input_embeddings'):
-            emb = model.get_input_embeddings()
-            torch.save(emb.state_dict(), model_dir / "embeddings.pt")
-            emb_size = (model_dir / 'embeddings.pt').stat().st_size / (1024**2)
-            print(f"      Embeddings: {emb_size:.1f}MB")
-        else:
-            print("      ⚠️ WARNING: Could not find input embeddings!")
+        finally:
+            # --- CRITICAL MEMORY CLEANUP ---
+            print("   🧹 Cleaning up memory...")
+            try:
+                # Delete local references
+                if 'layers' in locals(): del layers
+                if 'model' in locals(): del model
+                if 'emb' in locals(): del emb
 
-        # 2. LM Head
-        if hasattr(model, 'lm_head'):
-            torch.save(model.lm_head.state_dict(), model_dir / "lm_head.pt")
-            head_size = (model_dir / 'lm_head.pt').stat().st_size / (1024**2)
-            print(f"      LM Head: {head_size:.1f}MB")
-        else:
-            print("      ⚠️ WARNING: Could not find lm_head!")
+                # Force Python Garbage Collection
+                gc.collect()
 
-        # Save config
-        config.save_pretrained(model_dir)
+                # Clear Torch Cache (if any GPU was used, though we forced CPU)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-        # Save comprehensive structure info
-        structure_info = {
-            "model_id": model_id,
-            "num_layers": num_layers,
-            "architecture": config.architectures[0] if hasattr(config, 'architectures') else "unknown",
-            "hidden_size": config.hidden_size if hasattr(config, 'hidden_size') else None,
-            "total_size_mb": total_size_mb,
-            "is_moe": is_moe,
-            "num_experts_per_tok": num_experts_per_tok,
-            "layer_metadata": layer_metadata
-        }
-
-        with open(model_dir / "structure.json", "w") as f:
-            json.dump(structure_info, f, indent=2)
-
-        del model
-        torch.cuda.empty_cache()
-
-        print(f"\n✅ SHARDING COMPLETE")
-        print(f"   Model: {model_id}")
-        print(f"   Layers: {num_layers}")
-        print(f"   MoE: {'Yes' if is_moe else 'No'}")
-        if is_moe:
-            moe_layers = [m for m in layer_metadata if m['type'] == 'moe']
-            print(f"   MoE Layers: {len(moe_layers)}")
-            print(f"   Total Experts: {sum(m['num_experts'] for m in moe_layers)}")
-        print(f"   Total size: {total_size_mb:.1f}MB")
-
-        return num_layers
+                print("   ✅ Memory released")
+            except Exception as e:
+                print(f"   ⚠️ Cleanup warning: {e}")
 
     def get_model_structure(self, model_id: str):
         """Get overall model structure info"""

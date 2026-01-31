@@ -196,16 +196,18 @@ def main():
         platform = Keypair()
         scheduler = Keypair()
         user = Keypair()
-        client = AsyncClient(SOLANA_RPC)
+        # Removed global client creation to avoid event loop issues
 
         async def setup_wallets():
-            bal = (await client.get_balance(funder.pubkey())).value / 1e9
-            print(f"   💵 Funder: {funder.pubkey()} ({bal} SOL)")
-            if bal < 0.3: raise Exception("Insufficient funds")
+            # Create client INSIDE the async loop context
+            async with AsyncClient(SOLANA_RPC) as client:
+                bal = (await client.get_balance(funder.pubkey())).value / 1e9
+                print(f"   💵 Funder: {funder.pubkey()} ({bal} SOL)")
+                if bal < 0.3: raise Exception("Insufficient funds")
 
-            print("   💸 Funding Scheduler & User...")
-            await transfer_sol(client, funder, scheduler.pubkey(), 0.1)
-            await transfer_sol(client, funder, user.pubkey(), 0.1)
+                print("   💸 Funding Scheduler & User...")
+                await transfer_sol(client, funder, scheduler.pubkey(), 0.1)
+                await transfer_sol(client, funder, user.pubkey(), 0.1)
 
         asyncio.run(setup_wallets())
 
@@ -282,8 +284,6 @@ def main():
             worker_ids.append(wid)
 
         print("\n   ⏳ Waiting for workers to connect to Scheduler...")
-        # Since we don't have a direct Scheduler API for workers in this version of the script,
-        # we'll infer it by waiting a bit or assuming if submit works.
         time.sleep(60)
 
         # ==========================================
@@ -294,16 +294,20 @@ def main():
         # Deposit
         async def do_deposit():
             print("   💳 Sending Deposit...")
-            # Send SOL
-            ix = transfer(TransferParams(from_pubkey=user.pubkey(), to_pubkey=platform.pubkey(), lamports=50_000_000))
-            blockhash = (await client.get_latest_blockhash()).value.blockhash
-            tx = Transaction.new_signed_with_payer([ix], user.pubkey(), [user], blockhash)
-            sig = await client.send_transaction(tx)
-            await asyncio.sleep(20) # Wait for conf
+            # Create fresh client for this loop
+            async with AsyncClient(SOLANA_RPC) as client:
+                # Send SOL
+                ix = transfer(TransferParams(from_pubkey=user.pubkey(), to_pubkey=platform.pubkey(), lamports=50_000_000))
+                blockhash = (await client.get_latest_blockhash()).value.blockhash
+                tx = Transaction.new_signed_with_payer([ix], user.pubkey(), [user], blockhash)
+                sig = await client.send_transaction(tx)
 
-            # Notify API
-            requests.post(f"{api_url}/deposit", json={"tx_sig": str(sig.value), "user_pubkey": str(user.pubkey())})
-            print("   ✅ Deposit Registered")
+                # Notify API (Sync request is fine here)
+                # But we wait a bit for confusion
+                await asyncio.sleep(20)
+
+                requests.post(f"{api_url}/deposit", json={"tx_sig": str(sig.value), "user_pubkey": str(user.pubkey())})
+                print("   ✅ Deposit Registered")
 
         asyncio.run(do_deposit())
 

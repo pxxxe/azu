@@ -8,6 +8,7 @@ import os
 import traceback
 import asyncio
 import sys
+import shutil
 from pathlib import Path
 from shared.config import settings
 from .layer_storage import LayerStore
@@ -32,6 +33,7 @@ except Exception as e:
 
 class ShardRequest(BaseModel):
     model_id: str
+    force: bool = False  # NEW: Force re-shard even if model exists
 
 async def background_shard_task(model_id: str, hf_token: str):
     try:
@@ -49,7 +51,20 @@ async def background_shard_task(model_id: str, hf_token: str):
 @app.post("/models/shard")
 async def shard_model(req: ShardRequest, background_tasks: BackgroundTasks):
     try:
-        # 1. Check if physically exists
+        # FORCE MODE: Delete existing files and re-shard
+        if req.force:
+            sanitized = req.model_id.replace("/", "_")
+            model_dir = store.storage_path / sanitized
+            if model_dir.exists():
+                print(f"🗑️ FORCE MODE: Deleting existing model directory {model_dir}")
+                shutil.rmtree(model_dir)
+                print(f"✅ Deleted {model_dir}")
+
+            # Clear Redis status
+            await r.delete(f"shard_status:{req.model_id}")
+            print(f"🔄 FORCE MODE: Re-sharding {req.model_id} from scratch")
+
+        # 1. Check if physically exists (after potential deletion)
         if store.has_model(req.model_id):
             return {"status": "ready", "message": "Model already exists"}
 
@@ -135,6 +150,34 @@ async def debug_files(model_id: str):
         }
     except Exception as e:
         return {"error": str(e)}
+
+@app.delete("/models/{model_id}")
+async def delete_model(model_id: str):
+    """Delete a sharded model to free up space or force re-shard."""
+    try:
+        sanitized = model_id.replace("/", "_")
+        model_dir = store.storage_path / sanitized
+
+        if not model_dir.exists():
+            raise HTTPException(404, f"Model {model_id} not found")
+
+        # Delete directory
+        shutil.rmtree(model_dir)
+
+        # Clear Redis status
+        await r.delete(f"shard_status:{model_id}")
+
+        return {
+            "status": "deleted",
+            "model_id": model_id,
+            "message": f"Deleted {model_dir}"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Delete error: {e}")
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
 
 @app.get("/health")
 async def health():

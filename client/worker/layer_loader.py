@@ -5,13 +5,6 @@ import json
 from pathlib import Path
 from transformers import AutoConfig
 
-# Import layer classes
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
-from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeDecoderLayer, Qwen2MoeSparseMoeBlock
-from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
-from transformers.models.gpt2.modeling_gpt2 import GPT2Block
-
 class LayerLoader:
     def __init__(self, registry_url, cache_dir="./layer_cache"):
         self.registry_url = registry_url
@@ -38,19 +31,77 @@ class LayerLoader:
                 os.rename(temp, path)
 
     def _get_layer_class(self, config):
-        """Map architecture string to actual PyTorch Class"""
+        """
+        Map architecture string to actual PyTorch Layer Class.
+        Uses dynamic imports to support ALL architectures without hardcoding.
+        """
         arch = config.architectures[0]
-        if "Qwen2Moe" in arch or "Qwen2MoE" in arch:
-            return Qwen2MoeDecoderLayer
-        if "Llama" in arch:
-            return LlamaDecoderLayer
-        if "Qwen" in arch:
-            return Qwen2DecoderLayer
-        if "Mistral" in arch:
-            return MistralDecoderLayer
-        if "GPT2" in arch:
-            return GPT2Block
-        raise ValueError(f"Worker does not support architecture: {arch}")
+
+        # Common architecture -> (module_name, class_name) mappings
+        arch_map = {
+            "LlamaForCausalLM": ("llama", "LlamaDecoderLayer"),
+            "MistralForCausalLM": ("mistral", "MistralDecoderLayer"),
+            "MixtralForCausalLM": ("mixtral", "MixtralDecoderLayer"),
+            "Qwen2ForCausalLM": ("qwen2", "Qwen2DecoderLayer"),
+            "Qwen2MoeForCausalLM": ("qwen2_moe", "Qwen2MoeDecoderLayer"),
+            "GPT2LMHeadModel": ("gpt2", "GPT2Block"),
+            "GPTNeoForCausalLM": ("gpt_neo", "GPTNeoBlock"),
+            "GPTJForCausalLM": ("gptj", "GPTJBlock"),
+            "OPTForCausalLM": ("opt", "OPTDecoderLayer"),
+            "BloomForCausalLM": ("bloom", "BloomBlock"),
+            "FalconForCausalLM": ("falcon", "FalconDecoderLayer"),
+            "MPTForCausalLM": ("mpt", "MPTBlock"),
+            "PhiForCausalLM": ("phi", "PhiDecoderLayer"),
+            "Phi3ForCausalLM": ("phi3", "Phi3DecoderLayer"),
+            "GemmaForCausalLM": ("gemma", "GemmaDecoderLayer"),
+            "Gemma2ForCausalLM": ("gemma2", "Gemma2DecoderLayer"),
+            "Starcoder2ForCausalLM": ("starcoder2", "Starcoder2DecoderLayer"),
+            "DeepseekV2ForCausalLM": ("deepseek_v2", "DeepseekV2DecoderLayer"),
+        }
+
+        if arch in arch_map:
+            module_name, class_name = arch_map[arch]
+            try:
+                # Dynamic import: from transformers.models.{module_name}.modeling_{module_name} import {class_name}
+                import importlib
+                full_module = f"transformers.models.{module_name}.modeling_{module_name}"
+                mod = importlib.import_module(full_module)
+                return getattr(mod, class_name)
+            except (ImportError, AttributeError) as e:
+                print(f"⚠️ Failed to import {class_name} from {full_module}: {e}")
+                # Fall through to generic fallback
+
+        # FALLBACK: Try generic pattern matching for unknown architectures
+        # Most architectures follow the pattern: XForCausalLM -> XDecoderLayer
+        try:
+            # Extract base name (e.g., "Llama" from "LlamaForCausalLM")
+            if arch.endswith("ForCausalLM"):
+                base = arch[:-len("ForCausalLM")]
+            elif arch.endswith("LMHeadModel"):
+                base = arch[:-len("LMHeadModel")]
+            else:
+                base = arch
+
+            # Try to import dynamically
+            module_name = base.lower()
+            class_name = f"{base}DecoderLayer"
+
+            import importlib
+            full_module = f"transformers.models.{module_name}.modeling_{module_name}"
+            print(f"   🔍 Attempting generic import: {full_module}.{class_name}")
+            mod = importlib.import_module(full_module)
+            layer_class = getattr(mod, class_name)
+            print(f"   ✅ Successfully loaded {class_name} via generic pattern")
+            return layer_class
+        except Exception as e:
+            print(f"   ❌ Generic import failed: {e}")
+
+        # LAST RESORT: Return error with helpful message
+        raise ValueError(
+            f"Worker does not support architecture: {arch}\n"
+            f"To add support, update the arch_map in layer_loader.py with:\n"
+            f'  "{arch}": ("<module_name>", "<LayerClassName>")'
+        )
 
     async def load_dense_layer(self, model_id: str, layer_idx: int, device="cuda"):
         """Load a regular dense transformer layer."""
@@ -105,7 +156,7 @@ class LayerLoader:
         await self._download(f"{self.registry_url}/layers/{sanitized}/{filename}", path)
 
         # Create router (simple Linear layer for most MoE)
-        # For Qwen2-MoE: it's a Linear(hidden_size, num_experts)
+        # For Qwen2-MoE and Mixtral: it's a Linear(hidden_size, num_experts)
         num_experts = getattr(config, 'num_local_experts', 8)  # Default to 8
         hidden_size = config.hidden_size
 
@@ -139,19 +190,18 @@ class LayerLoader:
         path = self.cache_dir / f"{sanitized}_{filename}"
         await self._download(f"{self.registry_url}/layers/{sanitized}/{filename}", path)
 
-        # For Qwen2-MoE experts, they're simple FFN blocks
-        # Structure: w1 (gate), w2 (down), w3 (up)
-        intermediate_size = getattr(config, 'moe_intermediate_size', config.intermediate_size)
+        # Create expert module (standard FFN for most MoE models)
+        # Mixtral, Qwen2-MoE use: gate_proj, up_proj, down_proj with SiLU activation
+        intermediate_size = config.intermediate_size
         hidden_size = config.hidden_size
 
-        # Create expert FFN
         class ExpertFFN(torch.nn.Module):
             def __init__(self, hidden_size, intermediate_size):
                 super().__init__()
                 self.gate_proj = torch.nn.Linear(hidden_size, intermediate_size, bias=False)
                 self.up_proj = torch.nn.Linear(hidden_size, intermediate_size, bias=False)
                 self.down_proj = torch.nn.Linear(intermediate_size, hidden_size, bias=False)
-                self.act_fn = torch.nn.SiLU()  # Qwen2 uses SiLU
+                self.act_fn = torch.nn.SiLU()
 
             def forward(self, x):
                 return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -166,13 +216,11 @@ class LayerLoader:
         self.loaded_cache[cache_key] = expert
         return expert
 
-    async def load_moe_shared_expert(self, model_id: str, layer_idx: int, device="cuda"):
-        """Load the shared expert if it exists (Qwen2-MoE has this)."""
+    async def load_shared_expert(self, model_id: str, layer_idx: int, device="cuda"):
+        """Load the shared expert for models that have one (like DeepSeek-V2)."""
         cache_key = f"{model_id}:shared_expert:{layer_idx}"
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
-
-        print(f"📦 Loading shared expert for MoE layer {layer_idx}...")
 
         sanitized = model_id.replace("/", "_")
 

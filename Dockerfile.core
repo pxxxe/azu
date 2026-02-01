@@ -5,6 +5,8 @@ RUN apt-get update && apt-get install -y redis-server git curl
 
 WORKDIR /app
 
+ENV PYTHONUNBUFFERED=1
+
 COPY registry/requirements.txt reqs_reg.txt
 COPY scheduler/requirements.txt reqs_sched.txt
 COPY api/requirements.txt reqs_api.txt

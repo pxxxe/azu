@@ -40,19 +40,46 @@ class LayerStore:
         raise ValueError(f"Could not find layers. Model keys: {list(model.state_dict().keys())[:5]}...")
 
     def _is_moe_layer(self, layer, config):
-        """Check if a layer is an MoE layer."""
-        # On meta device, we check structure
-        moe_indicators = ['mlp.experts', 'block_sparse_moe', 'moe', 'experts']
-        for indicator in moe_indicators:
-            parts = indicator.split('.')
-            obj = layer
+        """Find the MoE block inside a layer.
+
+        Returns (is_moe, path_to_moe_block) where path_to_moe_block points to
+        the module that CONTAINS both the router (gate) and the experts list —
+        e.g. "mlp" for Mixtral, NOT "mlp.experts".
+
+        The old version checked for 'mlp.experts' first, which resolved to the
+        experts ModuleList itself.  The router check then ran against that
+        ModuleList (hasattr(ModuleList, "gate") == False), so the router was
+        never saved.  The expert extraction also broke because it called
+        getattr(ModuleList, "experts") which is None.
+        """
+        # Each candidate is (path_to_block, router_attr_name).
+        # We walk to path_to_block and confirm it has BOTH a router attribute
+        # AND an 'experts' ModuleList.  This guarantees we land on the container,
+        # not on the experts list itself.
+        candidates = [
+            ("block_sparse_moe", ["gate", "router"]),   # some Mixtral variants
+            ("mlp",              ["gate", "router"]),   # Mixtral standard
+            ("moe",              ["gate", "router"]),   # generic
+            ("",                 ["gate", "router"]),   # layer itself is the block
+        ]
+
+        for block_path, router_names in candidates:
             try:
-                for part in parts:
-                    obj = getattr(obj, part)
-                if obj is not None:
-                    return True, indicator
+                obj = layer
+                if block_path:
+                    for part in block_path.split('.'):
+                        obj = getattr(obj, part)
+
+                has_router = any(hasattr(obj, name) for name in router_names)
+                has_experts = (hasattr(obj, 'experts')
+                               and hasattr(obj.experts, '__len__')
+                               and len(obj.experts) > 0)
+
+                if has_router and has_experts:
+                    return True, block_path
             except AttributeError:
                 continue
+
         return False, None
 
     def _get_num_experts(self, config):
@@ -195,37 +222,39 @@ class LayerStore:
                 is_moe, moe_rel_path = self._is_moe_layer(layer, config)
 
                 if is_moe:
-                    # It's MoE. We need to save Router and Experts separately.
-                    # Navigate to MoE module
+                    # Navigate to the MoE block (e.g. layer.mlp for Mixtral).
+                    # moe_rel_path now correctly points to the BLOCK, not the experts list.
                     moe_module = layer
-                    for part in moe_rel_path.split('.'):
-                        moe_module = getattr(moe_module, part)
+                    if moe_rel_path:  # guard: empty string means layer itself is the block
+                        for part in moe_rel_path.split('.'):
+                            moe_module = getattr(moe_module, part)
+                        moe_prefix = f"{layer_prefix}.{moe_rel_path}"
+                    else:
+                        moe_prefix = layer_prefix
 
-                    moe_prefix = f"{layer_prefix}.{moe_rel_path}"
-
-                    # 1. Router
-                    router_attr = "gate" if hasattr(moe_module, "gate") else "router" # generic
+                    # 1. Router — moe_module now has .gate or .router directly
+                    router_attr = "gate" if hasattr(moe_module, "gate") else "router"
                     router = getattr(moe_module, router_attr, None)
                     if router:
+                        print(f"      💾 Saving router (attr={router_attr}) for layer {i}...")
                         self._save_module(router, f"{moe_prefix}.{router_attr}", model_path, weight_map, out_dir / f"layer_{i}_router.pt", loaded_shards)
+                    else:
+                        print(f"      ⚠️ WARNING: No router found on MoE block for layer {i}")
 
-                    # 2. Experts - FIX: Get count from config instead of meta device!
+                    # 2. Experts — moe_module.experts is the ModuleList directly
                     num_experts = self._get_num_experts(config)
+                    experts_list = moe_module.experts  # guaranteed to exist by _is_moe_layer
                     expert_size_acc = 0
 
-                    # Use range instead of iterating over the meta device experts
                     for exp_idx in range(num_experts):
-                        # Get the expert module from meta model (just for structure)
-                        experts_list = getattr(moe_module, "experts", None)
-                        if experts_list is not None and exp_idx < len(experts_list):
+                        if exp_idx < len(experts_list):
                             expert = experts_list[exp_idx]
                         else:
-                            # Fallback: assume experts exist in weight map even if not in meta
-                            expert = None
+                            # More experts in config than in meta model; use first as template
+                            expert = experts_list[0]
 
-                        # Save using the prefix - this will look up weights by key
                         sz = self._save_module(
-                            expert if expert else moe_module.experts[0],  # Use structure from first expert as template
+                            expert,
                             f"{moe_prefix}.experts.{exp_idx}",
                             model_path,
                             weight_map,

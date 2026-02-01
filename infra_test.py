@@ -114,7 +114,7 @@ def resolve_connection(pod_id, port, max_wait=120):
     print("      ⚠️ Timeout waiting for port check. Assuming Proxy is valid.")
     return proxy_url
 
-def deploy_pod_with_retry(name, image, env_vars, gpu_type, max_retries=8):
+def deploy_pod_with_retry(name, image, env_vars, gpu_type, max_retries=3):
     """Deploy pod with retries."""
     print(f"   🎯 Trying GPU type: {gpu_type}")
 
@@ -158,7 +158,7 @@ def deploy_pod_with_retry(name, image, env_vars, gpu_type, max_retries=8):
                  print(f"   ⚠️  Error: {e}")
 
         if attempt < max_retries:
-            time.sleep(3)
+            time.sleep(1)
 
     return None
 

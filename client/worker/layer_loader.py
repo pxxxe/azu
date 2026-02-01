@@ -20,6 +20,7 @@ class LayerLoader:
 
         print(f"   ⬇️ Downloading {url}...")
         sys.stdout.flush()
+        print("Fully downloaded")
 
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
@@ -28,10 +29,12 @@ class LayerLoader:
                 data = await resp.read()
 
                 # Atomic write
+                print("Writing to disk")
                 temp = path.with_suffix('.tmp')
                 with open(temp, 'wb') as f:
                     f.write(data)
                 os.rename(temp, path)
+                print("Written to disk")
 
     def _get_layer_class(self, config):
         """

@@ -120,6 +120,35 @@ class MoEScheduler:
                     node['expert_map'][str(exp_idx)] = exp_worker.specs.get('p2p_url')
 
             topology.append(node)
+
+        if not topology:
+            return None
+
+        # Bookend the topology with explicit embed and decode nodes.
+        # layer_idx=-1 tells the worker to run embeddings (is_first) or lm_head (is_last)
+        # without running any transformer layer. This is what was broken: the old code
+        # assumed topology[0] was dense and set is_first: i==0, but for Mixtral (and any
+        # pure-MoE model) layer 0 is MoE so embeddings were never dispatched.
+        first_worker = topology[0]
+        last_worker = topology[-1]
+
+        embed_node = {
+            "layer_idx": -1,
+            "type": "dense",
+            "role": "embed",
+            "worker_id": first_worker['worker_id'],
+            "endpoint": first_worker['endpoint']
+        }
+
+        decode_node = {
+            "layer_idx": -1,
+            "type": "dense",
+            "role": "decode",
+            "worker_id": last_worker['worker_id'],
+            "endpoint": last_worker['endpoint']
+        }
+
+        topology = [embed_node] + topology + [decode_node]
         return topology
 
     async def _check_model_status(self, model_id: str) -> str:
@@ -204,20 +233,34 @@ class MoEScheduler:
             w = self.workers.get(node['worker_id'])
             if not w: continue
 
-            next_hop = job.topology[i+1]['endpoint'] + "/tensor_in" if i < len(job.topology)-1 else None
+            is_last_node = (i == len(job.topology) - 1)
+            next_hop = job.topology[i + 1]['endpoint'] + "/tensor_in" if not is_last_node else None
+            role = node.get('role')  # 'embed', 'decode', or None
 
             payload = {
-                "job_id": job.id, "model_id": job.model_id, "layer_idx": node['layer_idx'], "next_hop": next_hop
+                "job_id": job.id,
+                "model_id": job.model_id,
+                "layer_idx": node['layer_idx'],
+                "next_hop": next_hop
             }
 
             if node['type'] == 'dense':
-                payload.update({"type": "EXECUTE_DENSE", "input": job.input_prompt if i==0 else None, "is_first": i==0, "is_last": i==len(job.topology)-1})
-                await w.ws.send_json(payload)
-            elif node['type'] == 'moe':
-                payload.update({"type": "EXECUTE_ROUTER", "expert_map": node['expert_map']})
+                payload.update({
+                    "type": "EXECUTE_DENSE",
+                    "input": job.input_prompt if role == 'embed' else None,
+                    "is_first": role == 'embed',
+                    "is_last": role == 'decode'
+                })
                 await w.ws.send_json(payload)
 
-                # Group experts
+            elif node['type'] == 'moe':
+                payload.update({
+                    "type": "EXECUTE_ROUTER",
+                    "expert_map": node['expert_map']
+                })
+                await w.ws.send_json(payload)
+
+                # Group experts by worker so we batch the sends
                 tasks = {}
                 for exp_idx, url in node['expert_map'].items():
                     exp_w = next((wk for wk in self.workers.values() if wk.specs.get('p2p_url') == url), None)
@@ -229,8 +272,12 @@ class MoEScheduler:
                     t_w = self.workers.get(wid)
                     for idx in indices:
                         await t_w.ws.send_json({
-                            "type": "EXECUTE_EXPERT", "job_id": job.id, "model_id": job.model_id,
-                            "layer_idx": node['layer_idx'], "expert_idx": idx, "return_url": node['endpoint']
+                            "type": "EXECUTE_EXPERT",
+                            "job_id": job.id,
+                            "model_id": job.model_id,
+                            "layer_idx": node['layer_idx'],
+                            "expert_idx": idx,
+                            "return_url": node['endpoint']
                         })
 
     async def handle_result(self, wid: str, data: dict):

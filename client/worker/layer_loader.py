@@ -1,6 +1,7 @@
 import torch
 import aiohttp
 import os
+import sys
 import json
 from pathlib import Path
 from transformers import AutoConfig
@@ -18,6 +19,8 @@ class LayerLoader:
             return
 
         print(f"   ⬇️ Downloading {url}...")
+        sys.stdout.flush()
+
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
                 if resp.status != 200:
@@ -69,6 +72,7 @@ class LayerLoader:
                 return getattr(mod, class_name)
             except (ImportError, AttributeError) as e:
                 print(f"⚠️ Failed to import {class_name} from {full_module}: {e}")
+                sys.stdout.flush()
                 # Fall through to generic fallback
 
         # FALLBACK: Try generic pattern matching for unknown architectures
@@ -88,13 +92,14 @@ class LayerLoader:
 
             import importlib
             full_module = f"transformers.models.{module_name}.modeling_{module_name}"
-            print(f"   🔍 Attempting generic import: {full_module}.{class_name}")
+            # print(f"   🔍 Attempting generic import: {full_module}.{class_name}")
             mod = importlib.import_module(full_module)
             layer_class = getattr(mod, class_name)
-            print(f"   ✅ Successfully loaded {class_name} via generic pattern")
+            # print(f"   ✅ Successfully loaded {class_name} via generic pattern")
             return layer_class
         except Exception as e:
             print(f"   ❌ Generic import failed: {e}")
+            sys.stdout.flush()
 
         # LAST RESORT: Return error with helpful message
         raise ValueError(
@@ -110,6 +115,7 @@ class LayerLoader:
             return self.loaded_cache[cache_key]
 
         print(f"📦 Loading dense layer {layer_idx} for {model_id}...")
+        sys.stdout.flush()
 
         sanitized = model_id.replace("/", "_")
 
@@ -142,6 +148,7 @@ class LayerLoader:
             return self.loaded_cache[cache_key]
 
         print(f"📦 Loading router for MoE layer {layer_idx}...")
+        sys.stdout.flush()
 
         sanitized = model_id.replace("/", "_")
 
@@ -177,6 +184,7 @@ class LayerLoader:
             return self.loaded_cache[cache_key]
 
         print(f"📦 Loading expert {expert_idx} from MoE layer {layer_idx}...")
+        sys.stdout.flush()
 
         sanitized = model_id.replace("/", "_")
 
@@ -191,7 +199,6 @@ class LayerLoader:
         await self._download(f"{self.registry_url}/layers/{sanitized}/{filename}", path)
 
         # Create expert module (standard FFN for most MoE models)
-        # Mixtral, Qwen2-MoE use: gate_proj, up_proj, down_proj with SiLU activation
         intermediate_size = config.intermediate_size
         hidden_size = config.hidden_size
 
@@ -263,46 +270,6 @@ class LayerLoader:
 
         self.loaded_cache[cache_key] = shared_expert
         return shared_expert
-
-    async def load_layers(self, model_id: str, layer_indices: list, device="cuda"):
-        """
-        DEPRECATED for MoE - use load_dense_layer instead.
-        Kept for backward compatibility with dense models.
-        """
-        cache_key = f"{model_id}_{tuple(layer_indices)}"
-        if cache_key in self.loaded_cache:
-            return self.loaded_cache[cache_key]
-
-        print(f"📦 Loading layers {layer_indices} for {model_id}...")
-
-        sanitized = model_id.replace("/", "_")
-        config_path = self.cache_dir / f"{sanitized}_config.json"
-        await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
-        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
-
-        LayerClass = self._get_layer_class(config)
-        modules = []
-
-        for idx in layer_indices:
-            # Try dense layer first
-            filename = f"layer_{idx}_dense.pt"
-            path = self.cache_dir / f"{sanitized}_{filename}"
-
-            try:
-                await self._download(f"{self.registry_url}/layers/{sanitized}/{filename}", path)
-            except:
-                # Might be MoE layer - skip for now
-                print(f"      ⚠️ Layer {idx} not found as dense layer (might be MoE)")
-                continue
-
-            layer = LayerClass(config, layer_idx=idx).to(device).half()
-            state_dict = torch.load(path, map_location=device)
-            layer.load_state_dict(state_dict, strict=False)
-            layer.eval()
-            modules.append(layer)
-
-        self.loaded_cache[cache_key] = modules
-        return modules
 
     async def load_embeddings(self, model_id: str, device="cuda"):
         cache_key = f"{model_id}:embeddings"

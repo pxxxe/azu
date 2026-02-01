@@ -87,6 +87,7 @@ class MoEWorker:
         site = web.TCPSite(runner, '0.0.0.0', 8003)
         await site.start()
         print("👂 [P2P] Server listening on :8003")
+        sys.stdout.flush()
 
     def _decode_tensor(self, b64_str):
         buff = io.BytesIO(base64.b64decode(b64_str))
@@ -105,25 +106,28 @@ class MoEWorker:
                 return None
         return self.active_jobs[job_id]
 
+    async def process_ingress_data(self, data):
+        """Internal handler for incoming tensor data (bypass logic)"""
+        job_id = data['job_id']
+        msg_type = data.get('type', 'input')
+        tensor = self._decode_tensor(data['tensor'])
+
+        ctx = await self._get_context(job_id, create=True)
+
+        if msg_type == 'input':
+            await ctx.input_queue.put(tensor)
+
+        elif msg_type == 'expert_result':
+            expert_idx = data.get('expert_idx')
+            if expert_idx is not None and expert_idx in ctx.pending_expert_requests:
+                future = ctx.pending_expert_requests[expert_idx]
+                if not future.done():
+                    future.set_result(tensor)
+
     async def handle_tensor_ingress(self, request):
         try:
             data = await request.json()
-            job_id = data['job_id']
-            msg_type = data.get('type', 'input')
-            tensor = self._decode_tensor(data['tensor'])
-
-            ctx = await self._get_context(job_id, create=True)
-
-            if msg_type == 'input':
-                await ctx.input_queue.put(tensor)
-
-            elif msg_type == 'expert_result':
-                expert_idx = data.get('expert_idx')
-                if expert_idx is not None and expert_idx in ctx.pending_expert_requests:
-                    future = ctx.pending_expert_requests[expert_idx]
-                    if not future.done():
-                        future.set_result(tensor)
-
+            await self.process_ingress_data(data)
             return web.Response(text="OK")
         except Exception as e:
             traceback.print_exc()
@@ -131,6 +135,25 @@ class MoEWorker:
 
     # --- EXECUTION LOGIC ---
     async def _send_p2p(self, url, payload):
+        """Send tensor to another worker. Includes LOOPBACK OPTIMIZATION."""
+
+        # 1. Check for Loopback (Self-Transfer)
+        # Avoids network hair-pinning which causes deadlocks/hangs on Cloud Proxies
+        my_p2p = self.get_p2p_url().rstrip("/")
+        target_base = url.replace("/tensor_in", "").rstrip("/")
+
+        if my_p2p == target_base:
+            # Short-circuit: Inject directly into local handler
+            # print(f"⚡ [P2P] Loopback detected. Short-circuiting {url}")
+            try:
+                await self.process_ingress_data(payload)
+                return
+            except Exception as e:
+                print(f"❌ Local P2P Error: {e}")
+                traceback.print_exc()
+                return
+
+        # 2. Actual Network Transfer
         for i in range(3):
             try:
                 async with aiohttp.ClientSession() as sess:
@@ -139,6 +162,7 @@ class MoEWorker:
             except:
                 await asyncio.sleep(0.5)
         print(f"❌ Failed to send to {url}")
+        sys.stdout.flush()
 
     async def _ensure_model(self, model_id):
         if self.current_model == model_id:
@@ -199,6 +223,7 @@ class MoEWorker:
         hidden_states = None
         if msg.get('is_first'):
             print(f"⚡ [Job {job_id}] Embedding...")
+            sys.stdout.flush()
             if not self.embeddings:
                 self.embeddings = await self.loader.load_embeddings(model_id, self.device)
             prompt = msg['input']
@@ -224,6 +249,7 @@ class MoEWorker:
         # 3. Output/Forward
         if msg.get('is_last'):
             print(f"🏁 [Job {job_id}] Decoding...")
+            sys.stdout.flush()
             if not self.lm_head:
                 self.lm_head = await self.loader.load_lm_head(model_id, self.device)
             with torch.no_grad():
@@ -254,6 +280,8 @@ class MoEWorker:
         try:
             hidden_states = await asyncio.wait_for(ctx.input_queue.get(), timeout=P2P_TIMEOUT)
         except asyncio.TimeoutError:
+            print(f"❌ [Job {job_id}] Router timed out waiting for input")
+            sys.stdout.flush()
             return
 
         hidden_states = hidden_states.half()
@@ -328,6 +356,7 @@ class MoEWorker:
         try:
             hidden_states = await asyncio.wait_for(ctx.input_queue.get(), timeout=P2P_TIMEOUT)
         except asyncio.TimeoutError:
+            # print(f"❌ [Job {job_id}] Expert {expert_idx} timed out waiting for input")
             return
 
         cache_key = (layer_idx, expert_idx)
@@ -351,6 +380,7 @@ class MoEWorker:
         while True:
             try:
                 print(f"🔌 Connecting to {SCHEDULER_URL}...")
+                sys.stdout.flush()
                 async with websockets.connect(SCHEDULER_URL) as ws:
                     print(f"✅ Connected. Reporting {self.vram_total_mb}MB VRAM")
                     sys.stdout.flush()

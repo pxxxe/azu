@@ -258,7 +258,7 @@ def main():
         # 2. Shard Model
         # ==========================================
         log_section(f"⚡ 2. Sharding {TEST_MODEL}")
-        print("   (This takes time for large models...)")
+        print("   (This takes time for large models so we preload)")
 
         shard_res = requests.post(f"{reg_url}/models/shard", json={"model_id": TEST_MODEL}, timeout=900)
         if shard_res.status_code != 200:

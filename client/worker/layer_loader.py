@@ -127,9 +127,9 @@ class LayerLoader:
         LayerClass = self._get_layer_class(config)
         layer = LayerClass(config, layer_idx=layer_idx).to(device).half()
 
-        # Load weights
+        # Load weights - strict=False for robustness
         state_dict = torch.load(path, map_location=device)
-        layer.load_state_dict(state_dict)
+        layer.load_state_dict(state_dict, strict=False)
         layer.eval()
 
         self.loaded_cache[cache_key] = layer
@@ -162,9 +162,9 @@ class LayerLoader:
 
         router = torch.nn.Linear(hidden_size, num_experts, bias=False).to(device).half()
 
-        # Load weights
+        # Load weights - strict=False
         state_dict = torch.load(path, map_location=device)
-        router.load_state_dict(state_dict)
+        router.load_state_dict(state_dict, strict=False)
         router.eval()
 
         self.loaded_cache[cache_key] = router
@@ -208,9 +208,9 @@ class LayerLoader:
 
         expert = ExpertFFN(hidden_size, intermediate_size).to(device).half()
 
-        # Load weights
+        # Load weights - strict=False
         state_dict = torch.load(path, map_location=device)
-        expert.load_state_dict(state_dict)
+        expert.load_state_dict(state_dict, strict=False)
         expert.eval()
 
         self.loaded_cache[cache_key] = expert
@@ -256,9 +256,9 @@ class LayerLoader:
 
         shared_expert = SharedExpertFFN(hidden_size, intermediate_size).to(device).half()
 
-        # Load weights
+        # Load weights - strict=False
         state_dict = torch.load(path, map_location=device)
-        shared_expert.load_state_dict(state_dict)
+        shared_expert.load_state_dict(state_dict, strict=False)
         shared_expert.eval()
 
         self.loaded_cache[cache_key] = shared_expert
@@ -297,7 +297,7 @@ class LayerLoader:
 
             layer = LayerClass(config, layer_idx=idx).to(device).half()
             state_dict = torch.load(path, map_location=device)
-            layer.load_state_dict(state_dict)
+            layer.load_state_dict(state_dict, strict=False)
             layer.eval()
             modules.append(layer)
 

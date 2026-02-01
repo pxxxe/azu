@@ -45,17 +45,8 @@ class LayerStore:
         Returns (is_moe, path_to_moe_block) where path_to_moe_block points to
         the module that CONTAINS both the router (gate) and the experts list —
         e.g. "mlp" for Mixtral, NOT "mlp.experts".
-
-        The old version checked for 'mlp.experts' first, which resolved to the
-        experts ModuleList itself.  The router check then ran against that
-        ModuleList (hasattr(ModuleList, "gate") == False), so the router was
-        never saved.  The expert extraction also broke because it called
-        getattr(ModuleList, "experts") which is None.
         """
         # Each candidate is (path_to_block, router_attr_name).
-        # We walk to path_to_block and confirm it has BOTH a router attribute
-        # AND an 'experts' ModuleList.  This guarantees we land on the container,
-        # not on the experts list itself.
         candidates = [
             ("block_sparse_moe", ["gate", "router"]),   # some Mixtral variants
             ("mlp",              ["gate", "router"]),   # Mixtral standard
@@ -108,7 +99,6 @@ class LayerStore:
         if not filename:
             # Maybe it's a non-sharded model (bin/safetensors directly)
             # We assume sharded for large models, but handle fallback?
-            # For now, rely on index. If index is None, it implies single file.
             pass
 
         filepath = os.path.join(model_path, filename)
@@ -132,20 +122,30 @@ class LayerStore:
         """
         Reconstructs a module's state_dict by fetching keys from disk and saving to output_path.
         prefix: e.g. "model.layers.0.mlp.experts.0"
+
+        INCLUDES FIX FOR MIXTRAL ALIASING (block_sparse_moe <-> mlp)
         """
         state_dict = {}
-        # Find all keys in the index that start with this prefix
-        # We need to map the module's local keys (e.g. "weight") to global keys (e.g. "model.layers.0...")
-
         # Iterate named parameters of the meta module to know what to look for
         for name, _ in module.named_parameters(recurse=True):
             global_key = f"{prefix}.{name}"
-            # Some models have different mapping, but usually simple concatenation works
-            if global_key in index:
-                state_dict[name] = self._load_tensor_for_key(global_key, model_path, index, loaded_shards)
+
+            # --- FIX: Handle Key Aliasing ---
+            # If the exact key isn't in the index, try swapping mlp/block_sparse_moe
+            target_key = global_key
+            if target_key not in index:
+                if ".mlp." in target_key:
+                    alt = target_key.replace(".mlp.", ".block_sparse_moe.")
+                    if alt in index: target_key = alt
+                elif ".block_sparse_moe." in target_key:
+                    alt = target_key.replace(".block_sparse_moe.", ".mlp.")
+                    if alt in index: target_key = alt
+
+            if target_key in index:
+                state_dict[name] = self._load_tensor_for_key(target_key, model_path, index, loaded_shards)
             else:
                 # Try finding without model prefix if wrapped? No, usually precise.
-                print(f"      ⚠️ Warning: Missing key {global_key}")
+                print(f"      ⚠️ Warning: Missing key {global_key} (checked alias: {target_key})")
 
         torch.save(state_dict, output_path)
         return output_path.stat().st_size / (1024**2)
@@ -163,7 +163,6 @@ class LayerStore:
 
         try:
             # 1. Download Model Artifacts (Metadata + Weights)
-            # We download to cache, then read. snapshot_download handles caching.
             print("   📥 Fetching model artifacts (snapshot)...")
             model_path = snapshot_download(
                 repo_id=model_id,
@@ -186,10 +185,8 @@ class LayerStore:
             else:
                 # Single file model
                 print("   ℹ️ Single file model detected.")
-                # Map all keys to the single file
                 files = glob.glob(os.path.join(model_path, "*.safetensors")) or glob.glob(os.path.join(model_path, "*.bin"))
                 file_name = os.path.basename(files[0])
-                # We need to know keys. Load the meta model first.
                 weight_map = None # Will populate later
 
             # 3. Instantiate Meta Model (Zero RAM)
@@ -230,7 +227,6 @@ class LayerStore:
 
                 if is_moe:
                     # Navigate to the MoE block (e.g. layer.mlp for Mixtral).
-                    # moe_rel_path now correctly points to the BLOCK, not the experts list.
                     moe_module = layer
                     if moe_rel_path:  # guard: empty string means layer itself is the block
                         for part in moe_rel_path.split('.'):
@@ -244,11 +240,9 @@ class LayerStore:
                     router = getattr(moe_module, router_attr, None)
                     if router:
                         router_file = out_dir / f"layer_{i}_router.pt"
-                        print(f"      💾 Saving router (attr={router_attr}) for layer {i} to {router_file}...")
+                        # print(f"      💾 Saving router (attr={router_attr}) for layer {i} to {router_file}...")
                         router_size = self._save_module(router, f"{moe_prefix}.{router_attr}", model_path, weight_map, router_file, loaded_shards)
-                        print(f"      ✅ Router saved: {router_file} ({router_size:.2f}MB)")
 
-                        # Verify file exists
                         if not router_file.exists():
                             raise RuntimeError(f"Router file was not created: {router_file}")
                     else:
@@ -259,20 +253,12 @@ class LayerStore:
                     experts_list = moe_module.experts  # guaranteed to exist by _is_moe_layer
                     expert_size_acc = 0
 
-                    # Verify we have experts to work with
                     if len(experts_list) == 0:
-                        raise RuntimeError(
-                            f"Layer {i}: MoE detected but experts list is empty! "
-                            f"This might be a model loading issue. "
-                            f"Expected {num_experts} experts from config."
-                        )
+                        raise RuntimeError(f"Layer {i}: MoE detected but experts list is empty!")
 
-                    # Use first expert as template for all (they have same structure)
                     template_expert = experts_list[0]
 
                     for exp_idx in range(num_experts):
-                        # All experts have same structure, just different weights
-                        # Use the meta template for structure, weights come from state dict
                         expert = template_expert
 
                         expert_file = out_dir / f"layer_{i}_expert_{exp_idx}.pt"
@@ -285,7 +271,6 @@ class LayerStore:
                             loaded_shards
                         )
 
-                        # Verify file exists
                         if not expert_file.exists():
                             raise RuntimeError(f"Expert file was not created: {expert_file}")
 
@@ -303,11 +288,9 @@ class LayerStore:
 
                 else:
                     # Dense Layer
-                    # We save the WHOLE layer as one block
                     dense_file = out_dir / f"layer_{i}_dense.pt"
                     sz = self._save_module(layer, layer_prefix, model_path, weight_map, dense_file, loaded_shards)
 
-                    # Verify file exists
                     if not dense_file.exists():
                         raise RuntimeError(f"Dense layer file was not created: {dense_file}")
 
@@ -363,10 +346,6 @@ class LayerStore:
             # List all files created
             all_files = list(out_dir.glob("*.pt")) + list(out_dir.glob("*.json"))
             print(f"   📁 Created {len(all_files)} files in {out_dir}")
-            for f in sorted(all_files)[:10]:  # Show first 10
-                print(f"      - {f.name}")
-            if len(all_files) > 10:
-                print(f"      ... and {len(all_files) - 10} more")
 
             print(f"✅ Sharding Complete. Total Size: {total_size_mb:.1f}MB")
             return num_layers

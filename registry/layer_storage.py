@@ -271,39 +271,56 @@ class LayerStore:
                     else:
                         moe_prefix = layer_prefix
 
-                    # 1. Router — moe_module now has .gate or .router directly
+                    # 1. Router/Gate — extract from checkpoint
                     router_attr = "gate" if hasattr(moe_module, "gate") else "router"
-                    router = getattr(moe_module, router_attr, None)
-                    if router:
-                        router_file = out_dir / f"layer_{i}_router.pt"
-                        router_prefix = f"{moe_prefix}.{router_attr}"
+                    router_file = out_dir / f"layer_{i}_router.pt"
+                    router_prefix = f"{moe_prefix}.{router_attr}"
 
-                        # Build router state dict manually from weight_map
-                        router_state = {}
+                    # Build router state dict manually from weight_map
+                    router_state = {}
 
-                        # Try both mlp and block_sparse_moe aliases
-                        possible_prefixes = [router_prefix]
-                        if ".mlp." in router_prefix:
-                            possible_prefixes.append(router_prefix.replace(".mlp.", ".block_sparse_moe."))
-                        elif ".block_sparse_moe." in router_prefix:
-                            possible_prefixes.append(router_prefix.replace(".block_sparse_moe.", ".mlp."))
+                    # The router/gate is typically a single weight tensor
+                    # In checkpoint it's stored as "layer.X.block_sparse_moe.gate.weight"
+                    # We need to find this exact key
 
-                        for key in weight_map.keys():
-                            for prefix in possible_prefixes:
-                                if key.startswith(prefix):
-                                    param_name = key[len(prefix)+1:]  # +1 for the dot
+                    # Try direct key match first
+                    direct_key = f"{router_prefix}.weight"
+                    if direct_key in weight_map:
+                        router_state["weight"] = self._load_tensor_for_key(direct_key, model_path, weight_map, loaded_shards)
+                    else:
+                        # Try with aliasing (mlp <-> block_sparse_moe)
+                        if ".mlp." in direct_key:
+                            alt_key = direct_key.replace(".mlp.", ".block_sparse_moe.")
+                        elif ".block_sparse_moe." in direct_key:
+                            alt_key = direct_key.replace(".block_sparse_moe.", ".mlp.")
+                        else:
+                            alt_key = None
+
+                        if alt_key and alt_key in weight_map:
+                            router_state["weight"] = self._load_tensor_for_key(alt_key, model_path, weight_map, loaded_shards)
+                        else:
+                            # Last resort: search for any key containing this layer's gate/router
+                            pattern = f"layers.{i}.*.{router_attr}.weight"
+                            for key in weight_map.keys():
+                                if f"layers.{i}." in key and f"{router_attr}.weight" in key:
+                                    param_name = "weight"
                                     router_state[param_name] = self._load_tensor_for_key(key, model_path, weight_map, loaded_shards)
+                                    print(f"      🔍 Found router via pattern match: {key}")
                                     break
 
-                        if router_state:
-                            torch.save(router_state, router_file)
-                            router_size = router_file.stat().st_size / (1024**2)
-                            if not router_file.exists():
-                                raise RuntimeError(f"Router file was not created: {router_file}")
-                        else:
-                            print(f"      ⚠️ WARNING: No router weights found, tried prefixes: {possible_prefixes}")
+                    if router_state:
+                        torch.save(router_state, router_file)
+                        if not router_file.exists():
+                            raise RuntimeError(f"Router file was not created: {router_file}")
+                        print(f"      ✅ Router saved ({router_file.stat().st_size / (1024**2):.2f}MB)")
                     else:
-                        print(f"      ⚠️ WARNING: No router found on MoE block for layer {i}")
+                        # CRITICAL: Router is mandatory for MoE layers
+                        print(f"      ❌ CRITICAL: No router weights found!")
+                        print(f"      Tried: {direct_key}, {alt_key if 'alt_key' in locals() else 'N/A'}")
+                        # Show some sample keys from this layer to debug
+                        layer_keys = [k for k in weight_map.keys() if f"layers.{i}." in k][:5]
+                        print(f"      Sample keys for layer {i}: {layer_keys}")
+                        raise RuntimeError(f"Router missing for MoE layer {i}")
 
                     # 2. Experts — handle both ModuleList and custom MixtralExperts class
                     num_experts = self._get_num_experts(config)

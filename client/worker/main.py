@@ -139,25 +139,71 @@ class MoEWorker:
         print(f"❌ Failed to send to {url}")
 
     async def _ensure_model(self, model_id):
-        if self.loaded_model_id != model_id:
+        """Ensure model config is loaded. Downloads from registry, not HuggingFace."""
+        if self.current_model != model_id:
             print(f"🧹 New model {model_id} requested. Clearing VRAM...")
+
+            # Clear all cached components
+            self.embeddings = None
+            self.lm_head = None
             self.dense_layers.clear()
             self.moe_routers.clear()
             self.moe_experts.clear()
-            self.embeddings = None
-            self.lm_head = None
+            self.active_jobs.clear()
+
+            gc.collect()
             torch.cuda.empty_cache()
-            gc.collect() # Force GC on worker too
-            self.loaded_model_id = model_id
 
-            sanitized = model_id.replace("/", "_")
+            # ✅ FIX: Get config from registry instead of HuggingFace
+            print(f"📥 Fetching model config from registry...")
             try:
-                self.model_config = AutoConfig.from_pretrained(
-                    self.loader.cache_dir / f"{sanitized}_config.json", trust_remote_code=True
-                )
-            except:
-                self.model_config = AutoConfig.from_pretrained(model_id, token=HF_TOKEN, trust_remote_code=True)
+                timeout = aiohttp.ClientTimeout(total=30)
+                async with aiohttp.ClientSession(timeout=timeout) as sess:
+                    # Get model info
+                    info_url = f"{REGISTRY_URL}/models/info"
+                    async with sess.get(info_url, params={"model_id": model_id}) as resp:
+                        if resp.status != 200:
+                            raise Exception(f"Registry returned {resp.status}")
 
+                    # Download config.json from registry
+                    sanitized = model_id.replace("/", "_")
+                    config_url = f"{REGISTRY_URL}/layers/{sanitized}/config.json"
+
+                    async with sess.get(config_url) as cfg_resp:
+                        if cfg_resp.status != 200:
+                            raise Exception(f"Config not found at {config_url}")
+
+                        cfg_data = await cfg_resp.json()
+                        self.model_config = AutoConfig.from_dict(cfg_data)
+                        print(f"✅ Config loaded from registry ({self.model_config.architectures[0]})")
+
+            except Exception as e:
+                print(f"❌ Failed to load config from registry: {e}")
+                print(f"⚠️ Falling back to HuggingFace (may be slow)...")
+
+                # Fallback: try HuggingFace with timeout
+                try:
+                    loop = asyncio.get_event_loop()
+                    self.model_config = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            lambda: AutoConfig.from_pretrained(
+                                model_id,
+                                token=HF_TOKEN,
+                                trust_remote_code=True
+                            )
+                        ),
+                        timeout=60.0
+                    )
+                    print(f"✅ Config loaded from HuggingFace")
+                except asyncio.TimeoutError:
+                    print(f"❌ HuggingFace download timeout!")
+                    raise Exception("Could not load model config")
+                except Exception as e2:
+                    print(f"❌ HuggingFace download failed: {e2}")
+                    raise
+
+            self.current_model = model_id
             sys.stdout.flush()
 
     async def process_dense(self, msg, ws):

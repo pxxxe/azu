@@ -36,13 +36,13 @@ SOLANA_RPC = "https://devnet.helius-rpc.com/?api-key=1d7ca6e1-7700-42eb-b086-818
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
-# Secure Cloud often requires these specific high-end cards
+# Prioritize High-RAM GPUs for Stability
 GPU_TYPES_SECURE = [
-    "NVIDIA GeForce RTX 4090",
-    "NVIDIA RTX A6000",
-    "NVIDIA RTX A5000",
+    "NVIDIA RTX A6000",             # 48GB VRAM, usually 128GB+ System RAM
+    "NVIDIA RTX 6000 Ada Generation",
     "NVIDIA A100 80GB PCIe",
-    "NVIDIA RTX 6000 Ada Generation"
+    "NVIDIA A100-80GB",
+    "NVIDIA GeForce RTX 4090"       # Fallback (Consumer, lower RAM risk)
 ]
 
 runpod.api_key = RUNPOD_API_KEY
@@ -284,6 +284,7 @@ def main():
             worker_ids.append(wid)
 
         print("\n   ⏳ Waiting for workers to connect to Scheduler...")
+        time.sleep(60)
 
         # ==========================================
         # 4 & 5. Deposit & Inference

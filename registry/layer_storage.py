@@ -6,6 +6,10 @@ import gc
 import shutil
 from pathlib import Path
 from transformers import AutoConfig, AutoModelForCausalLM
+from transformers.utils import ContextManagers
+from accelerate import init_empty_weights
+from safetensors.torch import load_file as load_safetensors
+import glob
 
 class LayerStore:
     def __init__(self, storage_path="/data/layers"):
@@ -13,46 +17,26 @@ class LayerStore:
         self.storage_path.mkdir(exist_ok=True, parents=True)
 
     def _find_layers(self, model):
-        """Find transformer layers in model architecture."""
-        print(f"   🔍 Searching for layers in model...")
-
-        possible_paths = [
-            'model.layers',           # Llama, Mistral, Qwen2
-            'transformer.h',          # GPT-2
-            'model.decoder.layers',   # Bart, T5
-            'transformer.layers',     # Some custom models
-        ]
-
+        """Find transformer layers in model architecture (works on meta device)."""
+        print(f"   🔍 Searching for layers in model structure...")
+        possible_paths = ['model.layers', 'transformer.h', 'model.decoder.layers', 'transformer.layers']
         for attr_path in possible_paths:
             try:
                 parts = attr_path.split('.')
                 obj = model
-                found = True
-
                 for part in parts:
-                    if not hasattr(obj, part):
-                        found = False
-                        break
                     obj = getattr(obj, part)
-
-                if found and hasattr(obj, '__len__') and len(obj) > 0:
+                if hasattr(obj, '__len__'):
                     print(f"   ✅ Found layers at: {attr_path}")
-                    return obj
+                    return obj, attr_path
             except AttributeError:
                 continue
-
-        raise ValueError(f"Could not find transformer layers in model. Available attributes: {dir(model)}")
+        raise ValueError(f"Could not find layers. Model keys: {list(model.state_dict().keys())[:5]}...")
 
     def _is_moe_layer(self, layer, config):
         """Check if a layer is an MoE layer."""
-        # Check for common MoE attributes
-        moe_indicators = [
-            'mlp.experts',      # Qwen2-MoE, DeepSeek-MoE
-            'block_sparse_moe', # Mixtral
-            'moe',              # Generic
-            'experts',          # Some models
-        ]
-
+        # On meta device, we check structure
+        moe_indicators = ['mlp.experts', 'block_sparse_moe', 'moe', 'experts']
         for indicator in moe_indicators:
             parts = indicator.split('.')
             obj = layer
@@ -63,239 +47,212 @@ class LayerStore:
                     return True, indicator
             except AttributeError:
                 continue
-
         return False, None
 
-    def _extract_moe_experts(self, layer, layer_idx, model_dir, moe_path):
-        """Extract individual experts and router from MoE layer."""
-        print(f"      🎯 MoE Layer {layer_idx} - Extracting experts...")
+    def _load_tensor_for_key(self, key, model_path, index, loaded_shards):
+        """
+        Loads a specific tensor key from the checkpoint files.
+        Uses a cache (loaded_shards) to avoid re-reading files unnecessarily.
+        """
+        filename = index.get(key)
+        if not filename:
+            # Maybe it's a non-sharded model (bin/safetensors directly)
+            # We assume sharded for large models, but handle fallback?
+            # For now, rely on index. If index is None, it implies single file.
+            pass
 
-        # Navigate to the MoE module
-        parts = moe_path.split('.')
-        moe_module = layer
-        for part in parts:
-            moe_module = getattr(moe_module, part)
+        filepath = os.path.join(model_path, filename)
 
-        # Extract router/gate
-        router_attr = None
-        for attr in ['gate', 'router', 'gating']:
-            if hasattr(moe_module, attr):
-                router_attr = attr
-                break
+        # Check cache
+        if filepath not in loaded_shards:
+            # Free memory if we have too many shards loaded?
+            # For strict memory, we keep only ONE shard.
+            loaded_shards.clear()
+            gc.collect()
 
-        if router_attr:
-            router = getattr(moe_module, router_attr)
-            router_path = model_dir / f"layer_{layer_idx}_router.pt"
-            torch.save(router.state_dict(), router_path)
-            router_size = router_path.stat().st_size / (1024**2)
-            print(f"         Router: {router_size:.1f}MB")
+            print(f"      📖 Loading shard: {filename}")
+            if filename.endswith(".safetensors"):
+                loaded_shards[filepath] = load_safetensors(filepath)
+            else:
+                loaded_shards[filepath] = torch.load(filepath, map_location="cpu")
 
-        # Extract experts
-        experts_attr = None
-        for attr in ['experts', 'expert']:
-            if hasattr(moe_module, attr):
-                experts_attr = attr
-                break
+        return loaded_shards[filepath][key]
 
-        num_experts = 0
-        total_expert_size = 0
+    def _save_module(self, module, prefix, model_path, index, output_path, loaded_shards):
+        """
+        Reconstructs a module's state_dict by fetching keys from disk and saving to output_path.
+        prefix: e.g. "model.layers.0.mlp.experts.0"
+        """
+        state_dict = {}
+        # Find all keys in the index that start with this prefix
+        # We need to map the module's local keys (e.g. "weight") to global keys (e.g. "model.layers.0...")
 
-        if experts_attr:
-            experts = getattr(moe_module, experts_attr)
-            if hasattr(experts, '__len__'):
-                num_experts = len(experts)
-                print(f"         Found {num_experts} experts")
+        # Iterate named parameters of the meta module to know what to look for
+        for name, _ in module.named_parameters(recurse=True):
+            global_key = f"{prefix}.{name}"
+            # Some models have different mapping, but usually simple concatenation works
+            if global_key in index:
+                state_dict[name] = self._load_tensor_for_key(global_key, model_path, index, loaded_shards)
+            else:
+                # Try finding without model prefix if wrapped? No, usually precise.
+                print(f"      ⚠️ Warning: Missing key {global_key}")
 
-                for expert_idx, expert in enumerate(experts):
-                    expert_path = model_dir / f"layer_{layer_idx}_expert_{expert_idx}.pt"
-                    torch.save(expert.state_dict(), expert_path)
-                    size = expert_path.stat().st_size / (1024**2)
-                    total_expert_size += size
-
-                    if (expert_idx + 1) % 8 == 0:
-                        print(f"         Extracted {expert_idx + 1}/{num_experts} experts ({total_expert_size:.1f}MB)")
-
-        # Extract shared expert if exists (Qwen2-MoE has this)
-        if hasattr(moe_module, 'shared_expert'):
-            shared_expert = moe_module.shared_expert
-            shared_path = model_dir / f"layer_{layer_idx}_shared_expert.pt"
-            torch.save(shared_expert.state_dict(), shared_path)
-            size = shared_path.stat().st_size / (1024**2)
-            print(f"         Shared Expert: {size:.1f}MB")
-
-        # Save layer metadata
-        metadata = {
-            "layer_idx": layer_idx,
-            "type": "moe",
-            "num_experts": num_experts,
-            "has_router": router_attr is not None,
-            "has_shared_expert": hasattr(moe_module, 'shared_expert'),
-            "router_attr": router_attr,
-            "experts_attr": experts_attr,
-            "moe_path": moe_path,
-            "total_size_mb": total_expert_size
-        }
-
-        with open(model_dir / f"layer_{layer_idx}_moe_meta.json", "w") as f:
-            json.dump(metadata, f, indent=2)
-
-        return num_experts
+        torch.save(state_dict, output_path)
+        return output_path.stat().st_size / (1024**2)
 
     def shard_model(self, model_id: str, hf_token: str):
-        """
-        Download model and extract individual layers + experts.
-        Returns number of layers extracted.
-        """
-        print(f"\n🔪 SHARDING {model_id}")
+        print(f"\n🔪 SHARDING {model_id} (Streaming Mode)")
 
         # Check disk space
-        total, used, free = shutil.disk_usage(self.storage_path)
-        print(f"   💾 Disk: {free // (2**30)}GB free / {total // (2**30)}GB total")
+        import shutil
+        total, _, free = shutil.disk_usage(self.storage_path)
+        if free < 50 * (2**30): # 50GB check
+            print(f"   ⚠️ Low disk space: {free // (2**30)}GB free")
+
+        from huggingface_hub import snapshot_download
 
         try:
-            print(f"\n   📥 Downloading model from HuggingFace...")
-            sys.stdout.flush()
-
-            # Load config first
-            config = AutoConfig.from_pretrained(model_id, token=hf_token, trust_remote_code=True)
-
-            # Check for MoE indicators
-            is_moe = False
-            num_experts_per_tok = None
-
-            for attr in ['num_local_experts', 'num_experts', 'moe_num_experts']:
-                if hasattr(config, attr):
-                    is_moe = True
-                    print(f"   🎯 MoE Model Detected! ({attr}={getattr(config, attr)})")
-                    break
-
-            if hasattr(config, 'num_experts_per_tok'):
-                num_experts_per_tok = config.num_experts_per_tok
-
-            # Load full model
-            # WARNING: This loads entire weights into RAM.
-            # Ideally we would use Lazy Loading with accelerate, but for simple splitting
-            # of arbitrary architectures, loading fully is the most robust method for now.
-            model = AutoModelForCausalLM.from_pretrained(
-                model_id,
+            # 1. Download Model Artifacts (Metadata + Weights)
+            # We download to cache, then read. snapshot_download handles caching.
+            print("   📥 Fetching model artifacts (snapshot)...")
+            model_path = snapshot_download(
+                repo_id=model_id,
                 token=hf_token,
-                torch_dtype=torch.float16,
-                device_map="cpu", # Force CPU to avoid GPU OOM during simple splitting
-                trust_remote_code=True,
-                low_cpu_mem_usage=True
+                allow_patterns=["*.json", "*.safetensors", "*.bin", "*.model"]
             )
-            print(f"   ✅ Model downloaded successfully")
+            print(f"   ✅ Model available at: {model_path}")
 
-        except Exception as e:
-            print(f"\n   ❌ Failed to download model: {str(e)}")
-            raise
+            # 2. Load Config & Index
+            config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
 
-        # Create storage directory
-        model_dir = self.storage_path / model_id.replace("/", "_")
-        model_dir.mkdir(exist_ok=True, parents=True)
+            # Load index.json for weights mapping
+            index_path = os.path.join(model_path, "model.safetensors.index.json")
+            if not os.path.exists(index_path):
+                index_path = os.path.join(model_path, "pytorch_model.bin.index.json")
 
-        try:
-            # Find layer structure
-            layers = self._find_layers(model)
-            num_layers = len(layers)
+            if os.path.exists(index_path):
+                with open(index_path) as f:
+                    weight_map = json.load(f)["weight_map"]
+            else:
+                # Single file model
+                print("   ℹ️ Single file model detected.")
+                # Map all keys to the single file
+                files = glob.glob(os.path.join(model_path, "*.safetensors")) or glob.glob(os.path.join(model_path, "*.bin"))
+                file_name = os.path.basename(files[0])
+                # We need to know keys. Load the meta model first.
+                weight_map = None # Will populate later
 
+            # 3. Instantiate Meta Model (Zero RAM)
+            print("   🏗️ Building Meta Model...")
+            with init_empty_weights():
+                model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+
+            # Populate weight map if single file
+            if weight_map is None:
+                weight_map = {k: file_name for k in model.state_dict().keys()}
+
+            # 4. Prepare Output Dir
+            out_dir = self.storage_path / model_id.replace("/", "_")
+            out_dir.mkdir(exist_ok=True, parents=True)
+
+            # 5. Extract Structure
+            layers_obj, layer_prefix_base = self._find_layers(model)
+            num_layers = len(layers_obj)
             layer_metadata = []
             total_size_mb = 0
 
-            print(f"\n   💾 Extracting {num_layers} layers...")
+            # State for streaming loader
+            loaded_shards = {} # path -> dict (cache current file)
 
-            # Save each layer
-            for i, layer in enumerate(layers):
-                is_moe_layer, moe_path = self._is_moe_layer(layer, config)
+            print(f"   💾 Processing {num_layers} layers...")
 
-                if is_moe_layer:
-                    num_experts = self._extract_moe_experts(layer, i, model_dir, moe_path)
-                    layer_type = "moe"
-                    # Approximate size calc based on file outputs would be better,
-                    # but for metadata we track what we extracted.
-                    expert_files = list(model_dir.glob(f"layer_{i}_expert_*.pt"))
-                    layer_size = sum(f.stat().st_size for f in expert_files) / (1024**2)
+            for i in range(num_layers):
+                layer = layers_obj[i]
+                layer_prefix = f"{layer_prefix_base}.{i}"
+
+                is_moe, moe_rel_path = self._is_moe_layer(layer, config)
+
+                if is_moe:
+                    # It's MoE. We need to save Router and Experts separately.
+                    # Navigate to MoE module
+                    moe_module = layer
+                    for part in moe_rel_path.split('.'):
+                        moe_module = getattr(moe_module, part)
+
+                    moe_prefix = f"{layer_prefix}.{moe_rel_path}"
+
+                    # 1. Router
+                    router_attr = "gate" if hasattr(moe_module, "gate") else "router" # generic
+                    router = getattr(moe_module, router_attr, None)
+                    if router:
+                        self._save_module(router, f"{moe_prefix}.{router_attr}", model_path, weight_map, out_dir / f"layer_{i}_router.pt", loaded_shards)
+
+                    # 2. Experts
+                    experts = getattr(moe_module, "experts", [])
+                    num_experts = len(experts)
+                    expert_size_acc = 0
+
+                    for exp_idx, expert in enumerate(experts):
+                        sz = self._save_module(expert, f"{moe_prefix}.experts.{exp_idx}", model_path, weight_map, out_dir / f"layer_{i}_expert_{exp_idx}.pt", loaded_shards)
+                        expert_size_acc += sz
+                        if exp_idx % 4 == 0: sys.stdout.write(".")
+                        sys.stdout.flush()
+
+                    print(f" Layer {i} MoE done ({num_experts} experts)")
+
+                    layer_metadata.append({
+                        "layer_idx": i, "type": "moe", "size_mb": expert_size_acc, "num_experts": num_experts
+                    })
+                    total_size_mb += expert_size_acc
+
                 else:
-                    layer_path = model_dir / f"layer_{i}_dense.pt"
-                    torch.save(layer.state_dict(), layer_path)
-                    layer_size = layer_path.stat().st_size / (1024**2)
-                    layer_type = "dense"
-                    num_experts = 0
+                    # Dense Layer
+                    # We save the WHOLE layer as one block
+                    sz = self._save_module(layer, layer_prefix, model_path, weight_map, out_dir / f"layer_{i}_dense.pt", loaded_shards)
+                    layer_metadata.append({
+                        "layer_idx": i, "type": "dense", "size_mb": sz, "num_experts": 0
+                    })
+                    total_size_mb += sz
+                    print(f"   Layer {i} Dense done")
 
-                total_size_mb += layer_size
+                # GC after every layer to be safe
+                loaded_shards.clear()
+                gc.collect()
 
-                layer_metadata.append({
-                    "layer_idx": i,
-                    "type": layer_type,
-                    "size_mb": layer_size,
-                    "num_experts": num_experts
-                })
+            # 6. Embeddings & Head
+            print("   💾 Saving embeddings & head...")
+            if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
+                self._save_module(model.model.embed_tokens, "model.embed_tokens", model_path, weight_map, out_dir / "embeddings.pt", loaded_shards)
 
-                # Progress + Aggressive GC during loop for massive models?
-                # No, standard GC usually handles iterative assignment,
-                # but clearing `layer` variable explicitly helps.
-                if (i + 1) % 5 == 0:
-                    print(f"      Progress: {i+1}/{num_layers} layers")
-                    sys.stdout.flush()
+            if hasattr(model, "lm_head"):
+                self._save_module(model.lm_head, "lm_head", model_path, weight_map, out_dir / "lm_head.pt", loaded_shards)
 
-            # Save embeddings/heads
-            if hasattr(model, 'get_input_embeddings'):
-                emb = model.get_input_embeddings()
-                torch.save(emb.state_dict(), model_dir / "embeddings.pt")
-
-            if hasattr(model, 'lm_head'):
-                torch.save(model.lm_head.state_dict(), model_dir / "lm_head.pt")
-
-            config.save_pretrained(model_dir)
-
-            structure_info = {
+            # 7. Metadata
+            config.save_pretrained(out_dir)
+            structure = {
                 "model_id": model_id,
                 "num_layers": num_layers,
-                "architecture": config.architectures[0] if hasattr(config, 'architectures') else "unknown",
-                "hidden_size": config.hidden_size if hasattr(config, 'hidden_size') else None,
+                "architecture": config.architectures[0],
+                "hidden_size": config.hidden_size,
                 "total_size_mb": total_size_mb,
-                "is_moe": is_moe,
-                "num_experts_per_tok": num_experts_per_tok,
+                "is_moe": any(x['type'] == 'moe' for x in layer_metadata),
+                "num_experts_per_tok": getattr(config, "num_experts_per_tok", 2),
                 "layer_metadata": layer_metadata
             }
 
-            with open(model_dir / "structure.json", "w") as f:
-                json.dump(structure_info, f, indent=2)
+            with open(out_dir / "structure.json", "w") as f:
+                json.dump(structure, f, indent=2)
 
+            print(f"✅ Sharding Complete. Total Size: {total_size_mb:.1f}MB")
             return num_layers
 
+        except Exception as e:
+            print(f"❌ Sharding Error: {e}")
+            import traceback
+            traceback.print_exc()
+            raise e
         finally:
-            # --- CRITICAL MEMORY CLEANUP ---
-            print("   🧹 Cleaning up memory...")
-            try:
-                # Delete local references
-                if 'layers' in locals(): del layers
-                if 'model' in locals(): del model
-                if 'emb' in locals(): del emb
-
-                # Force Python Garbage Collection
-                gc.collect()
-
-                # Clear Torch Cache (if any GPU was used, though we forced CPU)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-                print("   ✅ Memory released")
-            except Exception as e:
-                print(f"   ⚠️ Cleanup warning: {e}")
-
-    def get_model_structure(self, model_id: str):
-        """Get overall model structure info"""
-        model_dir = self.storage_path / model_id.replace("/", "_")
-        structure_path = model_dir / "structure.json"
-
-        if not structure_path.exists():
-            return None
-
-        with open(structure_path) as f:
-            return json.load(f)
-
-    def has_model(self, model_id: str):
-        """Check if model is already sharded"""
-        model_dir = self.storage_path / model_id.replace("/", "_")
-        return (model_dir / "structure.json").exists()
+            # Cleanup
+            if 'loaded_shards' in locals(): loaded_shards.clear()
+            if 'model' in locals(): del model
+            gc.collect()

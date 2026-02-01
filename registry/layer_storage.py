@@ -236,8 +236,14 @@ class LayerStore:
                     router_attr = "gate" if hasattr(moe_module, "gate") else "router"
                     router = getattr(moe_module, router_attr, None)
                     if router:
-                        print(f"      💾 Saving router (attr={router_attr}) for layer {i}...")
-                        self._save_module(router, f"{moe_prefix}.{router_attr}", model_path, weight_map, out_dir / f"layer_{i}_router.pt", loaded_shards)
+                        router_file = out_dir / f"layer_{i}_router.pt"
+                        print(f"      💾 Saving router (attr={router_attr}) for layer {i} to {router_file}...")
+                        router_size = self._save_module(router, f"{moe_prefix}.{router_attr}", model_path, weight_map, router_file, loaded_shards)
+                        print(f"      ✅ Router saved: {router_file} ({router_size:.2f}MB)")
+
+                        # Verify file exists
+                        if not router_file.exists():
+                            raise RuntimeError(f"Router file was not created: {router_file}")
                     else:
                         print(f"      ⚠️ WARNING: No router found on MoE block for layer {i}")
 
@@ -253,14 +259,20 @@ class LayerStore:
                             # More experts in config than in meta model; use first as template
                             expert = experts_list[0]
 
+                        expert_file = out_dir / f"layer_{i}_expert_{exp_idx}.pt"
                         sz = self._save_module(
                             expert,
                             f"{moe_prefix}.experts.{exp_idx}",
                             model_path,
                             weight_map,
-                            out_dir / f"layer_{i}_expert_{exp_idx}.pt",
+                            expert_file,
                             loaded_shards
                         )
+
+                        # Verify file exists
+                        if not expert_file.exists():
+                            raise RuntimeError(f"Expert file was not created: {expert_file}")
+
                         expert_size_acc += sz
                         if exp_idx % 4 == 0:
                             sys.stdout.write(".")
@@ -276,12 +288,18 @@ class LayerStore:
                 else:
                     # Dense Layer
                     # We save the WHOLE layer as one block
-                    sz = self._save_module(layer, layer_prefix, model_path, weight_map, out_dir / f"layer_{i}_dense.pt", loaded_shards)
+                    dense_file = out_dir / f"layer_{i}_dense.pt"
+                    sz = self._save_module(layer, layer_prefix, model_path, weight_map, dense_file, loaded_shards)
+
+                    # Verify file exists
+                    if not dense_file.exists():
+                        raise RuntimeError(f"Dense layer file was not created: {dense_file}")
+
                     layer_metadata.append({
                         "layer_idx": i, "type": "dense", "size_mb": sz, "num_experts": 0
                     })
                     total_size_mb += sz
-                    print(f"   Layer {i} Dense done")
+                    print(f"   Layer {i} Dense done ({sz:.2f}MB)")
 
                 # GC after every layer to be safe
                 loaded_shards.clear()
@@ -290,10 +308,18 @@ class LayerStore:
             # 6. Embeddings & Head
             print("   💾 Saving embeddings & head...")
             if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
-                self._save_module(model.model.embed_tokens, "model.embed_tokens", model_path, weight_map, out_dir / "embeddings.pt", loaded_shards)
+                emb_file = out_dir / "embeddings.pt"
+                self._save_module(model.model.embed_tokens, "model.embed_tokens", model_path, weight_map, emb_file, loaded_shards)
+                if not emb_file.exists():
+                    raise RuntimeError(f"Embeddings file was not created: {emb_file}")
+                print(f"      ✅ Embeddings saved")
 
             if hasattr(model, "lm_head"):
-                self._save_module(model.lm_head, "lm_head", model_path, weight_map, out_dir / "lm_head.pt", loaded_shards)
+                head_file = out_dir / "lm_head.pt"
+                self._save_module(model.lm_head, "lm_head", model_path, weight_map, head_file, loaded_shards)
+                if not head_file.exists():
+                    raise RuntimeError(f"LM head file was not created: {head_file}")
+                print(f"      ✅ LM head saved")
 
             # 7. Metadata
             config.save_pretrained(out_dir)
@@ -310,6 +336,21 @@ class LayerStore:
 
             with open(out_dir / "structure.json", "w") as f:
                 json.dump(structure, f, indent=2)
+
+            # 8. Verify all critical files exist
+            print(f"   🔍 Verifying files...")
+            critical_files = ["structure.json", "config.json"]
+            for cf in critical_files:
+                if not (out_dir / cf).exists():
+                    raise RuntimeError(f"Critical file missing: {cf}")
+
+            # List all files created
+            all_files = list(out_dir.glob("*.pt")) + list(out_dir.glob("*.json"))
+            print(f"   📁 Created {len(all_files)} files in {out_dir}")
+            for f in sorted(all_files)[:10]:  # Show first 10
+                print(f"      - {f.name}")
+            if len(all_files) > 10:
+                print(f"      ... and {len(all_files) - 10} more")
 
             print(f"✅ Sharding Complete. Total Size: {total_size_mb:.1f}MB")
             return num_layers

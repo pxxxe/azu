@@ -1,12 +1,14 @@
 import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import json
 import os
 import traceback
 import asyncio
 import sys
+from pathlib import Path
 from shared.config import settings
 from .layer_storage import LayerStore
 
@@ -51,47 +53,94 @@ async def shard_model(req: ShardRequest, background_tasks: BackgroundTasks):
         if store.has_model(req.model_id):
             return {"status": "ready", "message": "Model already exists"}
 
-        # 2. Check lock
-        current_status = await r.get(f"shard_status:{req.model_id}")
-        if current_status == "processing":
-            return {"status": "processing", "message": "Already processing"}
+        # 2. Check if currently sharding
+        status = await r.get(f"shard_status:{req.model_id}")
+        if status == "processing":
+            return {"status": "processing", "message": "Sharding in progress"}
 
-        hf_token = settings.HF_TOKEN
-        if not hf_token:
-            print("❌ Error: HF_TOKEN is missing")
-            raise HTTPException(500, "HF_TOKEN not set on Registry")
-
-        # 3. Lock & Spawn
+        # 3. Begin Sharding
         await r.set(f"shard_status:{req.model_id}", "processing")
-        background_tasks.add_task(background_shard_task, req.model_id, hf_token)
+        background_tasks.add_task(background_shard_task, req.model_id, settings.HF_TOKEN)
 
-        return {"status": "started", "message": "Background task started"}
+        return {"status": "processing", "message": "Sharding started"}
 
     except Exception as e:
-        # FORCE PRINT ERROR TO LOGS
-        print(f"🔥 API ERROR in /models/shard: {e}")
+        print(f"❌ Shard endpoint error: {e}")
         traceback.print_exc()
-        sys.stdout.flush()
-        raise HTTPException(500, f"Internal Server Error: {str(e)}")
+        raise HTTPException(500, str(e))
 
 @app.get("/models/status")
-async def get_shard_status(model_id: str):
+async def model_status(model_id: str):
+    """Check the sharding/availability status of a model."""
     try:
-        if store.has_model(model_id): return {"status": "ready"}
+        # Check physical existence
+        if store.has_model(model_id):
+            return {"status": "ready", "model_id": model_id}
+
+        # Check Redis status
         status = await r.get(f"shard_status:{model_id}")
-        if not status: return {"status": "idle"}
-        if status.startswith("failed"): return {"status": "failed", "error": status.split(": ", 1)[1]}
-        return {"status": status}
+        if status:
+            return {"status": status, "model_id": model_id}
+
+        return {"status": "not_found", "model_id": model_id}
+
     except Exception as e:
-        print(f"🔥 ERROR in /models/status: {e}")
-        traceback.print_exc()
-        return {"status": "error", "message": str(e)}
+        print(f"❌ Status check error: {e}")
+        raise HTTPException(500, str(e))
 
 @app.get("/models/info")
-async def get_model_info(model_id: str):
-    sanitized = model_id.replace("/", "_")
-    path = f"/data/layers/{sanitized}/structure.json"
-    if os.path.exists(path):
-        with open(path) as f:
+async def model_info(model_id: str):
+    """Get detailed information about a sharded model."""
+    try:
+        sanitized = model_id.replace("/", "_")
+        structure_path = store.storage_path / sanitized / "structure.json"
+
+        if not structure_path.exists():
+            raise HTTPException(404, f"Model {model_id} not found or not sharded")
+
+        with open(structure_path) as f:
             return json.load(f)
-    raise HTTPException(404, "Model not sharded or found")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Info error: {e}")
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+@app.get("/debug/files/{model_id}")
+async def debug_files(model_id: str):
+    """Debug endpoint to list all files for a model."""
+    try:
+        sanitized = model_id.replace("/", "_")
+        model_dir = store.storage_path / sanitized
+
+        if not model_dir.exists():
+            return {"error": "Model directory not found", "path": str(model_dir)}
+
+        files = []
+        for f in model_dir.glob("*"):
+            files.append({
+                "name": f.name,
+                "size": f.stat().st_size if f.is_file() else 0,
+                "is_file": f.is_file(),
+                "path": str(f)
+            })
+
+        return {
+            "model_id": model_id,
+            "directory": str(model_dir),
+            "file_count": len(files),
+            "files": sorted(files, key=lambda x: x["name"])
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "storage_path": str(store.storage_path),
+        "storage_exists": store.storage_path.exists()
+    }

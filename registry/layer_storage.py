@@ -71,9 +71,10 @@ class LayerStore:
                         obj = getattr(obj, part)
 
                 has_router = any(hasattr(obj, name) for name in router_names)
+                # For meta models, experts ModuleList exists but might be empty
+                # Just check it exists and is a container, don't check length
                 has_experts = (hasattr(obj, 'experts')
-                               and hasattr(obj.experts, '__len__')
-                               and len(obj.experts) > 0)
+                               and hasattr(obj.experts, '__len__'))
 
                 if has_router and has_experts:
                     return True, block_path
@@ -221,6 +222,12 @@ class LayerStore:
 
                 is_moe, moe_rel_path = self._is_moe_layer(layer, config)
 
+                # Debug: print what we detected
+                if is_moe:
+                    print(f"   Layer {i}: MoE (path: {moe_rel_path})")
+                else:
+                    print(f"   Layer {i}: Dense")
+
                 if is_moe:
                     # Navigate to the MoE block (e.g. layer.mlp for Mixtral).
                     # moe_rel_path now correctly points to the BLOCK, not the experts list.
@@ -252,12 +259,21 @@ class LayerStore:
                     experts_list = moe_module.experts  # guaranteed to exist by _is_moe_layer
                     expert_size_acc = 0
 
+                    # Verify we have experts to work with
+                    if len(experts_list) == 0:
+                        raise RuntimeError(
+                            f"Layer {i}: MoE detected but experts list is empty! "
+                            f"This might be a model loading issue. "
+                            f"Expected {num_experts} experts from config."
+                        )
+
+                    # Use first expert as template for all (they have same structure)
+                    template_expert = experts_list[0]
+
                     for exp_idx in range(num_experts):
-                        if exp_idx < len(experts_list):
-                            expert = experts_list[exp_idx]
-                        else:
-                            # More experts in config than in meta model; use first as template
-                            expert = experts_list[0]
+                        # All experts have same structure, just different weights
+                        # Use the meta template for structure, weights come from state dict
+                        expert = template_expert
 
                         expert_file = out_dir / f"layer_{i}_expert_{exp_idx}.pt"
                         sz = self._save_module(

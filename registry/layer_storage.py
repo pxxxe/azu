@@ -276,71 +276,85 @@ class LayerStore:
                     router = getattr(moe_module, router_attr, None)
                     if router:
                         router_file = out_dir / f"layer_{i}_router.pt"
-                        # print(f"      💾 Saving router (attr={router_attr}) for layer {i} to {router_file}...")
-                        router_size = self._save_module(router, f"{moe_prefix}.{router_attr}", model_path, weight_map, router_file, loaded_shards)
+                        router_prefix = f"{moe_prefix}.{router_attr}"
 
-                        if not router_file.exists():
-                            raise RuntimeError(f"Router file was not created: {router_file}")
+                        # Build router state dict manually from weight_map
+                        router_state = {}
+
+                        # Try both mlp and block_sparse_moe aliases
+                        possible_prefixes = [router_prefix]
+                        if ".mlp." in router_prefix:
+                            possible_prefixes.append(router_prefix.replace(".mlp.", ".block_sparse_moe."))
+                        elif ".block_sparse_moe." in router_prefix:
+                            possible_prefixes.append(router_prefix.replace(".block_sparse_moe.", ".mlp."))
+
+                        for key in weight_map.keys():
+                            for prefix in possible_prefixes:
+                                if key.startswith(prefix):
+                                    param_name = key[len(prefix)+1:]  # +1 for the dot
+                                    router_state[param_name] = self._load_tensor_for_key(key, model_path, weight_map, loaded_shards)
+                                    break
+
+                        if router_state:
+                            torch.save(router_state, router_file)
+                            router_size = router_file.stat().st_size / (1024**2)
+                            if not router_file.exists():
+                                raise RuntimeError(f"Router file was not created: {router_file}")
+                        else:
+                            print(f"      ⚠️ WARNING: No router weights found, tried prefixes: {possible_prefixes}")
                     else:
                         print(f"      ⚠️ WARNING: No router found on MoE block for layer {i}")
 
-                    # 2. Experts — moe_module.experts is the ModuleList directly
+                    # 2. Experts — handle both ModuleList and custom MixtralExperts class
                     num_experts = self._get_num_experts(config)
                     experts_list = getattr(moe_module, 'experts', None)
 
-                    if experts_list is None or len(experts_list) == 0:
-                        # Meta model might have empty experts - use config num_experts
-                        print(f"      ⚠️  Meta model has no experts instantiated, using config ({num_experts} experts)")
-                        # We'll need to construct a template based on what we expect
-                        # For now, we rely on the weight_map to have the keys
-                        expert_size_acc = 0
-                        for exp_idx in range(num_experts):
-                            expert_file = out_dir / f"layer_{i}_expert_{exp_idx}.pt"
-                            # We manually construct state dict by finding keys in weight_map
-                            expert_state = {}
-                            expert_prefix = f"{moe_prefix}.experts.{exp_idx}"
+                    # CRITICAL: In 2026, Mixtral uses MixtralExperts which doesn't have __len__
+                    # We can't use the traditional ModuleList[i] approach
+                    # Instead, we ALWAYS use the weight_map approach for MoE models
 
-                            for key in weight_map.keys():
-                                if key.startswith(expert_prefix):
-                                    # Extract the relative parameter name
-                                    param_name = key[len(expert_prefix)+1:]  # +1 for the dot
+                    expert_size_acc = 0
+
+                    # DEBUG: Show sample expert keys from checkpoint
+                    sample_expert_keys = [k for k in weight_map.keys() if f"layers.{i}." in k and "expert" in k.lower()]
+                    if sample_expert_keys:
+                        print(f"      🔍 Sample expert keys for layer {i}: {sample_expert_keys[:3]}")
+
+                    for exp_idx in range(num_experts):
+                        expert_file = out_dir / f"layer_{i}_expert_{exp_idx}.pt"
+
+                        # Build state dict by finding all keys for this expert in weight_map
+                        expert_state = {}
+                        expert_prefix = f"{moe_prefix}.experts.{exp_idx}"
+
+                        # Try both mlp and block_sparse_moe aliases
+                        possible_prefixes = [expert_prefix]
+                        if ".mlp." in expert_prefix:
+                            possible_prefixes.append(expert_prefix.replace(".mlp.", ".block_sparse_moe."))
+                        elif ".block_sparse_moe." in expert_prefix:
+                            possible_prefixes.append(expert_prefix.replace(".block_sparse_moe.", ".mlp."))
+
+                        for key in weight_map.keys():
+                            for prefix in possible_prefixes:
+                                if key.startswith(prefix):
+                                    # Extract the relative parameter name (everything after "experts.N.")
+                                    param_name = key[len(prefix)+1:]  # +1 for the dot
                                     expert_state[param_name] = self._load_tensor_for_key(key, model_path, weight_map, loaded_shards)
+                                    break  # Found with this prefix, don't check others
 
-                            if expert_state:
-                                torch.save(expert_state, expert_file)
-                                sz = expert_file.stat().st_size / (1024**2)
-                                expert_size_acc += sz
-                            else:
-                                print(f"      ⚠️  WARNING: No weights found for expert {exp_idx}")
+                        if not expert_state:
+                            print(f"      ⚠️  WARNING: No weights found for expert {exp_idx}")
+                            print(f"      Tried prefixes: {possible_prefixes}")
+                            # This is actually a critical error for MoE models
+                            raise RuntimeError(f"Expert {exp_idx} has no weights in checkpoint")
 
-                            if exp_idx % 4 == 0:
-                                sys.stdout.write(".")
-                            sys.stdout.flush()
-                    else:
-                        # Experts exist on meta model
-                        expert_size_acc = 0
-                        template_expert = experts_list[0]
+                        torch.save(expert_state, expert_file)
+                        sz = expert_file.stat().st_size / (1024**2)
+                        expert_size_acc += sz
 
-                        for exp_idx in range(num_experts):
-                            expert = template_expert
-
-                            expert_file = out_dir / f"layer_{i}_expert_{exp_idx}.pt"
-                            sz = self._save_module(
-                                expert,
-                                f"{moe_prefix}.experts.{exp_idx}",
-                                model_path,
-                                weight_map,
-                                expert_file,
-                                loaded_shards
-                            )
-
-                            if not expert_file.exists():
-                                raise RuntimeError(f"Expert file was not created: {expert_file}")
-
-                            expert_size_acc += sz
-                            if exp_idx % 4 == 0:
-                                sys.stdout.write(".")
-                            sys.stdout.flush()
+                        if exp_idx % 4 == 0:
+                            sys.stdout.write(".")
+                        sys.stdout.flush()
 
                     print(f" Layer {i} MoE done ({num_experts} experts)")
 

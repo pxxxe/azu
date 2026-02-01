@@ -26,13 +26,12 @@ from solders.transaction import Transaction
 
 CORE_IMG = 'pxxxe/azu-core:latest'
 WORKER_IMG = 'pxxxe/azu-worker:latest'
-
-VOLUME_ID = "u46bb8lryt"
-# VOLUME_ID = None
-
 TEST_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 
-SOLANA_RPC = "https://devnet.helius-rpc.com/?api-key=1d7ca6e1-7700-42eb-b086-8183fda42d76"
+
+
+VOLUME_ID = os.getenv("VOLUME_ID")
+SOLANA_RPC = os.getenv("SOLANA_RPC")
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
@@ -44,8 +43,6 @@ GPU_TYPES_SECURE = [
     "NVIDIA GeForce RTX 4090",
     "NVIDIA A100-SXM4-80GB",
     "NVIDIA GeForce RTX 3090",
-
-
 ]
 
 runpod.api_key = RUNPOD_API_KEY
@@ -102,13 +99,10 @@ def resolve_connection(pod_id, port, max_wait=120):
                 continue
             # ---------------------------------
 
-            # Check if ports are exposed yet
             ports = runtime.get('ports', [])
             is_port_open = any(p.get('privatePort') == port for p in ports)
 
             if is_port_open:
-                # On Secure Cloud, we often rely on Proxy.
-                # If we see it's running, return the proxy immediately.
                 print(f"      ✅ Port open. Using Proxy: {proxy_url}")
                 return proxy_url
 

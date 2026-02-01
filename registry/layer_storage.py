@@ -16,6 +16,12 @@ class LayerStore:
         self.storage_path = Path(storage_path)
         self.storage_path.mkdir(exist_ok=True, parents=True)
 
+    def has_model(self, model_id: str) -> bool:
+        """Check if a model is already fully sharded and stored."""
+        sanitized = model_id.replace("/", "_")
+        # We assume if structure.json exists, the sharding completed successfully
+        return (self.storage_path / sanitized / "structure.json").exists()
+
     def _find_layers(self, model):
         """Find transformer layers in model architecture (works on meta device)."""
         print(f"   🔍 Searching for layers in model structure...")

@@ -284,7 +284,6 @@ def main():
             worker_ids.append(wid)
 
         print("\n   ⏳ Waiting for workers to connect to Scheduler...")
-        time.sleep(60)
 
         # ==========================================
         # 4 & 5. Deposit & Inference

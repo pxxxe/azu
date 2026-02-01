@@ -13,6 +13,8 @@ app = FastAPI()
 r = redis.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, decode_responses=True)
 store = LayerStore()
 
+# Ensure directory exists for mounting
+os.makedirs("/data/layers", exist_ok=True)
 app.mount("/layers", StaticFiles(directory="/data/layers"), name="layers")
 
 class ShardRequest(BaseModel):
@@ -21,9 +23,11 @@ class ShardRequest(BaseModel):
 async def background_shard_task(model_id: str, hf_token: str):
     try:
         print(f"🔄 BACKGROUND: Starting shard for {model_id}")
-        await r.set(f"shard_status:{model_id}", "processing")
+        # NOTE: Status is already set to 'processing' by the endpoint
+
         loop = asyncio.get_event_loop()
         num_layers = await loop.run_in_executor(None, store.shard_model, model_id, hf_token)
+
         await r.set(f"shard_status:{model_id}", "ready")
         print(f"✅ BACKGROUND: Finished sharding {model_id} ({num_layers} layers)")
     except Exception as e:
@@ -34,15 +38,25 @@ async def background_shard_task(model_id: str, hf_token: str):
 
 @app.post("/models/shard")
 async def shard_model(req: ShardRequest, background_tasks: BackgroundTasks):
+    # 1. Check if physically exists
     if store.has_model(req.model_id):
         return {"status": "ready", "message": "Model already exists"}
+
+    # 2. Check if currently processing (Lock)
     current_status = await r.get(f"shard_status:{req.model_id}")
     if current_status == "processing":
         return {"status": "processing", "message": "Already processing"}
+
     hf_token = settings.HF_TOKEN
     if not hf_token:
         raise HTTPException(500, "HF_TOKEN not set on Registry")
+
+    # 3. SET LOCK IMMEDIATELY (Synchronous Block)
+    await r.set(f"shard_status:{req.model_id}", "processing")
+
+    # 4. Spawn Task
     background_tasks.add_task(background_shard_task, req.model_id, hf_token)
+
     return {"status": "started", "message": "Background task started"}
 
 @app.get("/models/status")
@@ -61,17 +75,3 @@ async def get_model_info(model_id: str):
         with open(path) as f:
             return json.load(f)
     raise HTTPException(404, "Model not sharded or found")
-
-@app.post("/workers/register")
-async def register_worker(data: dict):
-    await r.setex(f"worker_meta:{data['worker_id']}", 300, json.dumps(data))
-    return {"status": "ok"}
-
-@app.post("/workers/query")
-async def query_workers(data: dict):
-    keys = await r.keys("worker_meta:*")
-    workers = []
-    for k in keys:
-        w_data = await r.get(k)
-        if w_data: workers.append(json.loads(w_data))
-    return {"workers": workers}

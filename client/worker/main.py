@@ -6,6 +6,7 @@ import json
 import base64
 import io
 import os
+import sys
 import urllib.request
 import traceback
 import time
@@ -49,6 +50,8 @@ class MoEWorker:
             self.vram_total_mb = 32000 # Fallback for CPU dev
             print("⚠️ No GPU detected, using simulated 32GB RAM")
 
+        sys.stdout.flush()
+
         # Cache
         self.dense_layers = {}
         self.moe_routers = {}
@@ -57,29 +60,15 @@ class MoEWorker:
         self.lm_head = None
 
     def get_p2p_url(self):
-        """
-        Determines the public P2P URL for this worker.
-        Priority:
-        1. Explicit Env Var (P2P_PUBLIC_URL)
-        2. Template Env Var (P2P_URL_TEMPLATE) -> useful for dynamic platform IDs
-        3. Auto-detect Public IP
-        """
-        # 1. Explicit
         if os.getenv("P2P_PUBLIC_URL"):
             return os.getenv("P2P_PUBLIC_URL").strip("/")
 
-        # 2. Template (e.g. "https://{RUNPOD_POD_ID}-8003.proxy.runpod.net")
         template = os.getenv("P2P_URL_TEMPLATE")
         if template:
             try:
-                # Format using current environment variables
                 return template.format(**os.environ).strip("/")
-            except KeyError as e:
-                print(f"⚠️ P2P Template missing env var: {e}")
-            except Exception as e:
-                print(f"⚠️ P2P Template error: {e}")
+            except: pass
 
-        # 3. Auto-IP
         try:
             ip = urllib.request.urlopen('https://api.ipify.org').read().decode('utf8')
             return f"http://{ip}:8003"
@@ -157,9 +146,9 @@ class MoEWorker:
             self.embeddings = None
             self.lm_head = None
             torch.cuda.empty_cache()
+            gc.collect() # Force GC on worker too
             self.loaded_model_id = model_id
 
-            # Load config
             sanitized = model_id.replace("/", "_")
             try:
                 self.model_config = AutoConfig.from_pretrained(
@@ -167,6 +156,8 @@ class MoEWorker:
                 )
             except:
                 self.model_config = AutoConfig.from_pretrained(model_id, token=HF_TOKEN, trust_remote_code=True)
+
+            sys.stdout.flush()
 
     async def process_dense(self, msg, ws):
         job_id = msg['job_id']
@@ -240,7 +231,6 @@ class MoEWorker:
 
         hidden_states = hidden_states.half()
 
-        # Routing
         if layer_idx not in self.moe_routers:
             self.moe_routers[layer_idx] = await self.loader.load_moe_router(model_id, layer_idx, self.device)
 
@@ -256,7 +246,6 @@ class MoEWorker:
             ctx.selected_indices = top_indices.cpu()
             flat_indices = top_indices.view(-1)
 
-        # Scatter
         required_experts = torch.unique(flat_indices).tolist()
         send_tasks = []
 
@@ -264,7 +253,6 @@ class MoEWorker:
             target_url = expert_map.get(str(expert_idx))
             if not target_url: continue
 
-            # Create Mask & Slice
             mask = (top_indices == expert_idx)
             rows, cols, _ = torch.where(mask)
             sliced = hidden_states[rows, cols, :]
@@ -276,12 +264,10 @@ class MoEWorker:
 
         if send_tasks: await asyncio.gather(*send_tasks)
 
-        # Gather
         pending = list(ctx.pending_expert_requests.values())
         if pending:
             await asyncio.wait_for(asyncio.gather(*pending), timeout=P2P_TIMEOUT)
 
-        # Aggregate
         batch, seq, hidden = hidden_states.shape
         final_output = torch.zeros((batch, seq, hidden), dtype=torch.float16, device=self.device)
         top_weights = ctx.routing_weights.to(self.device)
@@ -292,8 +278,6 @@ class MoEWorker:
                 res = future.result().to(self.device)
                 mask = (top_indices == expert_idx)
                 rows, cols, k_idx = torch.where(mask)
-
-                # Weighted Add
                 w = top_weights[rows, cols, k_idx].unsqueeze(-1)
                 final_output.index_put_((rows, cols), res * w, accumulate=True)
 
@@ -336,11 +320,13 @@ class MoEWorker:
 
     async def run(self):
         await self.start_p2p_server()
+        import gc
         while True:
             try:
                 print(f"🔌 Connecting to {SCHEDULER_URL}...")
                 async with websockets.connect(SCHEDULER_URL) as ws:
                     print(f"✅ Connected. Reporting {self.vram_total_mb}MB VRAM")
+                    sys.stdout.flush()
                     await ws.send(json.dumps({
                         "type": "REGISTER",
                         "specs": {
@@ -358,6 +344,7 @@ class MoEWorker:
                         elif msg['type'] == 'EXECUTE_EXPERT': asyncio.create_task(self.process_moe_expert(msg, ws))
             except Exception as e:
                 print(f"❌ Error: {e}")
+                sys.stdout.flush()
                 await asyncio.sleep(5)
 
 if __name__ == "__main__":

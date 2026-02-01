@@ -16,11 +16,8 @@ class WorkerState:
     pubkey: str
     ws: WebSocket
     specs: dict
-    # Resource Management
     vram_total_mb: int
     vram_used_mb: int = 0
-    # Cache Awareness (What layers are already on this worker?)
-    # Key format: "{model_id}:{layer_idx}:{type}:{expert_idx?}"
     cached_layers: Set[str] = field(default_factory=set)
     last_heartbeat: float = field(default_factory=time.time)
 
@@ -44,14 +41,8 @@ class MoEScheduler:
 
     async def register_worker(self, ws: WebSocket, specs: dict) -> str:
         wid = specs['pubkey']
-        vram = specs.get('vram_mb', 24000) # Default 24GB if missing
-
-        self.workers[wid] = WorkerState(
-            pubkey=wid,
-            ws=ws,
-            specs=specs,
-            vram_total_mb=vram
-        )
+        vram = specs.get('vram_mb', 24000)
+        self.workers[wid] = WorkerState(pubkey=wid, ws=ws, specs=specs, vram_total_mb=vram)
         print(f"✅ Registered: {wid[:8]} | VRAM: {vram}MB")
         return wid
 
@@ -60,35 +51,10 @@ class MoEScheduler:
             del self.workers[wid]
             print(f"❌ Worker {wid[:8]} disconnected")
 
-    # --- INTELLIGENT PLANNING ---
-
-    def _estimate_layer_size(self, layer_meta, is_expert=False):
-        """Estimate VRAM usage in MB"""
-        if is_expert and layer_meta['type'] == 'moe':
-            # Expert Size = Total Experts Size / Num Experts
-            # Registry 'size_mb' for MoE is typically total size.
-            # Using 'total_size_mb' from registry (see layer_storage.py)
-            total = layer_meta.get('total_size_mb', 0)
-            count = layer_meta.get('num_experts', 1)
-            return max(1, total / count)
-
-        # Dense or Router size
-        # If it's MoE router, it's small, registry usually marks 'size_mb' as just router or small
-        return layer_meta.get('size_mb', 0)
-
-    def _find_best_worker(self, size_mb: int, previous_worker_id: str = None,
-                         cache_key: str = None) -> Optional[WorkerState]:
-        """
-        Finds the best worker for a task.
-        Priorities:
-        1. Has Data Cached (0 VRAM cost, 0 Loading time)
-        2. Is Previous Hop (0 Network cost) & Has VRAM
-        3. Has most Free VRAM
-        """
+    def _find_best_worker(self, size_mb: int, previous_worker_id: str = None, cache_key: str = None) -> Optional[WorkerState]:
         candidates = list(self.workers.values())
         if not candidates: return None
 
-        # Filter: Must have space OR already have it cached
         valid = []
         for w in candidates:
             has_cache = cache_key in w.cached_layers
@@ -97,54 +63,33 @@ class MoEScheduler:
 
         if not valid: return None
 
-        # Scoring Function
         def score(w):
             s = 0
-            # 1. Cache Locality (Huge bonus)
-            if cache_key and cache_key in w.cached_layers:
-                s += 10000
-
-            # 2. Network Locality (Affinity)
-            if previous_worker_id and w.pubkey == previous_worker_id:
-                s += 5000
-
-            # 3. Load Balancing (Tie-breaker)
-            s += (w.vram_free_mb / 1024) # Add point per GB free
+            if cache_key and cache_key in w.cached_layers: s += 10000
+            if previous_worker_id and w.pubkey == previous_worker_id: s += 5000
+            s += (w.vram_free_mb / 1024)
             return s
 
         return max(valid, key=score)
 
     def _plan_job(self, model_info) -> Optional[List[dict]]:
-        """
-        State-Aware Planner.
-        Assigns layers to workers based on VRAM state and Cache Locality.
-        """
         layers = model_info.get('layer_metadata', [])
         if not self.workers: return None
 
         topology = []
         prev_worker_id = None
 
-        # We simulate the cluster state for this job planning
-        # Note: In a real system, we'd snapshot this or lock it.
-        # Here we modify in-place assuming sequential planning.
-
         for layer in layers:
             layer_idx = layer['layer_idx']
             l_type = layer.get('type', 'dense')
-
-            # 1. Place the "Main" component (Dense Layer or MoE Router)
-            # Router is small, usually fits where previous layer was.
-            main_size = layer.get('size_mb', 0) if l_type == 'dense' else 50 # Router estimate
+            main_size = layer.get('size_mb', 0) if l_type == 'dense' else 50
             cache_key = f"{model_info['model_id']}:{layer_idx}:main"
 
             target_worker = self._find_best_worker(main_size, prev_worker_id, cache_key)
-
             if not target_worker:
-                print(f"⚠️ Cluster Full! Cannot place layer {layer_idx} ({main_size}MB)")
-                return None # Fail assignment
+                print(f"⚠️ Cluster Full! Cannot place layer {layer_idx}")
+                return None
 
-            # "Book" the resource
             if cache_key not in target_worker.cached_layers:
                 target_worker.vram_used_mb += main_size
                 target_worker.cached_layers.add(cache_key)
@@ -155,27 +100,18 @@ class MoEScheduler:
                 "worker_id": target_worker.pubkey,
                 "endpoint": target_worker.specs.get('p2p_url')
             }
+            prev_worker_id = target_worker.pubkey
 
-            prev_worker_id = target_worker.pubkey # Stickiness for next layer
-
-            # 2. If MoE, Place Experts (Scatter)
             if l_type == 'moe':
                 node['expert_map'] = {}
                 num_experts = layer.get('num_experts', 0)
-                expert_size = self._estimate_layer_size(layer, is_expert=True)
+                expert_size = layer.get('total_size_mb', 0) / max(1, num_experts)
 
                 for exp_idx in range(num_experts):
                     exp_key = f"{model_info['model_id']}:{layer_idx}:expert:{exp_idx}"
-
-                    # For experts, we prioritize capacity over affinity,
-                    # but try to keep them on the router node if space exists.
                     exp_worker = self._find_best_worker(expert_size, node['worker_id'], exp_key)
 
-                    if not exp_worker:
-                         # Soft fail: If no worker fits an expert, we might overload or fail.
-                         # Strict: Fail.
-                         print(f"⚠️ No room for Expert {exp_idx}!")
-                         return None
+                    if not exp_worker: return None
 
                     if exp_key not in exp_worker.cached_layers:
                         exp_worker.vram_used_mb += expert_size
@@ -184,27 +120,17 @@ class MoEScheduler:
                     node['expert_map'][str(exp_idx)] = exp_worker.specs.get('p2p_url')
 
             topology.append(node)
-
         return topology
 
-    # --- JOB PROCESSING ---
-
-    async def _check_model_ready(self, model_id: str) -> bool:
+    async def _check_model_status(self, model_id: str) -> str:
         try:
             async with aiohttp.ClientSession() as sess:
                 async with sess.get(f"{self.registry_url}/models/status", params={"model_id": model_id}) as resp:
                     if resp.status == 200:
-                        return (await resp.json()).get("status") == "ready"
+                        data = await resp.json()
+                        return data.get("status", "idle")
         except: pass
-        return False
-
-    async def _get_model_info(self, model_id: str):
-        try:
-            async with aiohttp.ClientSession() as sess:
-                async with sess.get(f"{self.registry_url}/models/info", params={"model_id": model_id}) as resp:
-                    if resp.status == 200: return await resp.json()
-        except: pass
-        return None
+        return "error"
 
     async def process_queue(self):
         print("🚀 [Scheduler] Intelligent Dispatcher Active")
@@ -217,20 +143,44 @@ class MoEScheduler:
                 job_id = raw_job['id']
                 model_id = raw_job['model']
 
-                if not await self._check_model_ready(model_id):
-                    # Trigger shard...
-                    async with aiohttp.ClientSession() as sess:
-                        await sess.post(f"{self.registry_url}/models/shard", json={"model_id": model_id})
+                # 1. Check Status
+                status = await self._check_model_status(model_id)
+
+                if status == 'ready':
+                    # Proceed to plan
+                    pass
+                elif status == 'processing':
+                    print(f"⏳ JIT: Model {model_id} is processing. Re-queueing...")
+                    await r.rpush("job_queue", item[1])
                     await asyncio.sleep(5)
+                    continue
+                elif status == 'failed':
+                    print(f"❌ JIT: Model {model_id} failed to shard. Dropping job.")
+                    continue
+                else: # idle or unknown
+                    print(f"⬇️ JIT: Triggering download for {model_id}")
+                    try:
+                        async with aiohttp.ClientSession() as sess:
+                            await sess.post(f"{self.registry_url}/models/shard", json={"model_id": model_id})
+                    except: pass
                     await r.rpush("job_queue", item[1])
+                    await asyncio.sleep(5)
                     continue
 
-                model_info = await self._get_model_info(model_id)
+                # 2. Plan
+                model_info = None
+                try:
+                    async with aiohttp.ClientSession() as sess:
+                        async with sess.get(f"{self.registry_url}/models/info", params={"model_id": model_id}) as resp:
+                            if resp.status == 200: model_info = await resp.json()
+                except: pass
+
                 if not model_info:
+                    print("⚠️ No model info. Re-queueing.")
                     await r.rpush("job_queue", item[1])
+                    await asyncio.sleep(2)
                     continue
 
-                # PLAN
                 plan = self._plan_job(model_info)
 
                 if not plan:
@@ -246,10 +196,10 @@ class MoEScheduler:
             except Exception as e:
                 import traceback
                 traceback.print_exc()
+                await asyncio.sleep(1)
 
     async def _dispatch(self, job: JobState):
         print(f"📦 Dispatching Job {job.id} (Smart Route)")
-
         for i, node in enumerate(job.topology):
             w = self.workers.get(node['worker_id'])
             if not w: continue
@@ -263,16 +213,13 @@ class MoEScheduler:
             if node['type'] == 'dense':
                 payload.update({"type": "EXECUTE_DENSE", "input": job.input_prompt if i==0 else None, "is_first": i==0, "is_last": i==len(job.topology)-1})
                 await w.ws.send_json(payload)
-
             elif node['type'] == 'moe':
                 payload.update({"type": "EXECUTE_ROUTER", "expert_map": node['expert_map']})
                 await w.ws.send_json(payload)
 
-                # Notify Experts
-                # Group by worker to reduce WS frames
+                # Group experts
                 tasks = {}
                 for exp_idx, url in node['expert_map'].items():
-                    # Find worker
                     exp_w = next((wk for wk in self.workers.values() if wk.specs.get('p2p_url') == url), None)
                     if exp_w:
                         if exp_w.pubkey not in tasks: tasks[exp_w.pubkey] = []

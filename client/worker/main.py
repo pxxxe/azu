@@ -41,6 +41,7 @@ class MoEWorker:
         self.active_jobs: Dict[str, JobContext] = {}
         self.loaded_model_id = None
         self.model_config = None
+        self.current_model = None
 
         # Hardware Specs
         if torch.cuda.is_available():

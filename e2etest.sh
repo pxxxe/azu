@@ -19,8 +19,6 @@ echo "    - CORE_IMG = 'pxxxe/azu-core:latest'"
 echo "    - WORKER_IMG = 'pxxxe/azu-worker:latest'"
 echo "    - Your Volume ID"
 echo ""
-echo "Press Enter to continue or Ctrl+C to cancel..."
-read
 
 echo ""
 echo "🚀 Launching RunPod instances..."

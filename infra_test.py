@@ -330,7 +330,7 @@ def main():
         print(f"   ✅ Job ID: {job_id}")
 
         # Poll
-        for i in range(60):
+        for i in range(200):
             try:
                 res = requests.get(f"{api_url}/results/{job_id}").json()
                 status = res.get('status')

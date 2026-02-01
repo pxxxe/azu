@@ -2,4 +2,4 @@ contentgen.sh
 project_contents.md
 .DS_Store
 .env
-envscript.sh
+populate.sh

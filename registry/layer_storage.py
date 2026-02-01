@@ -55,6 +55,22 @@ class LayerStore:
                 continue
         return False, None
 
+    def _get_num_experts(self, config):
+        """
+        Get number of experts from config.
+        Works for Mixtral and other MoE models.
+        """
+        # Common config keys for number of experts
+        for key in ['num_local_experts', 'num_experts', 'moe_num_experts', 'n_routed_experts']:
+            if hasattr(config, key):
+                num = getattr(config, key)
+                if num > 0:
+                    return num
+
+        # Fallback: default to 8 for Mixtral-style models
+        print(f"   ⚠️ Warning: Could not find num_experts in config, defaulting to 8")
+        return 8
+
     def _load_tensor_for_key(self, key, model_path, index, loaded_shards):
         """
         Loads a specific tensor key from the checkpoint files.
@@ -193,15 +209,32 @@ class LayerStore:
                     if router:
                         self._save_module(router, f"{moe_prefix}.{router_attr}", model_path, weight_map, out_dir / f"layer_{i}_router.pt", loaded_shards)
 
-                    # 2. Experts
-                    experts = getattr(moe_module, "experts", [])
-                    num_experts = len(experts)
+                    # 2. Experts - FIX: Get count from config instead of meta device!
+                    num_experts = self._get_num_experts(config)
                     expert_size_acc = 0
 
-                    for exp_idx, expert in enumerate(experts):
-                        sz = self._save_module(expert, f"{moe_prefix}.experts.{exp_idx}", model_path, weight_map, out_dir / f"layer_{i}_expert_{exp_idx}.pt", loaded_shards)
+                    # Use range instead of iterating over the meta device experts
+                    for exp_idx in range(num_experts):
+                        # Get the expert module from meta model (just for structure)
+                        experts_list = getattr(moe_module, "experts", None)
+                        if experts_list is not None and exp_idx < len(experts_list):
+                            expert = experts_list[exp_idx]
+                        else:
+                            # Fallback: assume experts exist in weight map even if not in meta
+                            expert = None
+
+                        # Save using the prefix - this will look up weights by key
+                        sz = self._save_module(
+                            expert if expert else moe_module.experts[0],  # Use structure from first expert as template
+                            f"{moe_prefix}.experts.{exp_idx}",
+                            model_path,
+                            weight_map,
+                            out_dir / f"layer_{i}_expert_{exp_idx}.pt",
+                            loaded_shards
+                        )
                         expert_size_acc += sz
-                        if exp_idx % 4 == 0: sys.stdout.write(".")
+                        if exp_idx % 4 == 0:
+                            sys.stdout.write(".")
                         sys.stdout.flush()
 
                     print(f" Layer {i} MoE done ({num_experts} experts)")

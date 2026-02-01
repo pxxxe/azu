@@ -14,6 +14,7 @@ from aiohttp import web
 from typing import Dict, Set, List, Tuple
 from transformers import AutoTokenizer, AutoConfig
 from layer_loader import LayerLoader
+import gc
 
 # CONFIG
 SCHEDULER_URL = os.getenv("SCHEDULER_URL", "ws://localhost:8001/ws/worker")

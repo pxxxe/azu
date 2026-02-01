@@ -42,14 +42,44 @@ class LayerStore:
     def _is_moe_layer(self, layer, config):
         """Find the MoE block inside a layer.
 
+        FIXED VERSION: Checks config FIRST instead of relying on broken meta model structure.
+
         Returns (is_moe, path_to_moe_block) where path_to_moe_block points to
         the module that CONTAINS both the router (gate) and the experts list —
         e.g. "mlp" for Mixtral, NOT "mlp.experts".
         """
-        # Each candidate is (path_to_block, router_attr_name).
+
+        # ===================================================================
+        # STEP 1: Check config to determine if this is an MoE architecture
+        # ===================================================================
+        # This is CRITICAL - meta models don't reliably expose structure
+        is_moe_architecture = False
+
+        # Check for MoE-specific config attributes
+        if hasattr(config, 'num_local_experts') and config.num_local_experts > 1:
+            is_moe_architecture = True
+        elif hasattr(config, 'num_experts') and config.num_experts > 1:
+            is_moe_architecture = True
+        elif hasattr(config, 'moe_num_experts') and config.moe_num_experts > 1:
+            is_moe_architecture = True
+
+        # Also check architecture name for known MoE models
+        if hasattr(config, 'architectures') and config.architectures:
+            arch_name = config.architectures[0].lower()
+            if 'mixtral' in arch_name or 'moe' in arch_name:
+                is_moe_architecture = True
+
+        # If config says it's NOT MoE, return immediately
+        if not is_moe_architecture:
+            return False, None
+
+        # ===================================================================
+        # STEP 2: If config confirms MoE, find the path to the MoE block
+        # ===================================================================
+        # We try common paths where the MoE block lives
         candidates = [
             ("block_sparse_moe", ["gate", "router"]),   # some Mixtral variants
-            ("mlp",              ["gate", "router"]),   # Mixtral standard
+            ("mlp",              ["gate", "router"]),   # Mixtral standard (MOST COMMON)
             ("moe",              ["gate", "router"]),   # generic
             ("",                 ["gate", "router"]),   # layer itself is the block
         ]
@@ -61,18 +91,24 @@ class LayerStore:
                     for part in block_path.split('.'):
                         obj = getattr(obj, part)
 
+                # CRITICAL FIX: On meta device, we can't rely on checking if
+                # experts has __len__ or if it's empty. Just check EXISTENCE.
                 has_router = any(hasattr(obj, name) for name in router_names)
-                # For meta models, experts ModuleList exists but might be empty
-                # Just check it exists and is a container, don't check length
-                has_experts = (hasattr(obj, 'experts')
-                               and hasattr(obj.experts, '__len__'))
+                has_experts = hasattr(obj, 'experts')
 
-                if has_router and has_experts:
+                # If we found EITHER router OR experts, this is the MoE block
+                if has_router or has_experts:
+                    print(f"      🔍 Found MoE block at path: '{block_path or 'ROOT'}'")
                     return True, block_path
             except AttributeError:
                 continue
 
-        return False, None
+        # ===================================================================
+        # STEP 3: Fallback - config says MoE but we can't find structure
+        # ===================================================================
+        # For Mixtral and most MoE models in 2026, it's always "mlp"
+        print(f"      ⚠️  Config indicates MoE but couldn't detect structure. Assuming 'mlp' path.")
+        return True, "mlp"
 
     def _get_num_experts(self, config):
         """
@@ -250,34 +286,61 @@ class LayerStore:
 
                     # 2. Experts — moe_module.experts is the ModuleList directly
                     num_experts = self._get_num_experts(config)
-                    experts_list = moe_module.experts  # guaranteed to exist by _is_moe_layer
-                    expert_size_acc = 0
+                    experts_list = getattr(moe_module, 'experts', None)
 
-                    if len(experts_list) == 0:
-                        raise RuntimeError(f"Layer {i}: MoE detected but experts list is empty!")
+                    if experts_list is None or len(experts_list) == 0:
+                        # Meta model might have empty experts - use config num_experts
+                        print(f"      ⚠️  Meta model has no experts instantiated, using config ({num_experts} experts)")
+                        # We'll need to construct a template based on what we expect
+                        # For now, we rely on the weight_map to have the keys
+                        expert_size_acc = 0
+                        for exp_idx in range(num_experts):
+                            expert_file = out_dir / f"layer_{i}_expert_{exp_idx}.pt"
+                            # We manually construct state dict by finding keys in weight_map
+                            expert_state = {}
+                            expert_prefix = f"{moe_prefix}.experts.{exp_idx}"
 
-                    template_expert = experts_list[0]
+                            for key in weight_map.keys():
+                                if key.startswith(expert_prefix):
+                                    # Extract the relative parameter name
+                                    param_name = key[len(expert_prefix)+1:]  # +1 for the dot
+                                    expert_state[param_name] = self._load_tensor_for_key(key, model_path, weight_map, loaded_shards)
 
-                    for exp_idx in range(num_experts):
-                        expert = template_expert
+                            if expert_state:
+                                torch.save(expert_state, expert_file)
+                                sz = expert_file.stat().st_size / (1024**2)
+                                expert_size_acc += sz
+                            else:
+                                print(f"      ⚠️  WARNING: No weights found for expert {exp_idx}")
 
-                        expert_file = out_dir / f"layer_{i}_expert_{exp_idx}.pt"
-                        sz = self._save_module(
-                            expert,
-                            f"{moe_prefix}.experts.{exp_idx}",
-                            model_path,
-                            weight_map,
-                            expert_file,
-                            loaded_shards
-                        )
+                            if exp_idx % 4 == 0:
+                                sys.stdout.write(".")
+                            sys.stdout.flush()
+                    else:
+                        # Experts exist on meta model
+                        expert_size_acc = 0
+                        template_expert = experts_list[0]
 
-                        if not expert_file.exists():
-                            raise RuntimeError(f"Expert file was not created: {expert_file}")
+                        for exp_idx in range(num_experts):
+                            expert = template_expert
 
-                        expert_size_acc += sz
-                        if exp_idx % 4 == 0:
-                            sys.stdout.write(".")
-                        sys.stdout.flush()
+                            expert_file = out_dir / f"layer_{i}_expert_{exp_idx}.pt"
+                            sz = self._save_module(
+                                expert,
+                                f"{moe_prefix}.experts.{exp_idx}",
+                                model_path,
+                                weight_map,
+                                expert_file,
+                                loaded_shards
+                            )
+
+                            if not expert_file.exists():
+                                raise RuntimeError(f"Expert file was not created: {expert_file}")
+
+                            expert_size_acc += sz
+                            if exp_idx % 4 == 0:
+                                sys.stdout.write(".")
+                            sys.stdout.flush()
 
                     print(f" Layer {i} MoE done ({num_experts} experts)")
 

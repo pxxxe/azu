@@ -27,7 +27,7 @@ from solders.transaction import Transaction
 CORE_IMG = 'pxxxe/azu-core:latest'
 WORKER_IMG = 'pxxxe/azu-worker:latest'
 
-VOLUME_ID = "m2iz5kl4wi"
+VOLUME_ID = "u46bb8lryt"
 # VOLUME_ID = None
 
 TEST_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
@@ -41,8 +41,11 @@ GPU_TYPES_SECURE = [
     "NVIDIA RTX A6000",             # 48GB VRAM, usually 128GB+ System RAM
     "NVIDIA RTX 6000 Ada Generation",
     "NVIDIA A100 80GB PCIe",
-    "NVIDIA A100-80GB",
-    "NVIDIA GeForce RTX 4090"       # Fallback (Consumer, lower RAM risk)
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA A100-SXM4-80GB",
+    "NVIDIA GeForce RTX 3090",
+
+
 ]
 
 runpod.api_key = RUNPOD_API_KEY
@@ -117,7 +120,7 @@ def resolve_connection(pod_id, port, max_wait=120):
     print("      ⚠️ Timeout waiting for port check. Assuming Proxy is valid.")
     return proxy_url
 
-def deploy_pod_with_retry(name, image, env_vars, gpu_type, max_retries=3):
+def deploy_pod_with_retry(name, image, env_vars, gpu_type, max_retries=8):
     """Deploy pod with retries."""
     print(f"   🎯 Trying GPU type: {gpu_type}")
 
@@ -125,19 +128,28 @@ def deploy_pod_with_retry(name, image, env_vars, gpu_type, max_retries=3):
         try:
             print(f"   🔄 Attempt {attempt}/{max_retries}...")
 
-            req = {
-                "name": name,
-                "image_name": image,
-                "gpu_type_id": gpu_type,
-                "cloud_type": "SECURE",
-                "env": env_vars,
-                "ports": "8000/http,8001/http,8002/http,8003/http",
-            }
-            if VOLUME_ID:
-                req["network_volume_id"] = VOLUME_ID
-                req["volume_mount_path"] = "/data"
+            # req = {
+            #     "name": name,
+            #     "image_name": image,
+            #     "gpu_type_id": gpu_type,
+            #     "cloud_type": "SECURE",
+            #     "env": env_vars,
+            #     "ports": "8000/http,8001/http,8002/http,8003/http",
+            # }
+            # if VOLUME_ID:
+            #     req["network_volume_id"] = VOLUME_ID
+            #     req["volume_mount_path"] = "/data"
 
-            response = runpod.create_pod(**req)
+            response = runpod.create_pod(
+              name=name,
+              image_name=image,
+              gpu_type_id=gpu_type,
+              cloud_type="SECURE",
+              env=env_vars,
+              ports="8000/http,8001/http,8002/http,8003/http",
+              network_volume_id=VOLUME_ID,
+              volume_mount_path="/data"
+            )
 
             if isinstance(response, dict) and response.get('id'):
                 pod_id = response['id']

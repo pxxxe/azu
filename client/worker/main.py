@@ -110,19 +110,33 @@ class MoEWorker:
         """Internal handler for incoming tensor data (bypass logic)"""
         job_id = data['job_id']
         msg_type = data.get('type', 'input')
+
+        print(f"📨 [P2P] Received {msg_type} for job {job_id[:8]}...")
+        sys.stdout.flush()
+
         tensor = self._decode_tensor(data['tensor'])
+        print(f"   ✓ Decoded tensor shape: {tensor.shape}")
+        sys.stdout.flush()
 
         ctx = await self._get_context(job_id, create=True)
 
         if msg_type == 'input':
+            print(f"   ➡️ Enqueueing input tensor for job {job_id[:8]}")
+            sys.stdout.flush()
             await ctx.input_queue.put(tensor)
+            print(f"   ✓ Input tensor enqueued (queue size: {ctx.input_queue.qsize()})")
+            sys.stdout.flush()
 
         elif msg_type == 'expert_result':
             expert_idx = data.get('expert_idx')
+            print(f"   ⬅️ Received expert {expert_idx} result for job {job_id[:8]}")
+            sys.stdout.flush()
             if expert_idx is not None and expert_idx in ctx.pending_expert_requests:
                 future = ctx.pending_expert_requests[expert_idx]
                 if not future.done():
                     future.set_result(tensor)
+                    print(f"   ✓ Expert {expert_idx} future resolved")
+                    sys.stdout.flush()
 
     async def handle_tensor_ingress(self, request):
         try:
@@ -130,12 +144,19 @@ class MoEWorker:
             await self.process_ingress_data(data)
             return web.Response(text="OK")
         except Exception as e:
+            print(f"❌ [P2P] Error handling ingress: {e}")
             traceback.print_exc()
+            sys.stdout.flush()
             return web.Response(status=500, text=str(e))
 
     # --- EXECUTION LOGIC ---
     async def _send_p2p(self, url, payload):
         """Send tensor to another worker. Includes LOOPBACK OPTIMIZATION."""
+        job_id = payload.get('job_id', 'unknown')
+        msg_type = payload.get('type', 'unknown')
+
+        print(f"📤 [P2P] Sending {msg_type} for job {job_id[:8] if len(job_id) > 8 else job_id} to {url}")
+        sys.stdout.flush()
 
         # 1. Check for Loopback (Self-Transfer)
         # Avoids network hair-pinning which causes deadlocks/hangs on Cloud Proxies
@@ -144,24 +165,39 @@ class MoEWorker:
 
         if my_p2p == target_base:
             # Short-circuit: Inject directly into local handler
-            # print(f"⚡ [P2P] Loopback detected. Short-circuiting {url}")
+            print(f"⚡ [P2P] Loopback detected. Short-circuiting to local handler")
+            sys.stdout.flush()
             try:
                 await self.process_ingress_data(payload)
+                print(f"   ✓ Loopback delivery successful")
+                sys.stdout.flush()
                 return
             except Exception as e:
                 print(f"❌ Local P2P Error: {e}")
                 traceback.print_exc()
+                sys.stdout.flush()
                 return
 
         # 2. Actual Network Transfer
-        for i in range(3):
+        print(f"   🌐 Sending over network to {url}")
+        sys.stdout.flush()
+        for attempt in range(3):
             try:
                 async with aiohttp.ClientSession() as sess:
                     async with sess.post(url, json=payload, timeout=30) as resp:
-                        if resp.status == 200: return
-            except:
+                        if resp.status == 200:
+                            print(f"   ✅ Network send successful (attempt {attempt + 1})")
+                            sys.stdout.flush()
+                            return
+                        else:
+                            print(f"   ⚠️ Got status {resp.status} (attempt {attempt + 1})")
+                            sys.stdout.flush()
+            except Exception as e:
+                print(f"   ⚠️ Send failed (attempt {attempt + 1}): {e}")
+                sys.stdout.flush()
                 await asyncio.sleep(0.5)
-        print(f"❌ Failed to send to {url}")
+
+        print(f"❌ Failed to send to {url} after 3 attempts")
         sys.stdout.flush()
 
     async def _ensure_model(self, model_id):
@@ -174,6 +210,7 @@ class MoEWorker:
                 return
 
             print(f"🧹 New model {model_id} requested. Clearing VRAM...")
+            sys.stdout.flush()
             self.embeddings = None
             self.lm_head = None
             self.dense_layers.clear()
@@ -184,6 +221,7 @@ class MoEWorker:
             torch.cuda.empty_cache()
 
             print(f"📥 Fetching model config from registry...")
+            sys.stdout.flush()
             sanitized = model_id.replace("/", "_")
             config_path = self.loader.cache_dir / f"{sanitized}_config.json"
 
@@ -202,13 +240,14 @@ class MoEWorker:
 
                 self.model_config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
                 print(f"✅ Config loaded from registry ({self.model_config.architectures[0]})")
+                sys.stdout.flush()
 
             except Exception as e:
                 print(f"❌ Failed to load config from registry: {e}")
+                sys.stdout.flush()
                 raise  # Don't silently fall back and spam HF
 
             self.current_model = model_id
-            sys.stdout.flush()
 
     async def process_dense(self, msg, ws):
         job_id = msg['job_id']
@@ -216,39 +255,63 @@ class MoEWorker:
         layer_idx = msg['layer_idx']
         next_hop = msg.get('next_hop')
 
+        print(f"🔵 [DENSE] Processing job {job_id[:8]}, layer_idx={layer_idx}, is_first={msg.get('is_first')}, is_last={msg.get('is_last')}, next_hop={next_hop}")
+        sys.stdout.flush()
+
         await self._ensure_model(model_id)
         ctx = await self._get_context(job_id, create=True)
 
         # 1. Input
         hidden_states = None
         if msg.get('is_first'):
-            print(f"⚡ [Job {job_id}] Embedding...")
+            print(f"⚡ [Job {job_id[:8]}] Embedding...")
             sys.stdout.flush()
             if not self.embeddings:
                 self.embeddings = await self.loader.load_embeddings(model_id, self.device)
+
             prompt = msg['input']
+            print(f"   🔤 Tokenizing prompt: '{prompt[:50]}...'")
+            sys.stdout.flush()
+
             tokenizer = AutoTokenizer.from_pretrained(model_id, token=HF_TOKEN, trust_remote_code=True)
             inputs = tokenizer(prompt, return_tensors="pt").to(self.device)
+
+            print(f"   ⚙️ Running embedding layer...")
+            sys.stdout.flush()
+
             with torch.no_grad():
                 hidden_states = self.embeddings(inputs.input_ids)
+
+            print(f"   ✅ Embedding complete. Output shape: {hidden_states.shape}")
+            sys.stdout.flush()
         else:
+            print(f"   ⏳ Waiting for input tensor from P2P (timeout={P2P_TIMEOUT}s)...")
+            sys.stdout.flush()
             try:
                 hidden_states = await asyncio.wait_for(ctx.input_queue.get(), timeout=P2P_TIMEOUT)
+                print(f"   ✅ Received input tensor. Shape: {hidden_states.shape}")
+                sys.stdout.flush()
             except asyncio.TimeoutError:
+                print(f"❌ [Job {job_id[:8]}] Timed out waiting for input tensor!")
+                sys.stdout.flush()
                 return
 
         # 2. Compute
         if layer_idx != -1:
+            print(f"   🔧 Processing dense layer {layer_idx}...")
+            sys.stdout.flush()
             if layer_idx not in self.dense_layers:
                 self.dense_layers[layer_idx] = await self.loader.load_dense_layer(model_id, layer_idx, self.device)
             with torch.no_grad():
                 hidden_states = hidden_states.half()
                 hidden_states = self.dense_layers[layer_idx](hidden_states)
                 if isinstance(hidden_states, tuple): hidden_states = hidden_states[0]
+            print(f"   ✅ Dense layer {layer_idx} complete. Output shape: {hidden_states.shape}")
+            sys.stdout.flush()
 
         # 3. Output/Forward
         if msg.get('is_last'):
-            print(f"🏁 [Job {job_id}] Decoding...")
+            print(f"🏁 [Job {job_id[:8]}] Decoding...")
             sys.stdout.flush()
             if not self.lm_head:
                 self.lm_head = await self.loader.load_lm_head(model_id, self.device)
@@ -257,15 +320,32 @@ class MoEWorker:
                 next_token = torch.argmax(logits[:, -1, :], dim=-1)
                 tokenizer = AutoTokenizer.from_pretrained(model_id, token=HF_TOKEN, trust_remote_code=True)
                 output_text = tokenizer.decode(next_token, skip_special_tokens=True)
-            await ws.send(json.dumps({
-                "type": "RESULT", "job_id": job_id, "status": "completed", "output": output_text
-            }))
+
+            print(f"   🎉 Generated output: '{output_text}'")
+            sys.stdout.flush()
+
+            result_msg = {"type": "RESULT", "job_id": job_id, "status": "completed", "output": output_text}
+            print(f"   📡 Sending result to scheduler: {result_msg}")
+            sys.stdout.flush()
+            await ws.send(json.dumps(result_msg))
+            print(f"   ✅ Result sent")
+            sys.stdout.flush()
         elif next_hop:
+            print(f"   ➡️ Forwarding to next hop: {next_hop}")
+            sys.stdout.flush()
             await self._send_p2p(next_hop, {
                 "job_id": job_id, "type": "input", "tensor": self._encode_tensor(hidden_states)
             })
+            print(f"   ✅ Forwarded to next hop")
+            sys.stdout.flush()
+        else:
+            print(f"   ⚠️ No next_hop and not last layer - job may be incomplete")
+            sys.stdout.flush()
 
-        if job_id in self.active_jobs: del self.active_jobs[job_id]
+        if job_id in self.active_jobs:
+            del self.active_jobs[job_id]
+            print(f"   🧹 Cleaned up job context for {job_id[:8]}")
+            sys.stdout.flush()
 
     async def process_moe_router(self, msg, ws):
         job_id = msg['job_id']
@@ -274,13 +354,22 @@ class MoEWorker:
         expert_map = msg['expert_map']
         next_hop = msg.get('next_hop')
 
+        print(f"🟢 [ROUTER] Processing job {job_id[:8]}, layer_idx={layer_idx}, next_hop={next_hop}")
+        print(f"   Expert map: {expert_map}")
+        sys.stdout.flush()
+
         await self._ensure_model(model_id)
         ctx = await self._get_context(job_id, create=True)
 
+        print(f"   ⏳ Waiting for input tensor from P2P (timeout={P2P_TIMEOUT}s)...")
+        sys.stdout.flush()
+
         try:
             hidden_states = await asyncio.wait_for(ctx.input_queue.get(), timeout=P2P_TIMEOUT)
+            print(f"   ✅ Received input tensor. Shape: {hidden_states.shape}")
+            sys.stdout.flush()
         except asyncio.TimeoutError:
-            print(f"❌ [Job {job_id}] Router timed out waiting for input")
+            print(f"❌ [Job {job_id[:8]}] Router timed out waiting for input")
             sys.stdout.flush()
             return
 
@@ -290,6 +379,9 @@ class MoEWorker:
             self.moe_routers[layer_idx] = await self.loader.load_moe_router(model_id, layer_idx, self.device)
 
         top_k = getattr(self.model_config, "num_experts_per_tok", 2)
+
+        print(f"   🧮 Running router (top_k={top_k})...")
+        sys.stdout.flush()
 
         with torch.no_grad():
             router = self.moe_routers[layer_idx]
@@ -302,31 +394,57 @@ class MoEWorker:
             flat_indices = top_indices.view(-1)
 
         required_experts = torch.unique(flat_indices).tolist()
+        print(f"   ✅ Routing complete. Required experts: {required_experts}")
+        sys.stdout.flush()
+
         send_tasks = []
 
         for expert_idx in required_experts:
             target_url = expert_map.get(str(expert_idx))
-            if not target_url: continue
+            if not target_url:
+                print(f"   ⚠️ No URL for expert {expert_idx}")
+                sys.stdout.flush()
+                continue
 
             mask = (top_indices == expert_idx)
             rows, cols, _ = torch.where(mask)
             sliced = hidden_states[rows, cols, :]
+
+            print(f"   📤 Dispatching to expert {expert_idx} at {target_url} (slice shape: {sliced.shape})")
+            sys.stdout.flush()
 
             ctx.pending_expert_requests[expert_idx] = asyncio.Future()
             send_tasks.append(asyncio.create_task(self._send_p2p(f"{target_url}/tensor_in", {
                 "job_id": job_id, "type": "input", "tensor": self._encode_tensor(sliced)
             })))
 
-        if send_tasks: await asyncio.gather(*send_tasks)
+        if send_tasks:
+            print(f"   ⏳ Waiting for {len(send_tasks)} expert sends to complete...")
+            sys.stdout.flush()
+            await asyncio.gather(*send_tasks)
+            print(f"   ✅ All expert sends complete")
+            sys.stdout.flush()
 
         pending = list(ctx.pending_expert_requests.values())
         if pending:
-            await asyncio.wait_for(asyncio.gather(*pending), timeout=P2P_TIMEOUT)
+            print(f"   ⏳ Waiting for {len(pending)} expert results (timeout={P2P_TIMEOUT}s)...")
+            sys.stdout.flush()
+            try:
+                await asyncio.wait_for(asyncio.gather(*pending), timeout=P2P_TIMEOUT)
+                print(f"   ✅ All expert results received")
+                sys.stdout.flush()
+            except asyncio.TimeoutError:
+                print(f"❌ [Job {job_id[:8]}] Timed out waiting for expert results")
+                sys.stdout.flush()
+                return
 
         batch, seq, hidden = hidden_states.shape
         final_output = torch.zeros((batch, seq, hidden), dtype=torch.float16, device=self.device)
         top_weights = ctx.routing_weights.to(self.device)
         top_indices = ctx.selected_indices.to(self.device)
+
+        print(f"   🔧 Merging expert outputs...")
+        sys.stdout.flush()
 
         with torch.no_grad():
             for expert_idx, future in ctx.pending_expert_requests.items():
@@ -336,12 +454,25 @@ class MoEWorker:
                 w = top_weights[rows, cols, k_idx].unsqueeze(-1)
                 final_output.index_put_((rows, cols), res * w, accumulate=True)
 
+        print(f"   ✅ Expert outputs merged. Final shape: {final_output.shape}")
+        sys.stdout.flush()
+
         if next_hop:
+            print(f"   ➡️ Forwarding to next hop: {next_hop}")
+            sys.stdout.flush()
             await self._send_p2p(next_hop, {
                 "job_id": job_id, "type": "input", "tensor": self._encode_tensor(final_output)
             })
+            print(f"   ✅ Forwarded to next hop")
+            sys.stdout.flush()
+        else:
+            print(f"   ⚠️ No next_hop - job may be incomplete")
+            sys.stdout.flush()
 
-        if job_id in self.active_jobs: del self.active_jobs[job_id]
+        if job_id in self.active_jobs:
+            del self.active_jobs[job_id]
+            print(f"   🧹 Cleaned up job context for {job_id[:8]}")
+            sys.stdout.flush()
 
     async def process_moe_expert(self, msg, ws):
         job_id = msg['job_id']
@@ -350,13 +481,23 @@ class MoEWorker:
         expert_idx = msg['expert_idx']
         return_url = msg['return_url']
 
+        print(f"🟡 [EXPERT] Processing expert {expert_idx} for job {job_id[:8]}, layer_idx={layer_idx}")
+        print(f"   Return URL: {return_url}")
+        sys.stdout.flush()
+
         await self._ensure_model(model_id)
         ctx = await self._get_context(job_id, create=True)
 
+        print(f"   ⏳ Waiting for input tensor from P2P (timeout={P2P_TIMEOUT}s)...")
+        sys.stdout.flush()
+
         try:
             hidden_states = await asyncio.wait_for(ctx.input_queue.get(), timeout=P2P_TIMEOUT)
+            print(f"   ✅ Received input tensor. Shape: {hidden_states.shape}")
+            sys.stdout.flush()
         except asyncio.TimeoutError:
-            # print(f"❌ [Job {job_id}] Expert {expert_idx} timed out waiting for input")
+            print(f"❌ [Job {job_id[:8]}] Expert {expert_idx} timed out waiting for input")
+            sys.stdout.flush()
             return
 
         cache_key = (layer_idx, expert_idx)
@@ -365,14 +506,29 @@ class MoEWorker:
                 model_id, layer_idx, expert_idx, self.device
             )
 
+        print(f"   ⚙️ Running expert {expert_idx}...")
+        sys.stdout.flush()
+
         with torch.no_grad():
             output = self.moe_experts[cache_key](hidden_states.half())
+
+        print(f"   ✅ Expert {expert_idx} complete. Output shape: {output.shape}")
+        sys.stdout.flush()
+
+        print(f"   ⬅️ Sending result back to router at {return_url}")
+        sys.stdout.flush()
 
         await self._send_p2p(f"{return_url}/tensor_in", {
             "job_id": job_id, "type": "expert_result", "expert_idx": expert_idx, "tensor": self._encode_tensor(output)
         })
 
-        if job_id in self.active_jobs: del self.active_jobs[job_id]
+        print(f"   ✅ Result sent back to router")
+        sys.stdout.flush()
+
+        if job_id in self.active_jobs:
+            del self.active_jobs[job_id]
+            print(f"   🧹 Cleaned up job context for {job_id[:8]}")
+            sys.stdout.flush()
 
     async def run(self):
         await self.start_p2p_server()
@@ -382,7 +538,8 @@ class MoEWorker:
                 print(f"🔌 Connecting to {SCHEDULER_URL}...")
                 sys.stdout.flush()
                 async with websockets.connect(SCHEDULER_URL) as ws:
-                    print(f"✅ Connected. Reporting {self.vram_total_mb}MB VRAM")
+                    p2p_url = self.get_p2p_url()
+                    print(f"✅ Connected. Reporting {self.vram_total_mb}MB VRAM, P2P URL: {p2p_url}")
                     sys.stdout.flush()
                     await ws.send(json.dumps({
                         "type": "REGISTER",
@@ -390,17 +547,35 @@ class MoEWorker:
                             "pubkey": "Worker_" + os.urandom(4).hex(),
                             "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
                             "vram_mb": self.vram_total_mb,
-                            "p2p_url": self.get_p2p_url(),
+                            "p2p_url": p2p_url,
                             "capabilities": ["dense", "moe_router", "moe_expert"]
                         }
                     }))
+                    print(f"📡 Registration sent")
+                    sys.stdout.flush()
+
                     async for raw in ws:
                         msg = json.loads(raw)
-                        if msg['type'] == 'EXECUTE_DENSE': asyncio.create_task(self.process_dense(msg, ws))
-                        elif msg['type'] == 'EXECUTE_ROUTER': asyncio.create_task(self.process_moe_router(msg, ws))
-                        elif msg['type'] == 'EXECUTE_EXPERT': asyncio.create_task(self.process_moe_expert(msg, ws))
+                        msg_type = msg['type']
+                        job_id = msg.get('job_id', 'unknown')[:8]
+
+                        print(f"\n{'='*60}")
+                        print(f"📬 Received message: {msg_type} for job {job_id}")
+                        print(f"{'='*60}")
+                        sys.stdout.flush()
+
+                        if msg_type == 'EXECUTE_DENSE':
+                            asyncio.create_task(self.process_dense(msg, ws))
+                        elif msg_type == 'EXECUTE_ROUTER':
+                            asyncio.create_task(self.process_moe_router(msg, ws))
+                        elif msg_type == 'EXECUTE_EXPERT':
+                            asyncio.create_task(self.process_moe_expert(msg, ws))
+                        else:
+                            print(f"⚠️ Unknown message type: {msg_type}")
+                            sys.stdout.flush()
             except Exception as e:
                 print(f"❌ Error: {e}")
+                traceback.print_exc()
                 sys.stdout.flush()
                 await asyncio.sleep(5)
 

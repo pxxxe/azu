@@ -27,20 +27,24 @@ class JobContext:
     def __init__(self, job_id, input_shape=None):
         self.job_id = job_id
         self.input_queue = asyncio.Queue()
-        # FIX: Per-expert input queues so each expert task waits on its own channel.
-        # Previously all expert slices landed in the shared input_queue and were
-        # consumed in arbitrary order — experts got wrong tensors and one always starved.
-        self.expert_input_queues: Dict[int, asyncio.Queue] = {}
-        self.pending_expert_requests: Dict[int, asyncio.Future] = {}
+        # FIX (Bug 1): expert_input_queues and pending_expert_requests are now
+        # keyed by (layer_idx, expert_idx) tuples.  Previously they were keyed
+        # by bare expert_idx, so when _dispatch fired EXECUTE_ROUTER for all 32
+        # layers simultaneously, each layer's router task overwrote the previous
+        # layer's futures/queues in this shared context — layer 0's experts could
+        # never resolve and the job hung forever.
+        self.expert_input_queues: Dict[Tuple[int, int], asyncio.Queue] = {}
+        self.pending_expert_requests: Dict[Tuple[int, int], asyncio.Future] = {}
         self.routing_weights: torch.Tensor = None
         self.selected_indices: torch.Tensor = None
         self.original_shape = input_shape
 
-    def get_expert_queue(self, expert_idx: int) -> asyncio.Queue:
-        """Get or create the input queue for a specific expert."""
-        if expert_idx not in self.expert_input_queues:
-            self.expert_input_queues[expert_idx] = asyncio.Queue()
-        return self.expert_input_queues[expert_idx]
+    def get_expert_queue(self, layer_idx: int, expert_idx: int) -> asyncio.Queue:
+        """Get or create the input queue for a specific (layer, expert) pair."""
+        key = (layer_idx, expert_idx)
+        if key not in self.expert_input_queues:
+            self.expert_input_queues[key] = asyncio.Queue()
+        return self.expert_input_queues[key]
 
 class MoEWorker:
     def __init__(self):
@@ -131,16 +135,18 @@ class MoEWorker:
         ctx = await self._get_context(job_id, create=True)
 
         if msg_type == 'input':
-            # FIX: If expert_idx is present, this is a slice from a router destined
-            # for a specific expert. Route it to that expert's dedicated queue.
-            # Otherwise it's a regular layer-to-layer tensor; use the shared queue.
+            # FIX (Bug 1): Route expert tensors using the (layer_idx, expert_idx)
+            # composite key.  The router includes both fields in the P2P payload
+            # so we can land the tensor in the correct per-layer queue.
             expert_idx = data.get('expert_idx')
-            if expert_idx is not None:
-                queue = ctx.get_expert_queue(expert_idx)
-                print(f"   ➡️ Enqueueing input tensor for expert {expert_idx} of job {job_id[:8]}")
+            layer_idx = data.get('layer_idx')
+
+            if expert_idx is not None and layer_idx is not None:
+                queue = ctx.get_expert_queue(layer_idx, expert_idx)
+                print(f"   ➡️ Enqueueing input tensor for layer {layer_idx} expert {expert_idx} of job {job_id[:8]}")
                 sys.stdout.flush()
                 await queue.put(tensor)
-                print(f"   ✓ Expert {expert_idx} input enqueued (queue size: {queue.qsize()})")
+                print(f"   ✓ Layer {layer_idx} expert {expert_idx} input enqueued (queue size: {queue.qsize()})")
                 sys.stdout.flush()
             else:
                 print(f"   ➡️ Enqueueing input tensor for job {job_id[:8]}")
@@ -151,14 +157,19 @@ class MoEWorker:
 
         elif msg_type == 'expert_result':
             expert_idx = data.get('expert_idx')
-            print(f"   ⬅️ Received expert {expert_idx} result for job {job_id[:8]}")
+            layer_idx = data.get('layer_idx')
+            print(f"   ⬅️ Received expert {expert_idx} result for layer {layer_idx} job {job_id[:8]}")
             sys.stdout.flush()
-            if expert_idx is not None and expert_idx in ctx.pending_expert_requests:
-                future = ctx.pending_expert_requests[expert_idx]
-                if not future.done():
-                    future.set_result(tensor)
-                    print(f"   ✓ Expert {expert_idx} future resolved")
-                    sys.stdout.flush()
+
+            # FIX (Bug 1): Resolve the future keyed by (layer_idx, expert_idx).
+            if expert_idx is not None and layer_idx is not None:
+                key = (layer_idx, expert_idx)
+                if key in ctx.pending_expert_requests:
+                    future = ctx.pending_expert_requests[key]
+                    if not future.done():
+                        future.set_result(tensor)
+                        print(f"   ✓ Layer {layer_idx} expert {expert_idx} future resolved")
+                        sys.stdout.flush()
 
     async def handle_tensor_ingress(self, request):
         try:
@@ -411,13 +422,18 @@ class MoEWorker:
             weights = torch.softmax(logits, dim=-1)
             top_weights, top_indices = torch.topk(weights, k=top_k, dim=-1)
 
-            ctx.routing_weights = top_weights.cpu()
-            ctx.selected_indices = top_indices.cpu()
+            routing_weights = top_weights.cpu()
+            selected_indices = top_indices.cpu()
             flat_indices = top_indices.view(-1)
 
         required_experts = torch.unique(flat_indices).tolist()
         print(f"   ✅ Routing complete. Required experts: {required_experts}")
         sys.stdout.flush()
+
+        # FIX (Bug 1): Use LOCAL dicts for this layer's futures, not the shared ctx.
+        # Each router invocation owns its own set of futures so concurrent routers
+        # for different layers cannot clobber each other.
+        local_pending: Dict[int, asyncio.Future] = {}
 
         send_tasks = []
 
@@ -435,11 +451,21 @@ class MoEWorker:
             print(f"   📤 Dispatching to expert {expert_idx} at {target_url} (slice shape: {sliced.shape})")
             sys.stdout.flush()
 
-            ctx.pending_expert_requests[expert_idx] = asyncio.Future()
-            # FIX: Include expert_idx in the payload so process_ingress_data can route
-            # the tensor to the correct per-expert queue instead of the shared one.
+            future = asyncio.Future()
+            local_pending[expert_idx] = future
+            # Also register in ctx so process_ingress_data can find it via the
+            # (layer_idx, expert_idx) key when the expert result arrives.
+            ctx.pending_expert_requests[(layer_idx, expert_idx)] = future
+
+            # FIX (Bug 1): Include layer_idx in the payload so the receiving
+            # worker's process_ingress_data routes the tensor to the correct
+            # per-layer expert queue.
             send_tasks.append(asyncio.create_task(self._send_p2p(f"{target_url}/tensor_in", {
-                "job_id": job_id, "type": "input", "expert_idx": expert_idx, "tensor": self._encode_tensor(sliced)
+                "job_id": job_id,
+                "type": "input",
+                "layer_idx": layer_idx,
+                "expert_idx": expert_idx,
+                "tensor": self._encode_tensor(sliced)
             })))
 
         if send_tasks:
@@ -449,7 +475,7 @@ class MoEWorker:
             print(f"   ✅ All expert sends complete")
             sys.stdout.flush()
 
-        pending = list(ctx.pending_expert_requests.values())
+        pending = list(local_pending.values())
         if pending:
             print(f"   ⏳ Waiting for {len(pending)} expert results (timeout={P2P_TIMEOUT}s)...")
             sys.stdout.flush()
@@ -464,19 +490,23 @@ class MoEWorker:
 
         batch, seq, hidden = hidden_states.shape
         final_output = torch.zeros((batch, seq, hidden), dtype=torch.float16, device=self.device)
-        top_weights = ctx.routing_weights.to(self.device)
-        top_indices = ctx.selected_indices.to(self.device)
+        top_weights_dev = routing_weights.to(self.device)
+        top_indices_dev = selected_indices.to(self.device)
 
         print(f"   🔧 Merging expert outputs...")
         sys.stdout.flush()
 
         with torch.no_grad():
-            for expert_idx, future in ctx.pending_expert_requests.items():
+            for expert_idx, future in local_pending.items():
                 res = future.result().to(self.device)
-                mask = (top_indices == expert_idx)
+                mask = (top_indices_dev == expert_idx)
                 rows, cols, k_idx = torch.where(mask)
-                w = top_weights[rows, cols, k_idx].unsqueeze(-1)
+                w = top_weights_dev[rows, cols, k_idx].unsqueeze(-1)
                 final_output.index_put_((rows, cols), res * w, accumulate=True)
+
+        # Clean up this layer's futures from the shared ctx
+        for expert_idx in local_pending:
+            ctx.pending_expert_requests.pop((layer_idx, expert_idx), None)
 
         print(f"   ✅ Expert outputs merged. Final shape: {final_output.shape}")
         sys.stdout.flush()
@@ -493,10 +523,10 @@ class MoEWorker:
             print(f"   ⚠️ No next_hop - job may be incomplete")
             sys.stdout.flush()
 
-        if job_id in self.active_jobs:
-            del self.active_jobs[job_id]
-            print(f"   🧹 Cleaned up job context for {job_id[:8]}")
-            sys.stdout.flush()
+        # NOTE: We deliberately do NOT delete self.active_jobs[job_id] here.
+        # Other layers' routers and experts for this same job may still be running
+        # (they were all dispatched at once). The context stays alive until the
+        # dense decode node at the end of the pipeline cleans it up.
 
     async def process_moe_expert(self, msg, ws):
         job_id = msg['job_id']
@@ -512,13 +542,10 @@ class MoEWorker:
         await self._ensure_model(model_id)
         ctx = await self._get_context(job_id, create=True)
 
-        # FIX: Wait on this expert's dedicated queue, not the shared input_queue.
-        # The router will only enqueue a tensor here if it actually selected this expert.
-        # Experts not selected by the router will simply never receive a tensor and will
-        # be cleaned up when the job context is deleted — no timeout burn.
-        expert_queue = ctx.get_expert_queue(expert_idx)
+        # FIX (Bug 1): Wait on the (layer_idx, expert_idx)-scoped queue.
+        expert_queue = ctx.get_expert_queue(layer_idx, expert_idx)
 
-        print(f"   ⏳ Waiting for input tensor on expert queue {expert_idx} (timeout={P2P_TIMEOUT}s)...")
+        print(f"   ⏳ Waiting for input tensor on layer {layer_idx} expert queue {expert_idx} (timeout={P2P_TIMEOUT}s)...")
         sys.stdout.flush()
 
         try:
@@ -526,7 +553,7 @@ class MoEWorker:
             print(f"   ✅ Received input tensor. Shape: {hidden_states.shape}")
             sys.stdout.flush()
         except asyncio.TimeoutError:
-            print(f"⏭️ [Job {job_id[:8]}] Expert {expert_idx} not selected by router — exiting cleanly")
+            print(f"⏭️ [Job {job_id[:8]}] Expert {expert_idx} layer {layer_idx} not selected by router — exiting cleanly")
             sys.stdout.flush()
             return
 
@@ -548,17 +575,22 @@ class MoEWorker:
         print(f"   ⬅️ Sending result back to router at {return_url}")
         sys.stdout.flush()
 
+        # FIX (Bug 1): Include layer_idx in the expert_result payload so the
+        # router worker can resolve the correct (layer_idx, expert_idx) future.
         await self._send_p2p(f"{return_url}/tensor_in", {
-            "job_id": job_id, "type": "expert_result", "expert_idx": expert_idx, "tensor": self._encode_tensor(output)
+            "job_id": job_id,
+            "type": "expert_result",
+            "layer_idx": layer_idx,
+            "expert_idx": expert_idx,
+            "tensor": self._encode_tensor(output)
         })
 
         print(f"   ✅ Result sent back to router")
         sys.stdout.flush()
 
-        if job_id in self.active_jobs:
-            del self.active_jobs[job_id]
-            print(f"   🧹 Cleaned up job context for {job_id[:8]}")
-            sys.stdout.flush()
+        # FIX (Bug 3): Experts must NOT delete the job context.  The context is
+        # shared across all layers' routers and experts for this job.  Only the
+        # final dense (decode) node cleans it up after the pipeline completes.
 
     async def run(self):
         await self.start_p2p_server()

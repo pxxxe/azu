@@ -43,13 +43,13 @@ class MoEScheduler:
         wid = specs['pubkey']
         vram = specs.get('vram_mb', 24000)
         self.workers[wid] = WorkerState(pubkey=wid, ws=ws, specs=specs, vram_total_mb=vram)
-        print(f"✅ Registered: {wid[:8]} | VRAM: {vram}MB")
+        print(f"✅ Registered: {wid} | VRAM: {vram}MB")
         return wid
 
     async def unregister_worker(self, wid: str):
         if wid in self.workers:
             del self.workers[wid]
-            print(f"❌ Worker {wid[:8]} disconnected")
+            print(f"❌ Worker {wid} disconnected")
 
     def _find_best_worker(self, size_mb: int, previous_worker_id: str = None, cache_key: str = None) -> Optional[WorkerState]:
         candidates = list(self.workers.values())
@@ -105,7 +105,12 @@ class MoEScheduler:
             if l_type == 'moe':
                 node['expert_map'] = {}
                 num_experts = layer.get('num_experts', 0)
-                expert_size = layer.get('total_size_mb', 0) / max(1, num_experts)
+                # FIX (Bug 2): The registry writes total expert size into the
+                # 'size_mb' field of layer_metadata.  This code previously read
+                # 'total_size_mb' which does not exist, so it always got 0 —
+                # experts were placed with zero VRAM cost and the planner's
+                # capacity tracking was completely broken.
+                expert_size = layer.get('size_mb', 0) / max(1, num_experts)
 
                 for exp_idx in range(num_experts):
                     exp_key = f"{model_info['model_id']}:{layer_idx}:expert:{exp_idx}"

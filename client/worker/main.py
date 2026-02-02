@@ -593,6 +593,17 @@ class MoEWorker:
         # shared across all layers' routers and experts for this job.  Only the
         # final dense (decode) node cleans it up after the pipeline completes.
 
+
+    async def _safe_task_wrapper(self, coro, task_name):
+        """Wrapper that ensures exceptions in tasks are logged"""
+        try:
+            await coro
+        except Exception as e:
+            print(f"❌ TASK ERROR in {task_name}: {e}")
+            traceback.print_exc()
+            sys.stdout.flush()
+
+
     async def run(self):
         await self.start_p2p_server()
         import gc
@@ -628,11 +639,14 @@ class MoEWorker:
                         sys.stdout.flush()
 
                         if msg_type == 'EXECUTE_DENSE':
-                            asyncio.create_task(self.process_dense(msg, ws))
+                            asyncio.create_task(self._safe_task_wrapper(
+                                self.process_dense(msg, ws), f"EXECUTE_DENSE-{job_id}"))
                         elif msg_type == 'EXECUTE_ROUTER':
-                            asyncio.create_task(self.process_moe_router(msg, ws))
+                            asyncio.create_task(self._safe_task_wrapper(
+                                self.process_moe_router(msg, ws), f"EXECUTE_ROUTER-{job_id}"))
                         elif msg_type == 'EXECUTE_EXPERT':
-                            asyncio.create_task(self.process_moe_expert(msg, ws))
+                            asyncio.create_task(self._safe_task_wrapper(
+                                self.process_moe_expert(msg, ws), f"EXECUTE_EXPERT-{job_id}"))
                         else:
                             print(f"⚠️ Unknown message type: {msg_type}")
                             sys.stdout.flush()

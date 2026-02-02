@@ -14,27 +14,48 @@ class LayerLoader:
         self.loaded_cache = {}  # RAM cache
 
     async def _download(self, url: str, path: Path):
-        """Helper to download a file from Registry to Worker Disk"""
+        """Helper to download a file from Registry to Worker Disk (STREAMING)"""
         if path.exists():
-            return
+            # Simple check for empty files from failed runs
+            if path.stat().st_size > 0:
+                return
+            else:
+                print(f"   ⚠️ Found 0-byte file {path.name}, removing...")
+                os.remove(path)
 
         print(f"   ⬇️ Downloading {url}...")
         sys.stdout.flush()
-        print("Fully downloaded")
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    raise Exception(f"Download failed [{resp.status}]: {url}")
-                data = await resp.read()
+        # Timeout: Connect fast (10s), but allow time for large file transfer (600s)
+        timeout = aiohttp.ClientTimeout(total=600, connect=10)
+        temp = path.with_suffix('.tmp')
 
-                # Atomic write
-                print("Writing to disk")
-                temp = path.with_suffix('.tmp')
-                with open(temp, 'wb') as f:
-                    f.write(data)
-                os.rename(temp, path)
-                print("Written to disk")
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        raise Exception(f"Download failed [{resp.status}]: {url}")
+
+                    # STREAMING DOWNLOAD (Chunked)
+                    with open(temp, 'wb') as f:
+                        downloaded = 0
+                        async for chunk in resp.content.iter_chunked(1024 * 1024): # 1MB chunks
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            # Optional: print dots for life signs on large files
+                            # sys.stdout.write(".")
+                            # sys.stdout.flush()
+
+            # Atomic Move
+            os.rename(temp, path)
+            print(f"   ✅ Downloaded {path.name} ({downloaded / (1024*1024):.2f} MB)")
+            sys.stdout.flush()
+
+        except Exception as e:
+            print(f"   ❌ Error downloading {url}: {e}")
+            sys.stdout.flush()
+            if os.path.exists(temp): os.remove(temp)
+            raise e
 
     def _get_layer_class(self, config):
         """

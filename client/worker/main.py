@@ -27,10 +27,20 @@ class JobContext:
     def __init__(self, job_id, input_shape=None):
         self.job_id = job_id
         self.input_queue = asyncio.Queue()
+        # FIX: Per-expert input queues so each expert task waits on its own channel.
+        # Previously all expert slices landed in the shared input_queue and were
+        # consumed in arbitrary order — experts got wrong tensors and one always starved.
+        self.expert_input_queues: Dict[int, asyncio.Queue] = {}
         self.pending_expert_requests: Dict[int, asyncio.Future] = {}
         self.routing_weights: torch.Tensor = None
         self.selected_indices: torch.Tensor = None
         self.original_shape = input_shape
+
+    def get_expert_queue(self, expert_idx: int) -> asyncio.Queue:
+        """Get or create the input queue for a specific expert."""
+        if expert_idx not in self.expert_input_queues:
+            self.expert_input_queues[expert_idx] = asyncio.Queue()
+        return self.expert_input_queues[expert_idx]
 
 class MoEWorker:
     def __init__(self):
@@ -121,11 +131,23 @@ class MoEWorker:
         ctx = await self._get_context(job_id, create=True)
 
         if msg_type == 'input':
-            print(f"   ➡️ Enqueueing input tensor for job {job_id[:8]}")
-            sys.stdout.flush()
-            await ctx.input_queue.put(tensor)
-            print(f"   ✓ Input tensor enqueued (queue size: {ctx.input_queue.qsize()})")
-            sys.stdout.flush()
+            # FIX: If expert_idx is present, this is a slice from a router destined
+            # for a specific expert. Route it to that expert's dedicated queue.
+            # Otherwise it's a regular layer-to-layer tensor; use the shared queue.
+            expert_idx = data.get('expert_idx')
+            if expert_idx is not None:
+                queue = ctx.get_expert_queue(expert_idx)
+                print(f"   ➡️ Enqueueing input tensor for expert {expert_idx} of job {job_id[:8]}")
+                sys.stdout.flush()
+                await queue.put(tensor)
+                print(f"   ✓ Expert {expert_idx} input enqueued (queue size: {queue.qsize()})")
+                sys.stdout.flush()
+            else:
+                print(f"   ➡️ Enqueueing input tensor for job {job_id[:8]}")
+                sys.stdout.flush()
+                await ctx.input_queue.put(tensor)
+                print(f"   ✓ Input tensor enqueued (queue size: {ctx.input_queue.qsize()})")
+                sys.stdout.flush()
 
         elif msg_type == 'expert_result':
             expert_idx = data.get('expert_idx')
@@ -414,8 +436,10 @@ class MoEWorker:
             sys.stdout.flush()
 
             ctx.pending_expert_requests[expert_idx] = asyncio.Future()
+            # FIX: Include expert_idx in the payload so process_ingress_data can route
+            # the tensor to the correct per-expert queue instead of the shared one.
             send_tasks.append(asyncio.create_task(self._send_p2p(f"{target_url}/tensor_in", {
-                "job_id": job_id, "type": "input", "tensor": self._encode_tensor(sliced)
+                "job_id": job_id, "type": "input", "expert_idx": expert_idx, "tensor": self._encode_tensor(sliced)
             })))
 
         if send_tasks:
@@ -488,15 +512,21 @@ class MoEWorker:
         await self._ensure_model(model_id)
         ctx = await self._get_context(job_id, create=True)
 
-        print(f"   ⏳ Waiting for input tensor from P2P (timeout={P2P_TIMEOUT}s)...")
+        # FIX: Wait on this expert's dedicated queue, not the shared input_queue.
+        # The router will only enqueue a tensor here if it actually selected this expert.
+        # Experts not selected by the router will simply never receive a tensor and will
+        # be cleaned up when the job context is deleted — no timeout burn.
+        expert_queue = ctx.get_expert_queue(expert_idx)
+
+        print(f"   ⏳ Waiting for input tensor on expert queue {expert_idx} (timeout={P2P_TIMEOUT}s)...")
         sys.stdout.flush()
 
         try:
-            hidden_states = await asyncio.wait_for(ctx.input_queue.get(), timeout=P2P_TIMEOUT)
+            hidden_states = await asyncio.wait_for(expert_queue.get(), timeout=P2P_TIMEOUT)
             print(f"   ✅ Received input tensor. Shape: {hidden_states.shape}")
             sys.stdout.flush()
         except asyncio.TimeoutError:
-            print(f"❌ [Job {job_id[:8]}] Expert {expert_idx} timed out waiting for input")
+            print(f"⏭️ [Job {job_id[:8]}] Expert {expert_idx} not selected by router — exiting cleanly")
             sys.stdout.flush()
             return
 

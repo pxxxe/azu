@@ -18,9 +18,12 @@ class LayerLoader:
         if path.exists():
             # Simple check for empty files from failed runs
             if path.stat().st_size > 0:
+                print(f"   ✓ Using cached {path.name}")
+                sys.stdout.flush()
                 return
             else:
                 print(f"   ⚠️ Found 0-byte file {path.name}, removing...")
+                sys.stdout.flush()
                 os.remove(path)
 
         print(f"   ⬇️ Downloading {url}...")
@@ -42,9 +45,10 @@ class LayerLoader:
                         async for chunk in resp.content.iter_chunked(1024 * 1024): # 1MB chunks
                             f.write(chunk)
                             downloaded += len(chunk)
-                            # Optional: print dots for life signs on large files
-                            # sys.stdout.write(".")
-                            # sys.stdout.flush()
+                            # Print progress every 50MB
+                            if downloaded % (50 * 1024 * 1024) == 0:
+                                print(f"      ...{downloaded / (1024*1024):.0f}MB downloaded...")
+                                sys.stdout.flush()
 
             # Atomic Move
             os.rename(temp, path)
@@ -54,7 +58,8 @@ class LayerLoader:
         except Exception as e:
             print(f"   ❌ Error downloading {url}: {e}")
             sys.stdout.flush()
-            if os.path.exists(temp): os.remove(temp)
+            if os.path.exists(temp):
+                os.remove(temp)
             raise e
 
     def _get_layer_class(self, config):
@@ -146,6 +151,9 @@ class LayerLoader:
         # Get config
         config_path = self.cache_dir / f"{sanitized}_config.json"
         await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+
+        print(f"   📋 Loading config from {config_path}...")
+        sys.stdout.flush()
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
         # Download dense layer
@@ -153,14 +161,24 @@ class LayerLoader:
         path = self.cache_dir / f"{sanitized}_{filename}"
         await self._download(f"{self.registry_url}/layers/{sanitized}/{filename}", path)
 
+        print(f"   🔧 Creating layer class and loading weights...")
+        sys.stdout.flush()
+
         # Create layer on GPU
         LayerClass = self._get_layer_class(config)
         layer = LayerClass(config, layer_idx=layer_idx).to(device).half()
 
         # Load weights - strict=False for robustness
+        print(f"   📥 torch.load({path.name})...")
+        sys.stdout.flush()
         state_dict = torch.load(path, map_location=device)
+        print(f"   ✓ Loaded state dict, applying to model...")
+        sys.stdout.flush()
         layer.load_state_dict(state_dict, strict=False)
         layer.eval()
+
+        print(f"   ✅ Dense layer {layer_idx} ready")
+        sys.stdout.flush()
 
         self.loaded_cache[cache_key] = layer
         return layer
@@ -179,6 +197,9 @@ class LayerLoader:
         # Get config
         config_path = self.cache_dir / f"{sanitized}_config.json"
         await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+
+        print(f"   📋 Loading config from {config_path}...")
+        sys.stdout.flush()
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
         # Download router
@@ -191,12 +212,22 @@ class LayerLoader:
         num_experts = getattr(config, 'num_local_experts', 8)  # Default to 8
         hidden_size = config.hidden_size
 
+        print(f"   🔧 Creating router ({hidden_size} -> {num_experts})...")
+        sys.stdout.flush()
+
         router = torch.nn.Linear(hidden_size, num_experts, bias=False).to(device).half()
 
         # Load weights - strict=False
+        print(f"   📥 torch.load({path.name})...")
+        sys.stdout.flush()
         state_dict = torch.load(path, map_location=device)
+        print(f"   ✓ Loaded state dict, applying to model...")
+        sys.stdout.flush()
         router.load_state_dict(state_dict, strict=False)
         router.eval()
+
+        print(f"   ✅ Router ready")
+        sys.stdout.flush()
 
         self.loaded_cache[cache_key] = router
         return router
@@ -215,6 +246,9 @@ class LayerLoader:
         # Get config
         config_path = self.cache_dir / f"{sanitized}_config.json"
         await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+
+        print(f"   📋 Loading config from {config_path}...")
+        sys.stdout.flush()
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
         # Download expert
@@ -222,57 +256,71 @@ class LayerLoader:
         path = self.cache_dir / f"{sanitized}_{filename}"
         await self._download(f"{self.registry_url}/layers/{sanitized}/{filename}", path)
 
-        # Create expert module (standard FFN for most MoE models)
-        intermediate_size = config.intermediate_size
+        # Create expert FFN
         hidden_size = config.hidden_size
+        intermediate_size = config.intermediate_size
+
+        print(f"   🔧 Creating expert FFN...")
+        sys.stdout.flush()
 
         class ExpertFFN(torch.nn.Module):
             def __init__(self, hidden_size, intermediate_size):
                 super().__init__()
-                self.gate_proj = torch.nn.Linear(hidden_size, intermediate_size, bias=False)
-                self.up_proj = torch.nn.Linear(hidden_size, intermediate_size, bias=False)
-                self.down_proj = torch.nn.Linear(intermediate_size, hidden_size, bias=False)
+                self.w1 = torch.nn.Linear(hidden_size, intermediate_size, bias=False)
+                self.w2 = torch.nn.Linear(intermediate_size, hidden_size, bias=False)
+                self.w3 = torch.nn.Linear(hidden_size, intermediate_size, bias=False)
                 self.act_fn = torch.nn.SiLU()
 
             def forward(self, x):
-                return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+                return self.w2(self.act_fn(self.w1(x)) * self.w3(x))
 
         expert = ExpertFFN(hidden_size, intermediate_size).to(device).half()
 
         # Load weights - strict=False
+        print(f"   📥 torch.load({path.name})...")
+        sys.stdout.flush()
         state_dict = torch.load(path, map_location=device)
+        print(f"   ✓ Loaded state dict, applying to model...")
+        sys.stdout.flush()
         expert.load_state_dict(state_dict, strict=False)
         expert.eval()
+
+        print(f"   ✅ Expert {expert_idx} ready")
+        sys.stdout.flush()
 
         self.loaded_cache[cache_key] = expert
         return expert
 
-    async def load_shared_expert(self, model_id: str, layer_idx: int, device="cuda"):
-        """Load the shared expert for models that have one (like DeepSeek-V2)."""
+    async def load_moe_shared_expert(self, model_id: str, layer_idx: int, device="cuda"):
+        """Load the shared expert FFN (Qwen2-MoE specific)."""
         cache_key = f"{model_id}:shared_expert:{layer_idx}"
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
+
+        print(f"📦 Loading shared expert for MoE layer {layer_idx}...")
+        sys.stdout.flush()
 
         sanitized = model_id.replace("/", "_")
 
         # Get config
         config_path = self.cache_dir / f"{sanitized}_config.json"
         await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+
+        print(f"   📋 Loading config from {config_path}...")
+        sys.stdout.flush()
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
-        # Check if file exists
+        # Download shared expert
         filename = f"layer_{layer_idx}_shared_expert.pt"
         path = self.cache_dir / f"{sanitized}_{filename}"
+        await self._download(f"{self.registry_url}/layers/{sanitized}/{filename}", path)
 
-        try:
-            await self._download(f"{self.registry_url}/layers/{sanitized}/{filename}", path)
-        except:
-            # No shared expert
-            return None
-
-        # Create shared expert (same structure as regular expert)
-        intermediate_size = getattr(config, 'shared_expert_intermediate_size', config.intermediate_size)
+        # Create shared expert FFN
         hidden_size = config.hidden_size
+        intermediate_size = getattr(config, "shared_expert_intermediate_size", config.intermediate_size)
+
+        print(f"   🔧 Creating shared expert FFN...")
+        sys.stdout.flush()
 
         class SharedExpertFFN(torch.nn.Module):
             def __init__(self, hidden_size, intermediate_size):
@@ -288,9 +336,16 @@ class LayerLoader:
         shared_expert = SharedExpertFFN(hidden_size, intermediate_size).to(device).half()
 
         # Load weights - strict=False
+        print(f"   📥 torch.load({path.name})...")
+        sys.stdout.flush()
         state_dict = torch.load(path, map_location=device)
+        print(f"   ✓ Loaded state dict, applying to model...")
+        sys.stdout.flush()
         shared_expert.load_state_dict(state_dict, strict=False)
         shared_expert.eval()
+
+        print(f"   ✅ Shared expert ready")
+        sys.stdout.flush()
 
         self.loaded_cache[cache_key] = shared_expert
         return shared_expert
@@ -298,19 +353,43 @@ class LayerLoader:
     async def load_embeddings(self, model_id: str, device="cuda"):
         cache_key = f"{model_id}:embeddings"
         if cache_key in self.loaded_cache:
+            print(f"   ✓ Using cached embeddings")
+            sys.stdout.flush()
             return self.loaded_cache[cache_key]
 
+        print(f"📦 Loading embeddings for {model_id}...")
+        sys.stdout.flush()
+
         sanitized = model_id.replace("/", "_")
-        path = self.cache_dir / f"{sanitized}_embeddings.pt"
 
-        await self._download(f"{self.registry_url}/layers/{sanitized}/embeddings.pt", path)
-
+        # CRITICAL FIX: Download config FIRST before embeddings
         config_path = self.cache_dir / f"{sanitized}_config.json"
+        await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+
+        print(f"   📋 Loading config from {config_path}...")
+        sys.stdout.flush()
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
+        # Now download embeddings
+        path = self.cache_dir / f"{sanitized}_embeddings.pt"
+        await self._download(f"{self.registry_url}/layers/{sanitized}/embeddings.pt", path)
+
+        print(f"   🔧 Creating embedding layer (vocab={config.vocab_size}, dim={config.hidden_size})...")
+        sys.stdout.flush()
+
         emb = torch.nn.Embedding(config.vocab_size, config.hidden_size).to(device).half()
-        emb.load_state_dict(torch.load(path, map_location=device))
+
+        print(f"   📥 torch.load({path.name})...")
+        sys.stdout.flush()
+        state_dict = torch.load(path, map_location=device)
+
+        print(f"   ✓ Loaded state dict ({len(state_dict)} keys), applying to model...")
+        sys.stdout.flush()
+        emb.load_state_dict(state_dict)
         emb.eval()
+
+        print(f"   ✅ Embeddings ready")
+        sys.stdout.flush()
 
         self.loaded_cache[cache_key] = emb
         return emb
@@ -318,19 +397,43 @@ class LayerLoader:
     async def load_lm_head(self, model_id: str, device="cuda"):
         cache_key = f"{model_id}:lm_head"
         if cache_key in self.loaded_cache:
+            print(f"   ✓ Using cached LM head")
+            sys.stdout.flush()
             return self.loaded_cache[cache_key]
 
+        print(f"📦 Loading LM head for {model_id}...")
+        sys.stdout.flush()
+
         sanitized = model_id.replace("/", "_")
-        path = self.cache_dir / f"{sanitized}_lm_head.pt"
 
-        await self._download(f"{self.registry_url}/layers/{sanitized}/lm_head.pt", path)
-
+        # Download config first
         config_path = self.cache_dir / f"{sanitized}_config.json"
+        await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+
+        print(f"   📋 Loading config from {config_path}...")
+        sys.stdout.flush()
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
+        # Now download LM head
+        path = self.cache_dir / f"{sanitized}_lm_head.pt"
+        await self._download(f"{self.registry_url}/layers/{sanitized}/lm_head.pt", path)
+
+        print(f"   🔧 Creating LM head (dim={config.hidden_size} -> vocab={config.vocab_size})...")
+        sys.stdout.flush()
+
         head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False).to(device).half()
-        head.load_state_dict(torch.load(path, map_location=device))
+
+        print(f"   📥 torch.load({path.name})...")
+        sys.stdout.flush()
+        state_dict = torch.load(path, map_location=device)
+
+        print(f"   ✓ Loaded state dict ({len(state_dict)} keys), applying to model...")
+        sys.stdout.flush()
+        head.load_state_dict(state_dict)
         head.eval()
+
+        print(f"   ✅ LM head ready")
+        sys.stdout.flush()
 
         self.loaded_cache[cache_key] = head
         return head

@@ -338,7 +338,8 @@ class MoEWorker:
             with torch.no_grad():
                 hidden_states = hidden_states.half()
                 hidden_states = self.dense_layers[layer_idx](hidden_states)
-                if isinstance(hidden_states, tuple): hidden_states = hidden_states[0]
+                if isinstance(hidden_states, tuple):
+                    hidden_states = hidden_states[0]
             print(f"   ✅ Dense layer {layer_idx} complete. Output shape: {hidden_states.shape}")
             sys.stdout.flush()
 
@@ -357,24 +358,44 @@ class MoEWorker:
             print(f"   🎉 Generated output: '{output_text}'")
             sys.stdout.flush()
 
-            result_msg = {"type": "RESULT", "job_id": job_id, "status": "completed", "output": output_text}
+            result_msg = {
+                "type": "RESULT",
+                "job_id": job_id,
+                "status": "completed",
+                "output": output_text
+            }
             print(f"   📡 Sending result to scheduler: {result_msg}")
             sys.stdout.flush()
             await ws.send(json.dumps(result_msg))
             print(f"   ✅ Result sent")
             sys.stdout.flush()
+
         elif next_hop:
             print(f"   ➡️ Forwarding to next hop: {next_hop}")
             sys.stdout.flush()
             await self._send_p2p(next_hop, {
-                "job_id": job_id, "type": "input", "tensor": self._encode_tensor(hidden_states)
+                "job_id": job_id,
+                "type": "input",
+                "tensor": self._encode_tensor(hidden_states)
             })
             print(f"   ✅ Forwarded to next hop")
             sys.stdout.flush()
+
+            # ✅ CRITICAL FIX: Notify scheduler that this layer is complete
+            # This triggers the scheduler to dispatch the next layer
+            await ws.send(json.dumps({
+                "type": "LAYER_COMPLETE",
+                "job_id": job_id,
+                "layer_idx": layer_idx
+            }))
+            print(f"   ✅ Notified scheduler of layer completion")
+            sys.stdout.flush()
+
         else:
             print(f"   ⚠️ No next_hop and not last layer - job may be incomplete")
             sys.stdout.flush()
 
+        # Cleanup
         if msg.get('is_last'):
             if job_id in self.active_jobs:
                 del self.active_jobs[job_id]
@@ -407,35 +428,28 @@ class MoEWorker:
             sys.stdout.flush()
             return
 
-        hidden_states = hidden_states.half()
-
+        # Load router
         if layer_idx not in self.moe_routers:
-            self.moe_routers[layer_idx] = await self.loader.load_moe_router(model_id, layer_idx, self.device)
+            self.moe_routers[layer_idx] = await self.loader.load_moe_router(
+                model_id, layer_idx, self.device
+            )
 
-        top_k = getattr(self.model_config, "num_experts_per_tok", 2)
-
-        print(f"   🧮 Running router (top_k={top_k})...")
+        print(f"   ⚙️ Running router...")
         sys.stdout.flush()
 
         with torch.no_grad():
-            router = self.moe_routers[layer_idx]
-            logits = router(hidden_states)
-            weights = torch.softmax(logits, dim=-1)
-            top_weights, top_indices = torch.topk(weights, k=top_k, dim=-1)
+            routing_logits = self.moe_routers[layer_idx](hidden_states.half())
+            routing_weights, selected_indices = torch.topk(routing_logits, k=2, dim=-1)
+            routing_weights = torch.nn.functional.softmax(routing_weights, dim=-1)
 
-            routing_weights = top_weights.cpu()
-            selected_indices = top_indices.cpu()
-            flat_indices = top_indices.view(-1)
+        top_indices = selected_indices.cpu()
+        required_experts = set(top_indices.flatten().tolist())
 
-        required_experts = torch.unique(flat_indices).tolist()
-        print(f"   ✅ Routing complete. Required experts: {required_experts}")
+        print(f"   ✅ Routing complete. Selected experts: {sorted(required_experts)}")
         sys.stdout.flush()
 
-        # FIX (Bug 1): Use LOCAL dicts for this layer's futures, not the shared ctx.
-        # Each router invocation owns its own set of futures so concurrent routers
-        # for different layers cannot clobber each other.
+        # Create per-router futures dict
         local_pending: Dict[int, asyncio.Future] = {}
-
         send_tasks = []
 
         for expert_idx in required_experts:
@@ -454,13 +468,8 @@ class MoEWorker:
 
             future = asyncio.Future()
             local_pending[expert_idx] = future
-            # Also register in ctx so process_ingress_data can find it via the
-            # (layer_idx, expert_idx) key when the expert result arrives.
             ctx.pending_expert_requests[(layer_idx, expert_idx)] = future
 
-            # FIX (Bug 1): Include layer_idx in the payload so the receiving
-            # worker's process_ingress_data routes the tensor to the correct
-            # per-layer expert queue.
             send_tasks.append(asyncio.create_task(self._send_p2p(f"{target_url}/tensor_in", {
                 "job_id": job_id,
                 "type": "input",
@@ -489,6 +498,7 @@ class MoEWorker:
                 sys.stdout.flush()
                 return
 
+        # Merge expert outputs
         batch, seq, hidden = hidden_states.shape
         final_output = torch.zeros((batch, seq, hidden), dtype=torch.float16, device=self.device)
         top_weights_dev = routing_weights.to(self.device)
@@ -505,29 +515,37 @@ class MoEWorker:
                 w = top_weights_dev[rows, cols, k_idx].unsqueeze(-1)
                 final_output.index_put_((rows, cols), res * w, accumulate=True)
 
-        # Clean up this layer's futures from the shared ctx
+        # Clean up futures
         for expert_idx in local_pending:
             ctx.pending_expert_requests.pop((layer_idx, expert_idx), None)
 
         print(f"   ✅ Expert outputs merged. Final shape: {final_output.shape}")
         sys.stdout.flush()
 
+        # Forward to next layer
         if next_hop:
             print(f"   ➡️ Forwarding to next hop: {next_hop}")
             sys.stdout.flush()
             await self._send_p2p(next_hop, {
-                "job_id": job_id, "type": "input", "tensor": self._encode_tensor(final_output)
+                "job_id": job_id,
+                "type": "input",
+                "tensor": self._encode_tensor(final_output)
             })
             print(f"   ✅ Forwarded to next hop")
             sys.stdout.flush()
+
+            # ✅ CRITICAL FIX: Notify scheduler that this layer is complete
+            await ws.send(json.dumps({
+                "type": "LAYER_COMPLETE",
+                "job_id": job_id,
+                "layer_idx": layer_idx
+            }))
+            print(f"   ✅ Notified scheduler of layer completion")
+            sys.stdout.flush()
+
         else:
             print(f"   ⚠️ No next_hop - job may be incomplete")
             sys.stdout.flush()
-
-        # NOTE: We deliberately do NOT delete self.active_jobs[job_id] here.
-        # Other layers' routers and experts for this same job may still be running
-        # (they were all dispatched at once). The context stays alive until the
-        # dense decode node at the end of the pipeline cleans it up.
 
     async def process_moe_expert(self, msg, ws):
         job_id = msg['job_id']

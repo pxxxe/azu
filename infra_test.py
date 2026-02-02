@@ -285,7 +285,7 @@ def main():
             'P2P_URL_TEMPLATE': 'https://{RUNPOD_POD_ID}-8003.proxy.runpod.net'
         }
 
-        for i in range(2):
+        for i in range(4):
             wid = deploy_with_fallback(f"azu-worker-{i}", WORKER_IMG, worker_env)
             worker_ids.append(wid)
 

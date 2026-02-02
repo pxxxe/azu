@@ -375,10 +375,11 @@ class MoEWorker:
             print(f"   ⚠️ No next_hop and not last layer - job may be incomplete")
             sys.stdout.flush()
 
-        if job_id in self.active_jobs:
-            del self.active_jobs[job_id]
-            print(f"   🧹 Cleaned up job context for {job_id[:8]}")
-            sys.stdout.flush()
+        if msg.get('is_last'):
+            if job_id in self.active_jobs:
+                del self.active_jobs[job_id]
+                print(f"   🧹 Cleaned up job context for {job_id[:8]}")
+                sys.stdout.flush()
 
     async def process_moe_router(self, msg, ws):
         job_id = msg['job_id']

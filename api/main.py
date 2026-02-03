@@ -48,8 +48,8 @@ async def submit(req: JobReq):
     job_id = str(uuid.uuid4())
     job = {
         "id": job_id,
-        "model": req.model_id,
-        "input": req.prompt,
+        "model_id": req.model_id,
+        "input_prompt": req.prompt,
         "tokens": req.est_tokens,
         "owner": req.user_pubkey,
         "cost": 0 # Will be filled post-run

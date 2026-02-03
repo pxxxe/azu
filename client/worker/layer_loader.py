@@ -18,7 +18,7 @@ class LayerLoader:
         # --- FIX START: Concurrency & IO Control ---
         # 1. ThreadPool for blocking torch.load (CPU bound + Disk Read)
         #    prevents the event loop from freezing during 500MB+ loads.
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=32)
 
         # 2. Semaphore for Network/Disk Write concurrency
         #    prevents opening 300+ SSL sockets simultaneously.

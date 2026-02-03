@@ -58,6 +58,7 @@ class MoEWorker:
         self.loaded_model_id = None
         self.model_config = None
         self.current_model = None
+        self.p2p_session = None
 
         # Hardware Specs
         if torch.cuda.is_available():
@@ -78,6 +79,7 @@ class MoEWorker:
         self.lm_head = None
         self._context_lock = asyncio.Lock()
 
+
     def get_p2p_url(self):
         if os.getenv("P2P_PUBLIC_URL"):
             return os.getenv("P2P_PUBLIC_URL").strip("/")
@@ -96,13 +98,15 @@ class MoEWorker:
 
     # --- P2P SERVER ---
     async def start_p2p_server(self):
-        app = web.Application()
+        # FIX: Set client_max_size to None (Unlimited) or 1GB.
+        # Default is 1MB, which rejects MoE tensor payloads causing the "stall".
+        app = web.Application(client_max_size=1024**3)
         app.router.add_post('/tensor_in', self.handle_tensor_ingress)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, '0.0.0.0', 8003)
         await site.start()
-        print("👂 [P2P] Server listening on :8003")
+        print("👂 [P2P] Server listening on :8003 (Max Payload: 1GB)")
         sys.stdout.flush()
 
     def _decode_tensor(self, b64_str):
@@ -217,23 +221,28 @@ class MoEWorker:
                 return
 
         # 2. Actual Network Transfer
+        if self.p2p_session is None or self.p2p_session.closed:
+            timeout = aiohttp.ClientTimeout(total=60, connect=10)
+            connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
+            self.p2p_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+
         print(f"   🌐 Sending over network to {url}")
         sys.stdout.flush()
         for attempt in range(3):
             try:
-                async with aiohttp.ClientSession() as sess:
-                    async with sess.post(url, json=payload, timeout=30) as resp:
-                        if resp.status == 200:
-                            print(f"   ✅ Network send successful (attempt {attempt + 1})")
-                            sys.stdout.flush()
-                            return
-                        else:
-                            print(f"   ⚠️ Got status {resp.status} (attempt {attempt + 1})")
-                            sys.stdout.flush()
+                # Use the persistent session
+                async with self.p2p_session.post(url, json=payload) as resp:
+                    if resp.status == 200:
+                        # Success - handshake completed and data accepted
+                        return
+                    else:
+                        text = await resp.text()
+                        print(f"   ⚠️ P2P Handshake Rejected {resp.status}: {text[:100]}")
+                        sys.stdout.flush()
             except Exception as e:
-                print(f"   ⚠️ Send failed (attempt {attempt + 1}): {e}")
+                print(f"   ⚠️ Connection Failed (attempt {attempt + 1}): {e}")
                 sys.stdout.flush()
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.2)
 
         print(f"❌ Failed to send to {url} after 3 attempts")
         sys.stdout.flush()

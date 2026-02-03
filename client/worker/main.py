@@ -21,7 +21,7 @@ SCHEDULER_URL = os.getenv("SCHEDULER_URL", "ws://localhost:8001/ws/worker")
 REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:8002")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
-P2P_TIMEOUT = 120
+P2P_TIMEOUT = None
 
 class JobContext:
     def __init__(self, job_id, input_shape=None):

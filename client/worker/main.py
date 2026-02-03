@@ -76,6 +76,7 @@ class MoEWorker:
         self.moe_experts = {}
         self.embeddings = None
         self.lm_head = None
+        self._context_lock = asyncio.Lock()
 
     def get_p2p_url(self):
         if os.getenv("P2P_PUBLIC_URL"):
@@ -114,12 +115,13 @@ class MoEWorker:
         return base64.b64encode(buff.getvalue()).decode('utf-8')
 
     async def _get_context(self, job_id, create=False):
-        if job_id not in self.active_jobs:
-            if create:
-                self.active_jobs[job_id] = JobContext(job_id)
-            else:
-                return None
-        return self.active_jobs[job_id]
+        async with self._context_lock:
+            if job_id not in self.active_jobs:
+                if create:
+                    self.active_jobs[job_id] = JobContext(job_id)
+                else:
+                    return None
+            return self.active_jobs[job_id]
 
     async def process_ingress_data(self, data):
         """Internal handler for incoming tensor data (bypass logic)"""

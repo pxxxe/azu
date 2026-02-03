@@ -13,9 +13,9 @@ class LayerLoader:
         self.registry_url = registry_url
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True, parents=True)
-        self.loaded_cache = {}  # RAM cache (holds references to GPU tensors)
+        self.loaded_cache = {}  # RAM cache
 
-        # --- CONCURRENCY & IO CONTROL ---
+        # --- FIX START: Concurrency & IO Control ---
         # 1. ThreadPool for blocking torch.load (CPU bound + Disk Read)
         #    prevents the event loop from freezing during 500MB+ loads.
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=32)
@@ -26,6 +26,7 @@ class LayerLoader:
 
         # 3. Shared Session for Connection Pooling (Keep-Alive)
         self.session = None
+        # --- FIX END ---
 
     async def _get_session(self):
         """Lazy-load the shared session with high connection limits."""
@@ -159,8 +160,10 @@ class LayerLoader:
 
             import importlib
             full_module = f"transformers.models.{module_name}.modeling_{module_name}"
+            # print(f"   🔍 Attempting generic import: {full_module}.{class_name}")
             mod = importlib.import_module(full_module)
             layer_class = getattr(mod, class_name)
+            # print(f"   ✅ Successfully loaded {class_name} via generic pattern")
             return layer_class
         except Exception as e:
             print(f"   ❌ Generic import failed: {e}")
@@ -387,9 +390,9 @@ class LayerLoader:
         # --- FIX: Use ThreadPool ---
         state_dict = await self._load_weights_safe(path)
 
-        print(f"   ✓ Loaded state dict ({len(state_dict)} keys), applying to model...")
+        print(f"   ✓ Loaded state dict, applying to model...")
         sys.stdout.flush()
-        shared_expert.load_state_dict(state_dict)
+        shared_expert.load_state_dict(state_dict, strict=False)
         shared_expert.eval()
 
         print(f"   ✅ Shared expert ready")
@@ -489,17 +492,3 @@ class LayerLoader:
 
         self.loaded_cache[cache_key] = head
         return head
-
-    def unload_layer(self, cache_key: str):
-        """
-        Explicitly unload a layer from VRAM and delete reference.
-        Called by Main Worker during eviction.
-        """
-        if cache_key in self.loaded_cache:
-            model = self.loaded_cache[cache_key]
-            del model
-            del self.loaded_cache[cache_key]
-            # print(f"   ♻️ Unloaded {cache_key} from memory")
-            # sys.stdout.flush()
-            return True
-        return False

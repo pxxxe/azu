@@ -237,21 +237,25 @@ class MoEScheduler:
         for i, node in enumerate(job.topology):
             w = self.workers.get(node['worker_id'])
             if not w:
-                print(f"⚠️ Worker {node['worker_id']} not found!")  # ✅ ADD THIS
+                print(f"⚠️ Worker {node['worker_id']} not found!")
                 continue
 
             is_last_node = (i == len(job.topology) - 1)
             next_hop = job.topology[i + 1]['endpoint'] + "/tensor_in" if not is_last_node else None
+
+            # NEW: Include target layer index for next hop
+            next_layer_idx = job.topology[i + 1]['layer_idx'] if not is_last_node else None
+
             role = node.get('role')
 
-            # ✅ ADD THIS DEBUG LINE
             print(f"  Layer {i}: type={node['type']}, worker={w.pubkey[:8]}, next_hop={next_hop}")
 
             payload = {
                 "job_id": job.id,
                 "model_id": job.model_id,
                 "layer_idx": node['layer_idx'],
-                "next_hop": next_hop
+                "next_hop": next_hop,
+                "next_layer_idx": next_layer_idx  # NEW: Add target layer index
             }
 
             if node['type'] == 'dense':
@@ -289,6 +293,7 @@ class MoEScheduler:
                             "expert_idx": idx,
                             "return_url": node['endpoint']
                         })
+
 
     async def handle_result(self, wid: str, data: dict):
         job_id = data.get('job_id')

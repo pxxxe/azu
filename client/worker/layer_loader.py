@@ -3,6 +3,7 @@ import aiohttp
 import os
 import sys
 import json
+import asyncio  # <--- ADDED
 from pathlib import Path
 from transformers import AutoConfig
 
@@ -12,55 +13,59 @@ class LayerLoader:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True, parents=True)
         self.loaded_cache = {}  # RAM cache
+        # 32 parallel downloads is enough to saturate a standard container NIC without killing the Registry.
+        self.semaphore = asyncio.Semaphore(32)
 
     async def _download(self, url: str, path: Path):
         """Helper to download a file from Registry to Worker Disk (STREAMING)"""
-        if path.exists():
-            # Simple check for empty files from failed runs
-            if path.stat().st_size > 0:
-                print(f"   ✓ Using cached {path.name}")
-                sys.stdout.flush()
-                return
-            else:
-                print(f"   ⚠️ Found 0-byte file {path.name}, removing...")
-                sys.stdout.flush()
-                os.remove(path)
+        # Acquire semaphore to throttle the thundering herd
+        async with self.semaphore:
+            if path.exists():
+                # Simple check for empty files from failed runs
+                if path.stat().st_size > 0:
+                    print(f"   ✓ Using cached {path.name}")
+                    sys.stdout.flush()
+                    return
+                else:
+                    print(f"   ⚠️ Found 0-byte file {path.name}, removing...")
+                    sys.stdout.flush()
+                    os.remove(path)
 
-        print(f"   ⬇️ Downloading {url}...")
-        sys.stdout.flush()
-
-        # Timeout: Connect fast (10s), but allow time for large file transfer (600s)
-        timeout = aiohttp.ClientTimeout(total=600, connect=10)
-        temp = path.with_suffix('.tmp')
-
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        raise Exception(f"Download failed [{resp.status}]: {url}")
-
-                    # STREAMING DOWNLOAD (Chunked)
-                    with open(temp, 'wb') as f:
-                        downloaded = 0
-                        async for chunk in resp.content.iter_chunked(1024 * 1024): # 1MB chunks
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            # Print progress every 50MB
-                            if downloaded % (50 * 1024 * 1024) == 0:
-                                print(f"      ...{downloaded / (1024*1024):.0f}MB downloaded...")
-                                sys.stdout.flush()
-
-            # Atomic Move
-            os.rename(temp, path)
-            print(f"   ✅ Downloaded {path.name} ({downloaded / (1024*1024):.2f} MB)")
+            print(f"   ⬇️ Downloading {url}...")
             sys.stdout.flush()
 
-        except Exception as e:
-            print(f"   ❌ Error downloading {url}: {e}")
-            sys.stdout.flush()
-            if os.path.exists(temp):
-                os.remove(temp)
-            raise e
+            # Timeout: Connect fast (10s), but allow time for large file transfer (600s)
+            timeout = aiohttp.ClientTimeout(total=600, connect=10)
+            temp = path.with_suffix('.tmp')
+
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            raise Exception(f"Download failed [{resp.status}]: {url}")
+
+                        # STREAMING DOWNLOAD (Chunked)
+                        with open(temp, 'wb') as f:
+                            downloaded = 0
+                            async for chunk in resp.content.iter_chunked(1024 * 1024): # 1MB chunks
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                # Print progress every 50MB
+                                if downloaded % (50 * 1024 * 1024) == 0:
+                                    print(f"      ...{downloaded / (1024*1024):.0f}MB downloaded...")
+                                    sys.stdout.flush()
+
+                # Atomic Move
+                os.rename(temp, path)
+                print(f"   ✅ Downloaded {path.name} ({downloaded / (1024*1024):.2f} MB)")
+                sys.stdout.flush()
+
+            except Exception as e:
+                print(f"   ❌ Error downloading {url}: {e}")
+                sys.stdout.flush()
+                if os.path.exists(temp):
+                    os.remove(temp)
+                raise e
 
     def _get_layer_class(self, config):
         """
@@ -152,8 +157,8 @@ class LayerLoader:
         config_path = self.cache_dir / f"{sanitized}_config.json"
         await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
 
-        print(f"   📋 Loading config from {config_path}...")
-        sys.stdout.flush()
+        # print(f"   📋 Loading config from {config_path}...")
+        # sys.stdout.flush()
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
         # Download dense layer
@@ -169,11 +174,11 @@ class LayerLoader:
         layer = LayerClass(config, layer_idx=layer_idx).to(device).half()
 
         # Load weights - strict=False for robustness
-        print(f"   📥 torch.load({path.name})...")
-        sys.stdout.flush()
+        # print(f"   📥 torch.load({path.name})...")
+        # sys.stdout.flush()
         state_dict = torch.load(path, map_location=device)
-        print(f"   ✓ Loaded state dict, applying to model...")
-        sys.stdout.flush()
+        # print(f"   ✓ Loaded state dict, applying to model...")
+        # sys.stdout.flush()
         layer.load_state_dict(state_dict, strict=False)
         layer.eval()
 
@@ -198,8 +203,8 @@ class LayerLoader:
         config_path = self.cache_dir / f"{sanitized}_config.json"
         await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
 
-        print(f"   📋 Loading config from {config_path}...")
-        sys.stdout.flush()
+        # print(f"   📋 Loading config from {config_path}...")
+        # sys.stdout.flush()
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
         # Download router
@@ -218,11 +223,11 @@ class LayerLoader:
         router = torch.nn.Linear(hidden_size, num_experts, bias=False).to(device).half()
 
         # Load weights - strict=False
-        print(f"   📥 torch.load({path.name})...")
-        sys.stdout.flush()
+        # print(f"   📥 torch.load({path.name})...")
+        # sys.stdout.flush()
         state_dict = torch.load(path, map_location=device)
-        print(f"   ✓ Loaded state dict, applying to model...")
-        sys.stdout.flush()
+        # print(f"   ✓ Loaded state dict, applying to model...")
+        # sys.stdout.flush()
         router.load_state_dict(state_dict, strict=False)
         router.eval()
 
@@ -247,8 +252,8 @@ class LayerLoader:
         config_path = self.cache_dir / f"{sanitized}_config.json"
         await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
 
-        print(f"   📋 Loading config from {config_path}...")
-        sys.stdout.flush()
+        # print(f"   📋 Loading config from {config_path}...")
+        # sys.stdout.flush()
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
         # Download expert
@@ -277,11 +282,11 @@ class LayerLoader:
         expert = ExpertFFN(hidden_size, intermediate_size).to(device).half()
 
         # Load weights - strict=False
-        print(f"   📥 torch.load({path.name})...")
-        sys.stdout.flush()
+        # print(f"   📥 torch.load({path.name})...")
+        # sys.stdout.flush()
         state_dict = torch.load(path, map_location=device)
-        print(f"   ✓ Loaded state dict, applying to model...")
-        sys.stdout.flush()
+        # print(f"   ✓ Loaded state dict, applying to model...")
+        # sys.stdout.flush()
         expert.load_state_dict(state_dict, strict=False)
         expert.eval()
 
@@ -306,8 +311,8 @@ class LayerLoader:
         config_path = self.cache_dir / f"{sanitized}_config.json"
         await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
 
-        print(f"   📋 Loading config from {config_path}...")
-        sys.stdout.flush()
+        # print(f"   📋 Loading config from {config_path}...")
+        # sys.stdout.flush()
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
         # Download shared expert
@@ -336,11 +341,11 @@ class LayerLoader:
         shared_expert = SharedExpertFFN(hidden_size, intermediate_size).to(device).half()
 
         # Load weights - strict=False
-        print(f"   📥 torch.load({path.name})...")
-        sys.stdout.flush()
+        # print(f"   📥 torch.load({path.name})...")
+        # sys.stdout.flush()
         state_dict = torch.load(path, map_location=device)
-        print(f"   ✓ Loaded state dict, applying to model...")
-        sys.stdout.flush()
+        # print(f"   ✓ Loaded state dict, applying to model...")
+        # sys.stdout.flush()
         shared_expert.load_state_dict(state_dict, strict=False)
         shared_expert.eval()
 
@@ -366,8 +371,8 @@ class LayerLoader:
         config_path = self.cache_dir / f"{sanitized}_config.json"
         await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
 
-        print(f"   📋 Loading config from {config_path}...")
-        sys.stdout.flush()
+        # print(f"   📋 Loading config from {config_path}...")
+        # sys.stdout.flush()
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
         # Now download embeddings
@@ -379,12 +384,12 @@ class LayerLoader:
 
         emb = torch.nn.Embedding(config.vocab_size, config.hidden_size).to(device).half()
 
-        print(f"   📥 torch.load({path.name})...")
-        sys.stdout.flush()
+        # print(f"   📥 torch.load({path.name})...")
+        # sys.stdout.flush()
         state_dict = torch.load(path, map_location=device)
 
-        print(f"   ✓ Loaded state dict ({len(state_dict)} keys), applying to model...")
-        sys.stdout.flush()
+        # print(f"   ✓ Loaded state dict ({len(state_dict)} keys), applying to model...")
+        # sys.stdout.flush()
         emb.load_state_dict(state_dict)
         emb.eval()
 
@@ -410,8 +415,8 @@ class LayerLoader:
         config_path = self.cache_dir / f"{sanitized}_config.json"
         await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
 
-        print(f"   📋 Loading config from {config_path}...")
-        sys.stdout.flush()
+        # print(f"   📋 Loading config from {config_path}...")
+        # sys.stdout.flush()
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
         # Now download LM head
@@ -423,12 +428,12 @@ class LayerLoader:
 
         head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False).to(device).half()
 
-        print(f"   📥 torch.load({path.name})...")
-        sys.stdout.flush()
+        # print(f"   📥 torch.load({path.name})...")
+        # sys.stdout.flush()
         state_dict = torch.load(path, map_location=device)
 
-        print(f"   ✓ Loaded state dict ({len(state_dict)} keys), applying to model...")
-        sys.stdout.flush()
+        # print(f"   ✓ Loaded state dict ({len(state_dict)} keys), applying to model...")
+        # sys.stdout.flush()
         head.load_state_dict(state_dict)
         head.eval()
 

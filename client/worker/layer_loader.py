@@ -4,6 +4,7 @@ import os
 import sys
 import json
 import asyncio
+import concurrent.futures
 from pathlib import Path
 from transformers import AutoConfig
 
@@ -14,32 +15,47 @@ class LayerLoader:
         self.cache_dir.mkdir(exist_ok=True, parents=True)
         self.loaded_cache = {}  # RAM cache
 
-        # FIX: Shared Session & Semaphore
-        # Reuse 1 session to enable HTTP Keep-Alive (prevents 300x SSL handshakes)
-        # Limit concurrency to 32 to saturate bandwidth without choking the event loop
-        self.session = None
+        # --- FIX START: Concurrency & IO Control ---
+        # 1. ThreadPool for blocking torch.load (CPU bound + Disk Read)
+        #    prevents the event loop from freezing during 500MB+ loads.
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+        # 2. Semaphore for Network/Disk Write concurrency
+        #    prevents opening 300+ SSL sockets simultaneously.
         self.sem = asyncio.Semaphore(32)
 
+        # 3. Shared Session for Connection Pooling (Keep-Alive)
+        self.session = None
+        # --- FIX END ---
+
     async def _get_session(self):
-        """Lazy-load the shared session with optimized connection limits."""
+        """Lazy-load the shared session with high connection limits."""
         if self.session is None:
-            # limit=0 means unlimited connections in pool (we throttle via self.sem)
-            # ttl_dns_cache=300 saves repetitive DNS lookups
             connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
-            # Higher connect timeout (30s) to handle initial burst
             timeout = aiohttp.ClientTimeout(total=600, connect=30)
             self.session = aiohttp.ClientSession(connector=connector, timeout=timeout)
         return self.session
 
+    async def _load_weights_safe(self, path):
+        """
+        Offload torch.load to a thread.
+        Critical for preventing the P2P heartbeat from dying while loading 2GB files.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self.executor,
+            lambda: torch.load(path, map_location="cpu")
+        )
+
     async def _download(self, url: str, path: Path):
         """Helper to download a file from Registry to Worker Disk (STREAMING)"""
-        # Acquire semaphore to prevent Thundering Herd
+        # Acquire semaphore to throttle the thundering herd
         async with self.sem:
             if path.exists():
                 # Simple check for empty files from failed runs
                 if path.stat().st_size > 0:
-                    # print(f"   ✓ Using cached {path.name}")
-                    # sys.stdout.flush()
+                    print(f"   ✓ Using cached {path.name}")
+                    sys.stdout.flush()
                     return
                 else:
                     print(f"   ⚠️ Found 0-byte file {path.name}, removing...")
@@ -52,7 +68,6 @@ class LayerLoader:
             temp = path.with_suffix('.tmp')
 
             try:
-                # Use shared session
                 session = await self._get_session()
                 async with session.get(url) as resp:
                     if resp.status != 200:
@@ -61,22 +76,22 @@ class LayerLoader:
                     # STREAMING DOWNLOAD (Chunked)
                     with open(temp, 'wb') as f:
                         downloaded = 0
-                        # 1MB chunks
-                        async for chunk in resp.content.iter_chunked(1024 * 1024):
+                        async for chunk in resp.content.iter_chunked(1024 * 1024): # 1MB chunks
                             f.write(chunk)
                             downloaded += len(chunk)
 
-                            # CRITICAL FIX: Yield to event loop during disk I/O.
-                            # Without this, writing 150MB blocks the loop, killing P2P heartbeats.
+                            # CRITICAL FIX: Yield to event loop during heavy disk writes.
+                            # Keeps P2P server responsive.
                             await asyncio.sleep(0)
 
+                            # Print progress every 50MB
                             if downloaded % (50 * 1024 * 1024) == 0:
                                 print(f"      ...{downloaded / (1024*1024):.0f}MB downloaded...")
                                 sys.stdout.flush()
 
                 # Atomic Move
                 os.rename(temp, path)
-                print(f"   ✅ Downloaded {path.name} ({path.stat().st_size / (1024*1024):.2f} MB)")
+                print(f"   ✅ Downloaded {path.name} ({downloaded / (1024*1024):.2f} MB)")
                 sys.stdout.flush()
 
             except Exception as e:
@@ -118,6 +133,7 @@ class LayerLoader:
         if arch in arch_map:
             module_name, class_name = arch_map[arch]
             try:
+                # Dynamic import: from transformers.models.{module_name}.modeling_{module_name} import {class_name}
                 import importlib
                 full_module = f"transformers.models.{module_name}.modeling_{module_name}"
                 mod = importlib.import_module(full_module)
@@ -125,9 +141,12 @@ class LayerLoader:
             except (ImportError, AttributeError) as e:
                 print(f"⚠️ Failed to import {class_name} from {full_module}: {e}")
                 sys.stdout.flush()
+                # Fall through to generic fallback
 
-        # FALLBACK: Try generic pattern matching
+        # FALLBACK: Try generic pattern matching for unknown architectures
+        # Most architectures follow the pattern: XForCausalLM -> XDecoderLayer
         try:
+            # Extract base name (e.g., "Llama" from "LlamaForCausalLM")
             if arch.endswith("ForCausalLM"):
                 base = arch[:-len("ForCausalLM")]
             elif arch.endswith("LMHeadModel"):
@@ -135,20 +154,30 @@ class LayerLoader:
             else:
                 base = arch
 
+            # Try to import dynamically
             module_name = base.lower()
             class_name = f"{base}DecoderLayer"
 
             import importlib
             full_module = f"transformers.models.{module_name}.modeling_{module_name}"
+            # print(f"   🔍 Attempting generic import: {full_module}.{class_name}")
             mod = importlib.import_module(full_module)
-            return getattr(mod, class_name)
+            layer_class = getattr(mod, class_name)
+            # print(f"   ✅ Successfully loaded {class_name} via generic pattern")
+            return layer_class
         except Exception as e:
             print(f"   ❌ Generic import failed: {e}")
             sys.stdout.flush()
 
-        raise ValueError(f"Worker does not support architecture: {arch}")
+        # LAST RESORT: Return error with helpful message
+        raise ValueError(
+            f"Worker does not support architecture: {arch}\n"
+            f"To add support, update the arch_map in layer_loader.py with:\n"
+            f'  "{arch}": ("<module_name>", "<LayerClassName>")'
+        )
 
     async def load_dense_layer(self, model_id: str, layer_idx: int, device="cuda"):
+        """Load a regular dense transformer layer."""
         cache_key = f"{model_id}:dense:{layer_idx}"
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
@@ -158,10 +187,15 @@ class LayerLoader:
 
         sanitized = model_id.replace("/", "_")
 
+        # Get config
         config_path = self.cache_dir / f"{sanitized}_config.json"
         await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+
+        print(f"   📋 Loading config from {config_path}...")
+        sys.stdout.flush()
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
+        # Download dense layer
         filename = f"layer_{layer_idx}_dense.pt"
         path = self.cache_dir / f"{sanitized}_{filename}"
         await self._download(f"{self.registry_url}/layers/{sanitized}/{filename}", path)
@@ -169,10 +203,19 @@ class LayerLoader:
         print(f"   🔧 Creating layer class and loading weights...")
         sys.stdout.flush()
 
+        # Create layer on GPU
         LayerClass = self._get_layer_class(config)
         layer = LayerClass(config, layer_idx=layer_idx).to(device).half()
 
-        state_dict = torch.load(path, map_location=device)
+        # Load weights - strict=False for robustness
+        print(f"   📥 torch.load({path.name})... (Threaded)")
+        sys.stdout.flush()
+
+        # --- FIX: Use ThreadPool ---
+        state_dict = await self._load_weights_safe(path)
+
+        print(f"   ✓ Loaded state dict, applying to model...")
+        sys.stdout.flush()
         layer.load_state_dict(state_dict, strict=False)
         layer.eval()
 
@@ -183,6 +226,7 @@ class LayerLoader:
         return layer
 
     async def load_moe_router(self, model_id: str, layer_idx: int, device="cuda"):
+        """Load the router/gate for an MoE layer."""
         cache_key = f"{model_id}:router:{layer_idx}"
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
@@ -192,22 +236,38 @@ class LayerLoader:
 
         sanitized = model_id.replace("/", "_")
 
+        # Get config
         config_path = self.cache_dir / f"{sanitized}_config.json"
         await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+
+        print(f"   📋 Loading config from {config_path}...")
+        sys.stdout.flush()
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
+        # Download router
         filename = f"layer_{layer_idx}_router.pt"
         path = self.cache_dir / f"{sanitized}_{filename}"
         await self._download(f"{self.registry_url}/layers/{sanitized}/{filename}", path)
 
-        num_experts = getattr(config, 'num_local_experts', 8)
+        # Create router (simple Linear layer for most MoE)
+        # For Qwen2-MoE and Mixtral: it's a Linear(hidden_size, num_experts)
+        num_experts = getattr(config, 'num_local_experts', 8)  # Default to 8
         hidden_size = config.hidden_size
 
         print(f"   🔧 Creating router ({hidden_size} -> {num_experts})...")
         sys.stdout.flush()
 
         router = torch.nn.Linear(hidden_size, num_experts, bias=False).to(device).half()
-        state_dict = torch.load(path, map_location=device)
+
+        # Load weights - strict=False
+        print(f"   📥 torch.load({path.name})... (Threaded)")
+        sys.stdout.flush()
+
+        # --- FIX: Use ThreadPool ---
+        state_dict = await self._load_weights_safe(path)
+
+        print(f"   ✓ Loaded state dict, applying to model...")
+        sys.stdout.flush()
         router.load_state_dict(state_dict, strict=False)
         router.eval()
 
@@ -218,6 +278,7 @@ class LayerLoader:
         return router
 
     async def load_moe_expert(self, model_id: str, layer_idx: int, expert_idx: int, device="cuda"):
+        """Load a specific expert from an MoE layer."""
         cache_key = f"{model_id}:expert:{layer_idx}:{expert_idx}"
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
@@ -227,14 +288,20 @@ class LayerLoader:
 
         sanitized = model_id.replace("/", "_")
 
+        # Get config
         config_path = self.cache_dir / f"{sanitized}_config.json"
         await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+
+        print(f"   📋 Loading config from {config_path}...")
+        sys.stdout.flush()
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
+        # Download expert
         filename = f"layer_{layer_idx}_expert_{expert_idx}.pt"
         path = self.cache_dir / f"{sanitized}_{filename}"
         await self._download(f"{self.registry_url}/layers/{sanitized}/{filename}", path)
 
+        # Create expert FFN
         hidden_size = config.hidden_size
         intermediate_size = config.intermediate_size
 
@@ -253,7 +320,16 @@ class LayerLoader:
                 return self.w2(self.act_fn(self.w1(x)) * self.w3(x))
 
         expert = ExpertFFN(hidden_size, intermediate_size).to(device).half()
-        state_dict = torch.load(path, map_location=device)
+
+        # Load weights - strict=False
+        print(f"   📥 torch.load({path.name})... (Threaded)")
+        sys.stdout.flush()
+
+        # --- FIX: Use ThreadPool ---
+        state_dict = await self._load_weights_safe(path)
+
+        print(f"   ✓ Loaded state dict, applying to model...")
+        sys.stdout.flush()
         expert.load_state_dict(state_dict, strict=False)
         expert.eval()
 
@@ -264,6 +340,7 @@ class LayerLoader:
         return expert
 
     async def load_moe_shared_expert(self, model_id: str, layer_idx: int, device="cuda"):
+        """Load the shared expert FFN (Qwen2-MoE specific)."""
         cache_key = f"{model_id}:shared_expert:{layer_idx}"
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
@@ -272,14 +349,21 @@ class LayerLoader:
         sys.stdout.flush()
 
         sanitized = model_id.replace("/", "_")
+
+        # Get config
         config_path = self.cache_dir / f"{sanitized}_config.json"
         await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+
+        print(f"   📋 Loading config from {config_path}...")
+        sys.stdout.flush()
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
+        # Download shared expert
         filename = f"layer_{layer_idx}_shared_expert.pt"
         path = self.cache_dir / f"{sanitized}_{filename}"
         await self._download(f"{self.registry_url}/layers/{sanitized}/{filename}", path)
 
+        # Create shared expert FFN
         hidden_size = config.hidden_size
         intermediate_size = getattr(config, "shared_expert_intermediate_size", config.intermediate_size)
 
@@ -298,7 +382,16 @@ class LayerLoader:
                 return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
         shared_expert = SharedExpertFFN(hidden_size, intermediate_size).to(device).half()
-        state_dict = torch.load(path, map_location=device)
+
+        # Load weights - strict=False
+        print(f"   📥 torch.load({path.name})... (Threaded)")
+        sys.stdout.flush()
+
+        # --- FIX: Use ThreadPool ---
+        state_dict = await self._load_weights_safe(path)
+
+        print(f"   ✓ Loaded state dict, applying to model...")
+        sys.stdout.flush()
         shared_expert.load_state_dict(state_dict, strict=False)
         shared_expert.eval()
 
@@ -320,10 +413,15 @@ class LayerLoader:
 
         sanitized = model_id.replace("/", "_")
 
+        # CRITICAL FIX: Download config FIRST before embeddings
         config_path = self.cache_dir / f"{sanitized}_config.json"
         await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+
+        print(f"   📋 Loading config from {config_path}...")
+        sys.stdout.flush()
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
+        # Now download embeddings
         path = self.cache_dir / f"{sanitized}_embeddings.pt"
         await self._download(f"{self.registry_url}/layers/{sanitized}/embeddings.pt", path)
 
@@ -331,7 +429,15 @@ class LayerLoader:
         sys.stdout.flush()
 
         emb = torch.nn.Embedding(config.vocab_size, config.hidden_size).to(device).half()
-        state_dict = torch.load(path, map_location=device)
+
+        print(f"   📥 torch.load({path.name})... (Threaded)")
+        sys.stdout.flush()
+
+        # --- FIX: Use ThreadPool ---
+        state_dict = await self._load_weights_safe(path)
+
+        print(f"   ✓ Loaded state dict ({len(state_dict)} keys), applying to model...")
+        sys.stdout.flush()
         emb.load_state_dict(state_dict)
         emb.eval()
 
@@ -353,10 +459,15 @@ class LayerLoader:
 
         sanitized = model_id.replace("/", "_")
 
+        # Download config first
         config_path = self.cache_dir / f"{sanitized}_config.json"
         await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+
+        print(f"   📋 Loading config from {config_path}...")
+        sys.stdout.flush()
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
+        # Now download LM head
         path = self.cache_dir / f"{sanitized}_lm_head.pt"
         await self._download(f"{self.registry_url}/layers/{sanitized}/lm_head.pt", path)
 
@@ -364,7 +475,15 @@ class LayerLoader:
         sys.stdout.flush()
 
         head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False).to(device).half()
-        state_dict = torch.load(path, map_location=device)
+
+        print(f"   📥 torch.load({path.name})... (Threaded)")
+        sys.stdout.flush()
+
+        # --- FIX: Use ThreadPool ---
+        state_dict = await self._load_weights_safe(path)
+
+        print(f"   ✓ Loaded state dict ({len(state_dict)} keys), applying to model...")
+        sys.stdout.flush()
         head.load_state_dict(state_dict)
         head.eval()
 

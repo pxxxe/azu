@@ -22,7 +22,7 @@ class LayerLoader:
 
         # 2. Semaphore for Network/Disk Write concurrency
         #    prevents opening 300+ SSL sockets simultaneously.
-        self.sem = asyncio.Semaphore(32)
+        self.sem = asyncio.Semaphore(4)
 
         # 3. Shared Session for Connection Pooling (Keep-Alive)
         self.session = None

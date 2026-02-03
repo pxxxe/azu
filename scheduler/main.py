@@ -175,7 +175,7 @@ class MoEScheduler:
 
                 raw_job = json.loads(item[1])
                 job_id = raw_job['id']
-                model_id = raw_job['model']
+                model_id = raw_job['model_id']
 
                 # 1. Check Status
                 status = await self._check_model_status(model_id)

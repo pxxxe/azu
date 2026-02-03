@@ -406,8 +406,8 @@ class MoEWorker:
         job_id = msg['job_id']
         model_id = msg['model_id']
         layer_idx = msg['layer_idx']
-        expert_map = msg['expert_map']
         next_hop = msg.get('next_hop')
+        expert_map = msg.get('expert_map', {})
 
         print(f"🟢 [ROUTER] Processing job {job_id[:8]}, layer_idx={layer_idx}, next_hop={next_hop}")
         print(f"   Expert map: {expert_map}")
@@ -418,7 +418,6 @@ class MoEWorker:
 
         print(f"   ⏳ Waiting for input tensor from P2P (timeout={P2P_TIMEOUT}s)...")
         sys.stdout.flush()
-
         try:
             hidden_states = await asyncio.wait_for(ctx.input_queue.get(), timeout=P2P_TIMEOUT)
             print(f"   ✅ Received input tensor. Shape: {hidden_states.shape}")
@@ -533,16 +532,6 @@ class MoEWorker:
             })
             print(f"   ✅ Forwarded to next hop")
             sys.stdout.flush()
-
-            # ✅ CRITICAL FIX: Notify scheduler that this layer is complete
-            await ws.send(json.dumps({
-                "type": "LAYER_COMPLETE",
-                "job_id": job_id,
-                "layer_idx": layer_idx
-            }))
-            print(f"   ✅ Notified scheduler of layer completion")
-            sys.stdout.flush()
-
         else:
             print(f"   ⚠️ No next_hop - job may be incomplete")
             sys.stdout.flush()

@@ -223,7 +223,7 @@ class MoEScheduler:
                     await r.rpush("job_queue", item[1])
                     continue
 
-                job = JobState(raw_job['id'], model_id, raw_job['input'], raw_job['owner'], plan)
+                job = JobState(raw_job['id'], model_id, raw_job['input_prompt'], raw_job['owner'], plan)
                 self.active_jobs[job_id] = job
                 await self._dispatch(job)
 

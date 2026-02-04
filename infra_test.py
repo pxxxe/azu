@@ -283,7 +283,7 @@ def main():
             'PUBLIC_KEY': 'null',
             # DECOUPLED: We pass the RunPod-specific URL template here via environment
             'P2P_URL_TEMPLATE': 'https://{RUNPOD_POD_ID}-8003.proxy.runpod.net',
-            'LAYER_CACHE_DIR': '/data/layer_cache'
+            'LAYER_CACHE_DIR': '/data/layers'
         }
 
         for i in range(4):

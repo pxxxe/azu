@@ -56,7 +56,8 @@ class MoEWorker:
             print("⚠️ No GPU detected, using simulated 32GB RAM")
 
         # --- LOADER ---
-        self.loader = LayerLoader(REGISTRY_URL, "layer_cache")
+        # self.loader = LayerLoader(REGISTRY_URL, "layer_cache")
+        self.loader = LayerLoader(REGISTRY_URL)
 
         # --- LOCKS (ROBUSTNESS) ---
         self._model_lock = asyncio.Lock()   # Prevents model switching race conditions

@@ -108,15 +108,19 @@ class MoEWorker:
     # --- TENSOR UTILS ---
     def _decode_tensor(self, data: dict) -> torch.Tensor:
         import numpy as np
+        # Uses numpy buffer to avoid base64 overhead, but supports hex encoding
         arr = np.frombuffer(bytes.fromhex(data['data']), dtype=data['dtype'])
         arr = arr.reshape(data['shape'])
-        return torch.from_numpy(arr.copy())
+        # Create tensor and ensure it's on the correct device
+        return torch.from_numpy(arr.copy()).to(self.device)
 
     def _encode_tensor(self, tensor: torch.Tensor) -> dict:
+        # Move to CPU and convert to numpy
+        np_tensor = tensor.detach().cpu().numpy()
         return {
-            "shape": list(tensor.shape),
-            "dtype": str(tensor.dtype),
-            "data": tensor.cpu().numpy().tobytes().hex()
+            "shape": list(np_tensor.shape),
+            "dtype": str(np_tensor.dtype), # FIX: Returns 'float16', not 'torch.float16'
+            "data": np_tensor.tobytes().hex()
         }
 
     # --- SHARED SESSION (THE FIX) ---
@@ -192,6 +196,7 @@ class MoEWorker:
                 return
             except Exception as e:
                 print(f"❌ Local P2P Error: {e}")
+                traceback.print_exc()
                 return
 
         # 2. Network Transfer (Using Shared Session)
@@ -202,9 +207,9 @@ class MoEWorker:
                     if resp.status == 200:
                         return
                     else:
-                        print(f"   ⚠️ P2P Handshake Rejected {resp.status}")
+                        print(f"   ⚠️ P2P Handshake Rejected {resp.status} from {url}")
             except Exception as e:
-                print(f"   ⚠️ Connection Failed (attempt {attempt+1}): {e}")
+                print(f"   ⚠️ Connection Failed (attempt {attempt+1}) to {url}: {e}")
                 await asyncio.sleep(0.2)
         print(f"❌ Failed to send to {url}")
 

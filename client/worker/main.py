@@ -4,13 +4,16 @@ import json
 import sys
 import os
 import traceback
-from typing import Dict, Optional
+import aiohttp
+import urllib.request
+import gc
+from typing import Dict, Optional, Tuple, Set
 import websockets
-from aiohttp import web, ClientSession
-from transformers import AutoTokenizer
+from aiohttp import web, ClientSession, TCPConnector, ClientTimeout
+from transformers import AutoTokenizer, AutoConfig
 from dataclasses import dataclass, field
 
-# === CRITICAL: IMPORT THE ROBUST LOADER ===
+# === ROBUST LOADER IMPORT ===
 from layer_loader import LayerLoader
 
 # Config
@@ -22,13 +25,12 @@ P2P_URL_TEMPLATE = os.getenv("P2P_URL_TEMPLATE")
 P2P_PORT = 8003
 P2P_TIMEOUT = 300
 
-@dataclass
 class JobContext:
-    """Per-job state machine"""
-    layer_input_queues: Dict[int, asyncio.Queue] = field(default_factory=dict)
-    expert_queues: Dict[tuple, asyncio.Queue] = field(default_factory=dict)
-    pending_expert_requests: Dict[tuple, asyncio.Future] = field(default_factory=dict)
-    original_shape: Optional[tuple] = None
+    def __init__(self, job_id):
+        self.job_id = job_id
+        self.layer_input_queues: Dict[int, asyncio.Queue] = {}
+        self.expert_input_queues: Dict[Tuple[int, int], asyncio.Queue] = {}
+        self.pending_expert_requests: Dict[Tuple[int, int], asyncio.Future] = {}
 
     def get_layer_input_queue(self, layer_idx: int) -> asyncio.Queue:
         if layer_idx not in self.layer_input_queues:
@@ -37,82 +39,78 @@ class JobContext:
 
     def get_expert_queue(self, layer_idx: int, expert_idx: int) -> asyncio.Queue:
         key = (layer_idx, expert_idx)
-        if key not in self.expert_queues:
-            self.expert_queues[key] = asyncio.Queue()
-        return self.expert_queues[key]
+        if key not in self.expert_input_queues:
+            self.expert_input_queues[key] = asyncio.Queue()
+        return self.expert_input_queues[key]
 
 class MoEWorker:
     def __init__(self):
+        # --- HARDWARE ---
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.vram_total_mb = torch.cuda.get_device_properties(0).total_memory // (1024**2) if torch.cuda.is_available() else 8000
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            self.vram_total_mb = int(props.total_memory / (1024**2))
+            print(f"🎮 GPU Detected: {props.name} | VRAM: {self.vram_total_mb} MB")
+        else:
+            self.vram_total_mb = 32000
+            print("⚠️ No GPU detected, using simulated 32GB RAM")
 
-        # === USE IMPORTED LOADER ===
+        # --- LOADER ---
         self.loader = LayerLoader(REGISTRY_URL, "layer_cache")
 
-        self.current_model_id = None
-        self.embeddings = None
-        self.dense_layers: Dict[int, torch.nn.Module] = {}
-        self.moe_routers: Dict[int, torch.nn.Module] = {}
-        self.moe_experts: Dict[tuple, torch.nn.Module] = {}
-        self.lm_head = None
+        # --- LOCKS (ROBUSTNESS) ---
+        self._model_lock = asyncio.Lock()   # Prevents model switching race conditions
+        self._context_lock = asyncio.Lock() # Prevents job context race conditions
 
+        # --- STATE ---
         self.active_jobs: Dict[str, JobContext] = {}
+        self.current_model_id = None
+
+        # Model Components
+        self.embeddings = None
+        self.lm_head = None
+        self.dense_layers = {}
+        self.moe_routers = {}
+        self.moe_experts = {}
+
+        # --- NETWORKING (SOCKET FIX) ---
+        self.p2p_session = None # Shared session to prevent socket exhaustion
         self.p2p_app = None
 
-        print(f"🎮 GPU Detected: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'} | VRAM: {self.vram_total_mb} MB")
         sys.stdout.flush()
 
     def get_p2p_url(self):
-        if P2P_PUBLIC_URL:
-            return P2P_PUBLIC_URL
-        elif P2P_URL_TEMPLATE:
-            pod_id = os.getenv("RUNPOD_POD_ID", "unknown")
-            return P2P_URL_TEMPLATE.replace("{RUNPOD_POD_ID}", pod_id)
-        return f"http://localhost:{P2P_PORT}"
+        if P2P_PUBLIC_URL: return P2P_PUBLIC_URL.strip("/")
+        if P2P_URL_TEMPLATE:
+            try:
+                pod_id = os.getenv("RUNPOD_POD_ID", "unknown")
+                return P2P_URL_TEMPLATE.replace("{RUNPOD_POD_ID}", pod_id).strip("/")
+            except: pass
+        try:
+            # Fallback to IP detection
+            ip = urllib.request.urlopen('https://api.ipify.org').read().decode('utf8')
+            return f"http://{ip}:{P2P_PORT}"
+        except:
+            return f"http://127.0.0.1:{P2P_PORT}"
 
+    # --- P2P SERVER ---
     async def start_p2p_server(self):
+        # MAX SIZE 1GB IS CRITICAL FOR MoE TENSORS
         self.p2p_app = web.Application(client_max_size=1024**3)
-        self.p2p_app.router.add_post("/tensor_in", self.handle_p2p_tensor)
+        self.p2p_app.router.add_post('/tensor_in', self.handle_tensor_ingress)
         runner = web.AppRunner(self.p2p_app)
         await runner.setup()
         site = web.TCPSite(runner, '0.0.0.0', P2P_PORT)
-        asyncio.create_task(site.start())
+        await site.start()
         print(f"👂 [P2P] Server listening on :{P2P_PORT} (Max Payload: 1GB)")
         sys.stdout.flush()
 
-    async def handle_p2p_tensor(self, request):
-        try:
-            data = await request.json()
-            job_id = data['job_id']
-            tensor_data = data['tensor']
-            msg_type = data.get('type')
-
-            ctx = await self._get_context(job_id, create=True)
-            tensor = self._decode_tensor(tensor_data)
-
-            if msg_type == 'input':
-                target_layer_idx = data.get('target_layer_idx')
-                if target_layer_idx is not None:
-                    await ctx.get_layer_input_queue(target_layer_idx).put(tensor)
-
-                expert_idx = data.get('expert_idx')
-                if expert_idx is not None:
-                    layer_idx = data['layer_idx']
-                    await ctx.get_expert_queue(layer_idx, expert_idx).put(tensor)
-
-            elif msg_type == 'expert_result':
-                layer_idx = data['layer_idx']
-                expert_idx = data['expert_idx']
-                key = (layer_idx, expert_idx)
-                if key in ctx.pending_expert_requests:
-                    future = ctx.pending_expert_requests[key]
-                    if not future.done():
-                        future.set_result(tensor)
-
-            return web.Response(text="OK")
-        except Exception as e:
-            print(f"❌ P2P Error: {e}")
-            return web.Response(status=500, text=str(e))
+    # --- TENSOR UTILS ---
+    def _decode_tensor(self, data: dict) -> torch.Tensor:
+        import numpy as np
+        arr = np.frombuffer(bytes.fromhex(data['data']), dtype=data['dtype'])
+        arr = arr.reshape(data['shape'])
+        return torch.from_numpy(arr.copy())
 
     def _encode_tensor(self, tensor: torch.Tensor) -> dict:
         return {
@@ -121,38 +119,114 @@ class MoEWorker:
             "data": tensor.cpu().numpy().tobytes().hex()
         }
 
-    def _decode_tensor(self, data: dict) -> torch.Tensor:
-        import numpy as np
-        arr = np.frombuffer(bytes.fromhex(data['data']), dtype=data['dtype'])
-        arr = arr.reshape(data['shape'])
-        return torch.from_numpy(arr.copy())
+    # --- SHARED SESSION (THE FIX) ---
+    async def _get_p2p_session(self):
+        """Lazy-load a shared session for P2P traffic to prevent socket exhaustion."""
+        if self.p2p_session is None or self.p2p_session.closed:
+            # High limits, tuned timeouts
+            timeout = ClientTimeout(total=60, sock_read=30, sock_connect=10)
+            connector = TCPConnector(limit=0, ttl_dns_cache=300)
+            self.p2p_session = ClientSession(connector=connector, timeout=timeout)
+        return self.p2p_session
 
-    async def _send_p2p(self, url: str, payload: dict):
-        # We create a new session here or could reuse one from self.loader if made public
-        # Using a new one for now to avoid complexity, P2P traffic is lower frequency than shards
-        async with ClientSession() as session:
+    # --- INGRESS LOGIC ---
+    async def _get_context(self, job_id, create=False):
+        async with self._context_lock:
+            if job_id not in self.active_jobs:
+                if create:
+                    self.active_jobs[job_id] = JobContext(job_id)
+                else:
+                    return None
+            return self.active_jobs[job_id]
+
+    async def handle_tensor_ingress(self, request):
+        try:
+            data = await request.json()
+            await self.process_ingress_data(data)
+            return web.Response(text="OK")
+        except Exception as e:
+            print(f"❌ [P2P] Error handling ingress: {e}")
+            traceback.print_exc()
+            return web.Response(status=500, text=str(e))
+
+    async def process_ingress_data(self, data):
+        job_id = data['job_id']
+        msg_type = data.get('type', 'input')
+        tensor = self._decode_tensor(data['tensor'])
+
+        ctx = await self._get_context(job_id, create=True)
+
+        if msg_type == 'input':
+            expert_idx = data.get('expert_idx')
+            layer_idx = data.get('layer_idx')
+            target_layer_idx = data.get('target_layer_idx')
+
+            if expert_idx is not None and layer_idx is not None:
+                queue = ctx.get_expert_queue(layer_idx, expert_idx)
+                await queue.put(tensor)
+            elif target_layer_idx is not None:
+                queue = ctx.get_layer_input_queue(target_layer_idx)
+                await queue.put(tensor)
+
+        elif msg_type == 'expert_result':
+            expert_idx = data.get('expert_idx')
+            layer_idx = data.get('layer_idx')
+            if expert_idx is not None and layer_idx is not None:
+                key = (layer_idx, expert_idx)
+                if key in ctx.pending_expert_requests:
+                    future = ctx.pending_expert_requests[key]
+                    if not future.done():
+                        future.set_result(tensor)
+
+    # --- EXECUTION LOGIC ---
+    async def _send_p2p(self, url, payload):
+        """Send tensor to another worker. Includes LOOPBACK OPTIMIZATION."""
+        # 1. Loopback Check
+        my_p2p = self.get_p2p_url().rstrip("/")
+        target_base = url.replace("/tensor_in", "").rstrip("/")
+
+        if my_p2p == target_base:
+            # Short-circuit: Inject directly into local handler
             try:
-                async with session.post(url, json=payload, timeout=60) as resp:
-                    if resp.status != 200:
-                        print(f"   ⚠️ P2P send failed to {url}: {resp.status}")
+                await self.process_ingress_data(payload)
+                return
             except Exception as e:
-                print(f"   ❌ P2P send error to {url}: {e}")
+                print(f"❌ Local P2P Error: {e}")
+                return
 
-    async def _get_context(self, job_id: str, create: bool = False) -> Optional[JobContext]:
-        if job_id not in self.active_jobs and create:
-            self.active_jobs[job_id] = JobContext()
-        return self.active_jobs.get(job_id)
+        # 2. Network Transfer (Using Shared Session)
+        session = await self._get_p2p_session()
+        for attempt in range(3):
+            try:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status == 200:
+                        return
+                    else:
+                        print(f"   ⚠️ P2P Handshake Rejected {resp.status}")
+            except Exception as e:
+                print(f"   ⚠️ Connection Failed (attempt {attempt+1}): {e}")
+                await asyncio.sleep(0.2)
+        print(f"❌ Failed to send to {url}")
 
-    async def _ensure_model(self, model_id: str):
-        if self.current_model_id != model_id:
+    async def _ensure_model(self, model_id):
+        if self.current_model_id == model_id:
+            return
+
+        async with self._model_lock:
+            if self.current_model_id == model_id: return
+
             print(f"🧹 New model {model_id} requested. Clearing VRAM...")
             sys.stdout.flush()
+
             self.embeddings = None
+            self.lm_head = None
             self.dense_layers.clear()
             self.moe_routers.clear()
             self.moe_experts.clear()
-            self.lm_head = None
+            self.active_jobs.clear()
+            gc.collect()
             torch.cuda.empty_cache()
+
             self.current_model_id = model_id
 
     async def process_dense(self, msg, ws):
@@ -167,6 +241,8 @@ class MoEWorker:
         ctx = await self._get_context(job_id, create=True)
 
         hidden_states = None
+
+        # --- JIT Embeddings ---
         if msg.get('is_first'):
             print(f"   🔤 Tokenizing prompt...")
             prompt = msg['input']
@@ -179,17 +255,16 @@ class MoEWorker:
 
             with torch.no_grad():
                 hidden_states = self.embeddings(inputs['input_ids'])
-            ctx.original_shape = hidden_states.shape
         else:
             queue = ctx.get_layer_input_queue(layer_idx)
-            print(f"   ⏳ Waiting for input tensor on layer {layer_idx}...")
+            print(f"   ⏳ Waiting for input tensor...")
             try:
                 hidden_states = await asyncio.wait_for(queue.get(), timeout=P2P_TIMEOUT)
             except asyncio.TimeoutError:
                 print(f"❌ [Job {job_id[:8]}] Timeout waiting for input")
                 return
 
-        # Process Layer
+        # --- JIT Dense Layer ---
         layer_out = hidden_states
         if layer_idx != -1:
             if layer_idx not in self.dense_layers:
@@ -200,7 +275,7 @@ class MoEWorker:
                 out = self.dense_layers[layer_idx](hidden_states.half())
                 layer_out = out[0] if isinstance(out, tuple) else out
 
-        # Decode or Forward
+        # --- JIT Head & Decode ---
         if msg.get('is_last'):
             if not self.lm_head:
                 print(f"🔚 Loading LM Head...")
@@ -247,6 +322,7 @@ class MoEWorker:
             print(f"❌ [Job {job_id[:8]}] Router input timeout")
             return
 
+        # --- JIT Router ---
         if layer_idx not in self.moe_routers:
             print(f"📦 Loading router {layer_idx}...")
             self.moe_routers[layer_idx] = await self.loader.load_moe_router(model_id, layer_idx, self.device)
@@ -267,9 +343,8 @@ class MoEWorker:
 
             mask = (top_indices == expert_idx)
             rows, cols, _ = torch.where(mask)
-            if rows.numel() == 0: continue
-
             sliced = hidden_states[rows, cols, :]
+
             future = asyncio.Future()
             local_pending[expert_idx] = future
             ctx.pending_expert_requests[(layer_idx, expert_idx)] = future
@@ -339,6 +414,7 @@ class MoEWorker:
             print(f"⏭️ [Job {job_id[:8]}] Expert {expert_idx} not used (timeout)")
             return
 
+        # --- JIT Expert ---
         cache_key = (layer_idx, expert_idx)
         if cache_key not in self.moe_experts:
             print(f"📦 Loading expert {expert_idx}...")
@@ -401,6 +477,9 @@ class MoEWorker:
             except Exception as e:
                 print(f"❌ Connection Error: {e}")
                 await asyncio.sleep(5)
+            finally:
+                if self.p2p_session and not self.p2p_session.closed:
+                    await self.p2p_session.close()
 
 if __name__ == "__main__":
     asyncio.run(MoEWorker().run())

@@ -13,6 +13,7 @@ class LayerLoader:
         self.registry_url = registry_url
         if cache_dir is None:
           cache_dir = os.getenv("LAYER_CACHE_DIR", "/app/layer_cache")
+        print(f"Using cache directory: {cache_dir}")
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True, parents=True)
         self.loaded_cache = {}  # RAM cache

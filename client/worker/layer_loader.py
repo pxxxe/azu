@@ -9,7 +9,7 @@ from pathlib import Path
 from transformers import AutoConfig
 
 class LayerLoader:
-    def __init__(self, registry_url, cache_dir="./layer_cache"):
+    def __init__(self, registry_url, cache_dir=None):
         self.registry_url = registry_url
         if cache_dir is None:
           cache_dir = os.getenv("LAYER_CACHE_DIR", "/app/layer_cache")

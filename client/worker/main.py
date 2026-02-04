@@ -1,299 +1,285 @@
-import torch
 import asyncio
-import websockets
-import aiohttp
+import torch
 import json
-import base64
-import io
-import os
 import sys
-import urllib.request
+import os
 import traceback
-import time
-from aiohttp import web
-from typing import Dict, Set, List, Tuple
-from transformers import AutoTokenizer, AutoConfig
-from layer_loader import LayerLoader
-import gc
+from pathlib import Path
+from typing import Dict, Optional
+import websockets
+from aiohttp import web, ClientSession
+from transformers import AutoTokenizer
+from dataclasses import dataclass, field
 
-# CONFIG
+# Config
+HF_TOKEN = os.getenv("HF_TOKEN")
 SCHEDULER_URL = os.getenv("SCHEDULER_URL", "ws://localhost:8001/ws/worker")
 REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:8002")
-HF_TOKEN = os.getenv("HF_TOKEN")
+P2P_PUBLIC_URL = os.getenv("P2P_PUBLIC_URL")
+P2P_URL_TEMPLATE = os.getenv("P2P_URL_TEMPLATE")
+P2P_PORT = 8003
+P2P_TIMEOUT = 300  # 5 minutes
 
-P2P_TIMEOUT = None
-
+@dataclass
 class JobContext:
-    def __init__(self, job_id, input_shape=None):
-        self.job_id = job_id
-        # FIX: Add per-layer input queues for routers
-        self.layer_input_queues: Dict[int, asyncio.Queue] = {}
-        self.expert_input_queues: Dict[Tuple[int, int], asyncio.Queue] = {}
-        self.pending_expert_requests: Dict[Tuple[int, int], asyncio.Future] = {}
-        self.routing_weights: torch.Tensor = None
-        self.selected_indices: torch.Tensor = None
-        self.original_shape = input_shape
+    """Per-job state machine"""
+    layer_input_queues: Dict[int, asyncio.Queue] = field(default_factory=dict)
+    expert_queues: Dict[tuple, asyncio.Queue] = field(default_factory=dict)  # (layer_idx, expert_idx)
+    pending_expert_requests: Dict[tuple, asyncio.Future] = field(default_factory=dict)
+    original_shape: Optional[tuple] = None
 
     def get_layer_input_queue(self, layer_idx: int) -> asyncio.Queue:
-        """Get or create the input queue for a specific layer's router."""
         if layer_idx not in self.layer_input_queues:
             self.layer_input_queues[layer_idx] = asyncio.Queue()
         return self.layer_input_queues[layer_idx]
 
     def get_expert_queue(self, layer_idx: int, expert_idx: int) -> asyncio.Queue:
-        """Get or create the input queue for a specific (layer, expert) pair."""
         key = (layer_idx, expert_idx)
-        if key not in self.expert_input_queues:
-            self.expert_input_queues[key] = asyncio.Queue()
-        return self.expert_input_queues[key]
+        if key not in self.expert_queues:
+            self.expert_queues[key] = asyncio.Queue()
+        return self.expert_queues[key]
+
+class LayerLoader:
+    """Handles downloading layer files from registry"""
+    def __init__(self, registry_url: str, cache_dir: str):
+        self.registry_url = registry_url
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True, parents=True)
+        self.download_locks: Dict[str, asyncio.Lock] = {}  # NEW: Per-file download lock
+
+    async def _download(self, url: str, path: Path):
+        """Download with lock to prevent duplicate concurrent downloads"""
+        # Use the destination path as the lock key
+        lock_key = str(path)
+        if lock_key not in self.download_locks:
+            self.download_locks[lock_key] = asyncio.Lock()
+
+        async with self.download_locks[lock_key]:
+            # Check again inside lock - another task may have downloaded it
+            if path.exists():
+                print(f"   ✓ Using cached {path.name}")
+                return
+
+            print(f"   📥 Downloading {url}")
+            sys.stdout.flush()
+
+            async with ClientSession() as session:
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                        if resp.status != 200:
+                            raise Exception(f"HTTP {resp.status}")
+
+                        # Download in chunks to avoid memory issues
+                        temp_path = path.with_suffix('.tmp')
+                        with open(temp_path, 'wb') as f:
+                            async for chunk in resp.content.iter_chunked(1024 * 1024):  # 1MB chunks
+                                f.write(chunk)
+
+                        # Atomic rename
+                        temp_path.rename(path)
+                        print(f"   ✅ Downloaded {path.name}")
+                        sys.stdout.flush()
+
+                except Exception as e:
+                    if path.with_suffix('.tmp').exists():
+                        path.with_suffix('.tmp').unlink()
+                    print(f"   ❌ Error downloading {url}: {e}")
+                    sys.stdout.flush()
+                    raise e
+
+    async def load_embeddings(self, model_id: str, device):
+        sanitized = model_id.replace("/", "_")
+        path = self.cache_dir / f"{sanitized}_embeddings.pt"
+
+        if not path.exists():
+            await self._download(f"{self.registry_url}/layers/{sanitized}/embeddings.pt", path)
+
+        return torch.load(path, map_location=device)
+
+    async def load_dense_layer(self, model_id: str, layer_idx: int, device):
+        sanitized = model_id.replace("/", "_")
+        path = self.cache_dir / f"{sanitized}_layer_{layer_idx}_dense.pt"
+
+        if not path.exists():
+            await self._download(f"{self.registry_url}/layers/{sanitized}/layer_{layer_idx}_dense.pt", path)
+
+        return torch.load(path, map_location=device)
+
+    async def load_lm_head(self, model_id: str, device):
+        sanitized = model_id.replace("/", "_")
+        path = self.cache_dir / f"{sanitized}_lm_head.pt"
+
+        if not path.exists():
+            await self._download(f"{self.registry_url}/layers/{sanitized}/lm_head.pt", path)
+
+        return torch.load(path, map_location=device)
+
+    async def load_moe_router(self, model_id: str, layer_idx: int, device):
+        sanitized = model_id.replace("/", "_")
+
+        # Download config first
+        config_path = self.cache_dir / f"{sanitized}_config.json"
+        if not config_path.exists():
+            print(f"   📥 Fetching model config from registry...")
+            sys.stdout.flush()
+            await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+        else:
+            print(f"   ✓ Using cached {sanitized}_config.json")
+
+        # Load router weights
+        filename = f"layer_{layer_idx}_router.pt"
+        path = self.cache_dir / f"{sanitized}_{filename}"
+
+        print(f"   📋 Loading config from {config_path}...")
+        sys.stdout.flush()
+
+        if not path.exists():
+            await self._download(f"{self.registry_url}/layers/{sanitized}/{filename}", path)
+
+        return torch.load(path, map_location=device)
+
+    async def load_moe_expert(self, model_id: str, layer_idx: int, expert_idx: int, device):
+        sanitized = model_id.replace("/", "_")
+
+        # Download config first
+        config_path = self.cache_dir / f"{sanitized}_config.json"
+        if not config_path.exists():
+            print(f"   📥 Fetching model config from registry...")
+            sys.stdout.flush()
+            await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+        else:
+            print(f"   ✓ Using cached {sanitized}_config.json")
+
+        # Load expert weights
+        filename = f"layer_{layer_idx}_expert_{expert_idx}.pt"
+        path = self.cache_dir / f"{sanitized}_{filename}"
+
+        print(f"   📋 Loading config from {config_path}...")
+        sys.stdout.flush()
+
+        if not path.exists():
+            await self._download(f"{self.registry_url}/layers/{sanitized}/{filename}", path)
+
+        return torch.load(path, map_location=device)
 
 class MoEWorker:
     def __init__(self):
-        self._model_lock = asyncio.Lock()
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.loader = LayerLoader(REGISTRY_URL)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.vram_total_mb = torch.cuda.get_device_properties(0).total_memory // (1024**2) if torch.cuda.is_available() else 8000
 
-        # State
-        self.active_jobs: Dict[str, JobContext] = {}
-        self.loaded_model_id = None
-        self.model_config = None
-        self.current_model = None
-        self.p2p_session = None
+        self.loader = LayerLoader(REGISTRY_URL, "layer_cache")
 
-        # Hardware Specs
-        if torch.cuda.is_available():
-            props = torch.cuda.get_device_properties(0)
-            self.vram_total_mb = int(props.total_memory / (1024**2))
-            print(f"🎮 GPU Detected: {props.name} | VRAM: {self.vram_total_mb} MB")
-        else:
-            self.vram_total_mb = 32000 # Fallback for CPU dev
-            print("⚠️ No GPU detected, using simulated 32GB RAM")
-
-        sys.stdout.flush()
-
-        # Cache
-        self.dense_layers = {}
-        self.moe_routers = {}
-        self.moe_experts = {}
+        self.current_model_id = None
         self.embeddings = None
+        self.dense_layers: Dict[int, torch.nn.Module] = {}
+        self.moe_routers: Dict[int, torch.nn.Module] = {}
+        self.moe_experts: Dict[tuple, torch.nn.Module] = {}
         self.lm_head = None
-        self._context_lock = asyncio.Lock()
 
+        self.active_jobs: Dict[str, JobContext] = {}
+        self.p2p_app = None
+
+        print(f"🎮 GPU Detected: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'} | VRAM: {self.vram_total_mb} MB")
+        sys.stdout.flush()
 
     def get_p2p_url(self):
-        if os.getenv("P2P_PUBLIC_URL"):
-            return os.getenv("P2P_PUBLIC_URL").strip("/")
+        if P2P_PUBLIC_URL:
+            return P2P_PUBLIC_URL
+        elif P2P_URL_TEMPLATE:
+            pod_id = os.getenv("RUNPOD_POD_ID", "unknown")
+            return P2P_URL_TEMPLATE.replace("{RUNPOD_POD_ID}", pod_id)
+        return f"http://localhost:{P2P_PORT}"
 
-        template = os.getenv("P2P_URL_TEMPLATE")
-        if template:
-            try:
-                return template.format(**os.environ).strip("/")
-            except: pass
-
-        try:
-            ip = urllib.request.urlopen('https://api.ipify.org').read().decode('utf8')
-            return f"http://{ip}:8003"
-        except:
-            return "http://127.0.0.1:8003"
-
-    # --- P2P SERVER ---
     async def start_p2p_server(self):
-        # FIX: Set client_max_size to None (Unlimited) or 1GB.
-        # Default is 1MB, which rejects MoE tensor payloads causing the "stall".
-        app = web.Application(client_max_size=1024**3)
-        app.router.add_post('/tensor_in', self.handle_tensor_ingress)
-        runner = web.AppRunner(app)
+        """HTTP server for P2P tensor transfer"""
+        self.p2p_app = web.Application(client_max_size=1024**3)
+        self.p2p_app.router.add_post("/tensor_in", self.handle_p2p_tensor)
+
+        runner = web.AppRunner(self.p2p_app)
         await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', 8003)
-        await site.start()
-        print("👂 [P2P] Server listening on :8003 (Max Payload: 1GB)")
+        site = web.TCPSite(runner, '0.0.0.0', P2P_PORT)
+        asyncio.create_task(site.start())
+        print(f"👂 [P2P] Server listening on :{P2P_PORT} (Max Payload: 1GB)")
         sys.stdout.flush()
 
-    def _decode_tensor(self, b64_str):
-        buff = io.BytesIO(base64.b64decode(b64_str))
-        return torch.load(buff, map_location=self.device)
-
-    def _encode_tensor(self, tensor):
-        buff = io.BytesIO()
-        torch.save(tensor, buff)
-        return base64.b64encode(buff.getvalue()).decode('utf-8')
-
-    async def _get_context(self, job_id, create=False):
-        async with self._context_lock:
-            if job_id not in self.active_jobs:
-                if create:
-                    self.active_jobs[job_id] = JobContext(job_id)
-                else:
-                    return None
-            return self.active_jobs[job_id]
-
-    async def process_ingress_data(self, data):
-        """Internal handler for incoming tensor data (bypass logic)"""
+    async def handle_p2p_tensor(self, request):
+        """Receive tensor from another worker"""
+        data = await request.json()
         job_id = data['job_id']
-        msg_type = data.get('type', 'input')
-
-        print(f"📨 [P2P] Received {msg_type} for job {job_id[:8]}...")
-        sys.stdout.flush()
-
-        tensor = self._decode_tensor(data['tensor'])
-        print(f"   ✓ Decoded tensor shape: {tensor.shape}")
-        sys.stdout.flush()
+        tensor_data = data['tensor']
+        msg_type = data.get('type')
 
         ctx = await self._get_context(job_id, create=True)
+        tensor = self._decode_tensor(tensor_data)
 
         if msg_type == 'input':
-            expert_idx = data.get('expert_idx')
-            layer_idx = data.get('layer_idx')
-            target_layer_idx = data.get('target_layer_idx')  # NEW: For router-to-router forwarding
-
-            if expert_idx is not None and layer_idx is not None:
-                # Expert input
-                queue = ctx.get_expert_queue(layer_idx, expert_idx)
-                print(f"   ➡️ Enqueueing input tensor for layer {layer_idx} expert {expert_idx} of job {job_id[:8]}")
-                sys.stdout.flush()
-                await queue.put(tensor)
-                print(f"   ✓ Layer {layer_idx} expert {expert_idx} input enqueued (queue size: {queue.qsize()})")
-                sys.stdout.flush()
-            elif target_layer_idx is not None:
-                # NEW: Router-to-router input with explicit target layer
+            # Input for a layer or expert
+            target_layer_idx = data.get('target_layer_idx')
+            if target_layer_idx is not None:
                 queue = ctx.get_layer_input_queue(target_layer_idx)
-                print(f"   ➡️ Enqueueing input tensor for router layer {target_layer_idx} of job {job_id[:8]}")
-                sys.stdout.flush()
                 await queue.put(tensor)
-                print(f"   ✓ Router layer {target_layer_idx} input enqueued (queue size: {queue.qsize()})")
-                sys.stdout.flush()
-            else:
-                print(f"   ⚠️ Input message missing target info (expert_idx, layer_idx, or target_layer_idx)")
-                sys.stdout.flush()
+
+            expert_idx = data.get('expert_idx')
+            if expert_idx is not None:
+                layer_idx = data['layer_idx']
+                queue = ctx.get_expert_queue(layer_idx, expert_idx)
+                await queue.put(tensor)
 
         elif msg_type == 'expert_result':
-            expert_idx = data.get('expert_idx')
-            layer_idx = data.get('layer_idx')
-            print(f"   ⬅️ Received expert {expert_idx} result for layer {layer_idx} job {job_id[:8]}")
-            sys.stdout.flush()
+            # Result from an expert
+            layer_idx = data['layer_idx']
+            expert_idx = data['expert_idx']
+            key = (layer_idx, expert_idx)
 
-            if expert_idx is not None and layer_idx is not None:
-                key = (layer_idx, expert_idx)
-                if key in ctx.pending_expert_requests:
-                    future = ctx.pending_expert_requests[key]
-                    if not future.done():
-                        future.set_result(tensor)
-                        print(f"   ✓ Layer {layer_idx} expert {expert_idx} future resolved")
-                        sys.stdout.flush()
+            if key in ctx.pending_expert_requests:
+                future = ctx.pending_expert_requests[key]
+                if not future.done():
+                    future.set_result(tensor)
 
-    async def handle_tensor_ingress(self, request):
-        try:
-            data = await request.json()
-            await self.process_ingress_data(data)
-            return web.Response(text="OK")
-        except Exception as e:
-            print(f"❌ [P2P] Error handling ingress: {e}")
-            traceback.print_exc()
-            sys.stdout.flush()
-            return web.Response(status=500, text=str(e))
+        return web.Response(text="OK")
 
-    # --- EXECUTION LOGIC ---
-    async def _send_p2p(self, url, payload):
-        """Send tensor to another worker. Includes LOOPBACK OPTIMIZATION."""
-        job_id = payload.get('job_id', 'unknown')
-        msg_type = payload.get('type', 'unknown')
+    def _encode_tensor(self, tensor: torch.Tensor) -> dict:
+        return {
+            "shape": list(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "data": tensor.cpu().numpy().tobytes().hex()
+        }
 
-        print(f"📤 [P2P] Sending {msg_type} for job {job_id[:8] if len(job_id) > 8 else job_id} to {url}")
-        sys.stdout.flush()
+    def _decode_tensor(self, data: dict) -> torch.Tensor:
+        import numpy as np
+        arr = np.frombuffer(bytes.fromhex(data['data']), dtype=data['dtype'])
+        arr = arr.reshape(data['shape'])
+        return torch.from_numpy(arr.copy())
 
-        # 1. Check for Loopback (Self-Transfer)
-        my_p2p = self.get_p2p_url().rstrip("/")
-        target_base = url.replace("/tensor_in", "").rstrip("/")
-
-        if my_p2p == target_base:
-            # Short-circuit: Inject directly into local handler
-            print(f"⚡ [P2P] Loopback detected. Short-circuiting to local handler")
-            sys.stdout.flush()
+    async def _send_p2p(self, url: str, payload: dict):
+        """Send tensor to another worker"""
+        async with ClientSession() as session:
             try:
-                await self.process_ingress_data(payload)
-                print(f"   ✓ Loopback delivery successful")
-                sys.stdout.flush()
-                return
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status != 200:
+                        print(f"   ⚠️ P2P send failed: {resp.status}")
             except Exception as e:
-                print(f"❌ Local P2P Error: {e}")
-                traceback.print_exc()
-                sys.stdout.flush()
-                return
+                print(f"   ❌ P2P send error: {e}")
 
-        # 2. Actual Network Transfer
-        if self.p2p_session is None or self.p2p_session.closed:
-            timeout = aiohttp.ClientTimeout(total=60, connect=10)
-            connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
-            self.p2p_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+    async def _get_context(self, job_id: str, create: bool = False) -> Optional[JobContext]:
+        if job_id not in self.active_jobs and create:
+            self.active_jobs[job_id] = JobContext()
+        return self.active_jobs.get(job_id)
 
-        print(f"   🌐 Sending over network to {url}")
-        sys.stdout.flush()
-        for attempt in range(3):
-            try:
-                # Use the persistent session
-                async with self.p2p_session.post(url, json=payload) as resp:
-                    if resp.status == 200:
-                        # Success - handshake completed and data accepted
-                        return
-                    else:
-                        text = await resp.text()
-                        print(f"   ⚠️ P2P Handshake Rejected {resp.status}: {text[:100]}")
-                        sys.stdout.flush()
-            except Exception as e:
-                print(f"   ⚠️ Connection Failed (attempt {attempt + 1}): {e}")
-                sys.stdout.flush()
-                await asyncio.sleep(0.2)
-
-        print(f"❌ Failed to send to {url} after 3 attempts")
-        sys.stdout.flush()
-
-    async def _ensure_model(self, model_id):
-        if self.current_model == model_id:
-            return  # fast path, no lock needed
-
-        async with self._model_lock:
-            # Double-check after acquiring lock
-            if self.current_model == model_id:
-                return
-
+    async def _ensure_model(self, model_id: str):
+        """Ensure we're working with the correct model"""
+        if self.current_model_id != model_id:
             print(f"🧹 New model {model_id} requested. Clearing VRAM...")
             sys.stdout.flush()
+
             self.embeddings = None
-            self.lm_head = None
             self.dense_layers.clear()
             self.moe_routers.clear()
             self.moe_experts.clear()
-            self.active_jobs.clear()
-            gc.collect()
+            self.lm_head = None
             torch.cuda.empty_cache()
 
-            print(f"📥 Fetching model config from registry...")
-            sys.stdout.flush()
-            sanitized = model_id.replace("/", "_")
-            config_path = self.loader.cache_dir / f"{sanitized}_config.json"
-
-            try:
-                timeout = aiohttp.ClientTimeout(total=30)
-                async with aiohttp.ClientSession(timeout=timeout) as sess:
-                    config_url = f"{REGISTRY_URL}/layers/{sanitized}/config.json"
-                    async with sess.get(config_url) as cfg_resp:
-                        if cfg_resp.status != 200:
-                            raise Exception(f"Config not found: {cfg_resp.status}")
-                        cfg_data = await cfg_resp.read()
-                        config_path.parent.mkdir(parents=True, exist_ok=True)
-                        with open(config_path, 'wb') as f:
-                            f.write(cfg_data)
-
-                self.model_config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
-                print(f"✅ Config loaded from registry ({self.model_config.architectures[0]})")
-                sys.stdout.flush()
-
-            except Exception as e:
-                print(f"❌ Failed to load config from registry: {e}")
-                sys.stdout.flush()
-                raise
-
-            self.current_model = model_id
+            self.current_model_id = model_id
 
     async def process_dense(self, msg, ws):
         job_id = msg['job_id']
@@ -309,34 +295,10 @@ class MoEWorker:
         ctx = await self._get_context(job_id, create=True)
 
         # ---------------------------------------------------------
-        # ARROGANT FIX: PRE-LOAD EVERYTHING BEFORE WAITING
+        # CRITICAL FIX: ONLY LOAD AFTER INPUT IS READY
         # ---------------------------------------------------------
 
-        # 1. Pre-load Embeddings if needed
-        if msg.get('is_first') and not self.embeddings:
-            print(f"⚡ [Job {job_id[:8]}] Pre-loading embeddings...")
-            sys.stdout.flush()
-            self.embeddings = await self.loader.load_embeddings(model_id, self.device)
-
-        # 2. Pre-load Dense Layer if needed
-        if layer_idx != -1 and layer_idx not in self.dense_layers:
-            print(f"📦 [Job {job_id[:8]}] Pre-loading dense layer {layer_idx}...")
-            sys.stdout.flush()
-            self.dense_layers[layer_idx] = await self.loader.load_dense_layer(
-                model_id, layer_idx, self.device
-            )
-
-        # 3. Pre-load LM Head if needed
-        if msg.get('is_last') and not self.lm_head:
-            print(f"🔚 [Job {job_id[:8]}] Pre-loading LM Head...")
-            sys.stdout.flush()
-            self.lm_head = await self.loader.load_lm_head(model_id, self.device)
-
-        # ---------------------------------------------------------
-        # END PRE-LOAD - NOW WE WAIT
-        # ---------------------------------------------------------
-
-        # 4. Input Processing
+        # 1. Get input FIRST
         hidden_states = None
         if msg.get('is_first'):
             print(f"   🔤 Tokenizing prompt...")
@@ -344,6 +306,12 @@ class MoEWorker:
             prompt = msg['input']
             tokenizer = AutoTokenizer.from_pretrained(model_id, token=HF_TOKEN, trust_remote_code=True)
             inputs = tokenizer(prompt, return_tensors="pt").to(self.device)
+
+            # NOW load embeddings
+            if not self.embeddings:
+                print(f"⚡ [Job {job_id[:8]}] Loading embeddings...")
+                sys.stdout.flush()
+                self.embeddings = await self.loader.load_embeddings(model_id, self.device)
 
             print(f"   ⚙️ Running embedding layer...")
             with torch.no_grad():
@@ -353,7 +321,7 @@ class MoEWorker:
             print(f"   ✅ Embeddings complete. Shape: {hidden_states.shape}")
 
         else:
-            # Wait for P2P input
+            # Wait for P2P input FIRST
             queue = ctx.get_layer_input_queue(layer_idx)
             print(f"   ⏳ Waiting for input tensor on layer {layer_idx} input queue (timeout={P2P_TIMEOUT}s)...")
             sys.stdout.flush()
@@ -365,7 +333,15 @@ class MoEWorker:
                 sys.stdout.flush()
                 return
 
-        # 5. Process Layer
+        # 2. NOW load layer weights (after we have input)
+        if layer_idx != -1 and layer_idx not in self.dense_layers:
+            print(f"📦 [Job {job_id[:8]}] Loading dense layer {layer_idx}...")
+            sys.stdout.flush()
+            self.dense_layers[layer_idx] = await self.loader.load_dense_layer(
+                model_id, layer_idx, self.device
+            )
+
+        # 3. Process Layer
         if layer_idx != -1:
             print(f"   ⚙️ Running dense layer {layer_idx}...")
             sys.stdout.flush()
@@ -377,8 +353,14 @@ class MoEWorker:
         else:
             layer_out = hidden_states
 
-        # 6. Decode (if last)
+        # 4. Decode (if last)
         if msg.get('is_last'):
+            # NOW load LM head
+            if not self.lm_head:
+                print(f"🔚 [Job {job_id[:8]}] Loading LM Head...")
+                sys.stdout.flush()
+                self.lm_head = await self.loader.load_lm_head(model_id, self.device)
+
             print(f"   🔚 Final layer — decoding token...")
             sys.stdout.flush()
             with torch.no_grad():
@@ -402,7 +384,7 @@ class MoEWorker:
                 del self.active_jobs[job_id]
             return
 
-        # 7. Forward to next layer
+        # 5. Forward to next layer
         if next_hop:
             print(f"   ➡️ Forwarding to next hop: {next_hop}")
             sys.stdout.flush()
@@ -433,18 +415,10 @@ class MoEWorker:
         ctx = await self._get_context(job_id, create=True)
 
         # ---------------------------------------------------------
-        # ARROGANT FIX: PRE-LOAD ROUTER
+        # CRITICAL FIX: GET INPUT FIRST, THEN LOAD ROUTER
         # ---------------------------------------------------------
-        if layer_idx not in self.moe_routers:
-            print(f"📦 [Job {job_id[:8]}] Pre-loading router {layer_idx}...")
-            sys.stdout.flush()
-            self.moe_routers[layer_idx] = await self.loader.load_moe_router(
-                model_id, layer_idx, self.device
-            )
 
-        # ---------------------------------------------------------
-        # NOW WAIT
-        # ---------------------------------------------------------
+        # 1. Wait for input FIRST
         queue = ctx.get_layer_input_queue(layer_idx)
         print(f"   ⏳ Waiting for input tensor on layer {layer_idx} input queue (timeout={P2P_TIMEOUT}s)...")
         sys.stdout.flush()
@@ -455,6 +429,14 @@ class MoEWorker:
             print(f"❌ [Job {job_id[:8]}] Router timed out waiting for input")
             sys.stdout.flush()
             return
+
+        # 2. NOW load router (after we have input)
+        if layer_idx not in self.moe_routers:
+            print(f"📦 [Job {job_id[:8]}] Loading router {layer_idx}...")
+            sys.stdout.flush()
+            self.moe_routers[layer_idx] = await self.loader.load_moe_router(
+                model_id, layer_idx, self.device
+            )
 
         print(f"   ⚙️ Running router...")
         sys.stdout.flush()
@@ -558,19 +540,10 @@ class MoEWorker:
         ctx = await self._get_context(job_id, create=True)
 
         # ---------------------------------------------------------
-        # ARROGANT FIX: PRE-LOAD EXPERT
+        # CRITICAL FIX: WAIT FOR INPUT FIRST, THEN LOAD EXPERT
         # ---------------------------------------------------------
-        cache_key = (layer_idx, expert_idx)
-        if cache_key not in self.moe_experts:
-            print(f"📦 [Job {job_id[:8]}] Pre-loading expert {expert_idx} (Layer {layer_idx})...")
-            sys.stdout.flush()
-            self.moe_experts[cache_key] = await self.loader.load_moe_expert(
-                model_id, layer_idx, expert_idx, self.device
-            )
 
-        # ---------------------------------------------------------
-        # NOW WAIT
-        # ---------------------------------------------------------
+        # 1. Wait for input FIRST
         expert_queue = ctx.get_expert_queue(layer_idx, expert_idx)
         print(f"   ⏳ Waiting for input tensor on layer {layer_idx} expert queue {expert_idx} (timeout={P2P_TIMEOUT}s)...")
         sys.stdout.flush()
@@ -581,6 +554,15 @@ class MoEWorker:
         except asyncio.TimeoutError:
             print(f"⏭️ [Job {job_id[:8]}] Expert {expert_idx} layer {layer_idx} not selected by router — exiting cleanly")
             return
+
+        # 2. NOW load expert (after we have input)
+        cache_key = (layer_idx, expert_idx)
+        if cache_key not in self.moe_experts:
+            print(f"📦 [Job {job_id[:8]}] Loading expert {expert_idx} (Layer {layer_idx})...")
+            sys.stdout.flush()
+            self.moe_experts[cache_key] = await self.loader.load_moe_expert(
+                model_id, layer_idx, expert_idx, self.device
+            )
 
         print(f"   ⚙️ Running expert {expert_idx}...")
         with torch.no_grad():
@@ -661,4 +643,5 @@ class MoEWorker:
                 await asyncio.sleep(5)
 
 if __name__ == "__main__":
+    import aiohttp
     asyncio.run(MoEWorker().run())

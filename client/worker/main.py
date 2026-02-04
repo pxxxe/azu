@@ -65,14 +65,14 @@ class LayerLoader:
 
             async with ClientSession() as session:
                 try:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=180)) as resp:
                         if resp.status != 200:
                             raise Exception(f"HTTP {resp.status}")
 
                         # Download in chunks to avoid memory issues
                         temp_path = path.with_suffix('.tmp')
                         with open(temp_path, 'wb') as f:
-                            async for chunk in resp.content.iter_chunked(1024 * 1024):  # 1MB chunks
+                            async for chunk in resp.content.iter_chunked(1024 * 1024 * 256):  # 256MB chunks
                                 f.write(chunk)
 
                         # Atomic rename

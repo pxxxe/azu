@@ -19,20 +19,12 @@ class LayerLoader:
         self.loaded_cache = {}  # RAM cache
 
         # --- CONCURRENCY CONTROL ---
-        # 1. ThreadPool for blocking torch.load (CPU bound + Disk Read)
-        #    prevents the event loop from freezing during 500MB+ loads.
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
-
-        # 2. Semaphore for Network/Disk Write concurrency
-        #    prevents opening too many simultaneous connections
         self.sem = asyncio.Semaphore(10)
-
-        # 3. Shared Session for Connection Pooling (Keep-Alive)
         self.session = None
         self.download_locks: dict[str, asyncio.Lock] = {}
 
     async def _get_session(self):
-        """Lazy-load the shared session with high connection limits."""
         if self.session is None:
             connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
             timeout = aiohttp.ClientTimeout(total=600, connect=60)
@@ -40,10 +32,6 @@ class LayerLoader:
         return self.session
 
     async def _load_weights_safe(self, path):
-        """
-        Offload torch.load to a thread.
-        Critical for preventing the P2P heartbeat from dying while loading huge files.
-        """
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             self.executor,
@@ -51,20 +39,23 @@ class LayerLoader:
         )
 
     async def _download(self, url: str, path: Path):
-        """Helper to download a file from Registry to Worker Disk (STREAMING & NON-BLOCKING)"""
+        """Helper to download a file from Registry to Worker Disk"""
 
-        # 1. Per-file locking to prevent duplicate downloads of the same shard
+        # Ensure parent directory exists (for model subfolders)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
         lock_key = str(path)
         if lock_key not in self.download_locks:
             self.download_locks[lock_key] = asyncio.Lock()
 
         async with self.download_locks[lock_key]:
+            # === THE FIX IS HERE ===
+            # If sharing a volume with Registry, this check will pass immediately
             if path.exists() and path.stat().st_size > 0:
                 print(f"   ✓ Using cached {path.name}")
                 sys.stdout.flush()
                 return
 
-            # 2. Global concurrency semaphore
             async with self.sem:
                 print(f"   ⬇️ Downloading {url}...")
                 sys.stdout.flush()
@@ -77,16 +68,13 @@ class LayerLoader:
                         if resp.status != 200:
                             raise Exception(f"Download failed [{resp.status}]: {url}")
 
-                        # 3. STREAMING DOWNLOAD (Chunked + Yield)
                         with open(temp, 'wb') as f:
                             downloaded = 0
-                            # CRITICAL FIX: 4MB chunks + sleep(0) prevents event loop starvation
                             async for chunk in resp.content.iter_chunked(4 * 1024 * 1024):
                                 f.write(chunk)
                                 downloaded += len(chunk)
-                                await asyncio.sleep(0) # Yield to event loop
+                                await asyncio.sleep(0)
 
-                    # Atomic Move
                     os.rename(temp, path)
                     print(f"   ✅ Downloaded {path.name} ({downloaded / (1024*1024):.2f} MB)")
                     sys.stdout.flush()
@@ -99,10 +87,7 @@ class LayerLoader:
                     raise e
 
     def _get_layer_class(self, config):
-        """Map architecture string to actual PyTorch Layer Class using dynamic imports."""
         arch = config.architectures[0]
-
-        # Generic fallback pattern: XForCausalLM -> XDecoderLayer
         try:
             if arch.endswith("ForCausalLM"):
                 base = arch[:-len("ForCausalLM")]
@@ -114,7 +99,6 @@ class LayerLoader:
             module_name = base.lower()
             class_name = f"{base}DecoderLayer"
 
-            # Mixtral edge case
             if "Mixtral" in arch:
                 class_name = "MixtralDecoderLayer"
 
@@ -125,25 +109,30 @@ class LayerLoader:
         except Exception as e:
             raise ValueError(f"Could not load layer class for {arch}: {e}")
 
+    # === UPDATE HELPER FOR PATHS ===
+    def _get_paths(self, model_id, filename):
+        sanitized = model_id.replace("/", "_")
+        # UPDATED: Use subdirectory structure matching Registry
+        path = self.cache_dir / sanitized / filename
+        url = f"{self.registry_url}/layers/{sanitized}/{filename}"
+        return path, url
+
     async def load_dense_layer(self, model_id: str, layer_idx: int, device="cuda"):
-        """Load a regular dense transformer layer."""
         cache_key = f"{model_id}:dense:{layer_idx}"
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
 
-        sanitized = model_id.replace("/", "_")
-
         # 1. Config
-        config_path = self.cache_dir / f"{sanitized}_config.json"
-        await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+        config_path, config_url = self._get_paths(model_id, "config.json")
+        await self._download(config_url, config_path)
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
         # 2. Weights
         filename = f"layer_{layer_idx}_dense.pt"
-        path = self.cache_dir / f"{sanitized}_{filename}"
-        await self._download(f"{self.registry_url}/layers/{sanitized}/{filename}", path)
+        path, url = self._get_paths(model_id, filename)
+        await self._download(url, path)
 
-        # 3. Create & Load (Offloaded)
+        # 3. Create & Load
         LayerClass = self._get_layer_class(config)
         layer = LayerClass(config, layer_idx=layer_idx).to(device).half()
 
@@ -155,22 +144,19 @@ class LayerLoader:
         return layer
 
     async def load_moe_router(self, model_id: str, layer_idx: int, device="cuda"):
-        """Load the router/gate for an MoE layer."""
         cache_key = f"{model_id}:router:{layer_idx}"
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
 
-        sanitized = model_id.replace("/", "_")
-
         # 1. Config
-        config_path = self.cache_dir / f"{sanitized}_config.json"
-        await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+        config_path, config_url = self._get_paths(model_id, "config.json")
+        await self._download(config_url, config_path)
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
         # 2. Weights
         filename = f"layer_{layer_idx}_router.pt"
-        path = self.cache_dir / f"{sanitized}_{filename}"
-        await self._download(f"{self.registry_url}/layers/{sanitized}/{filename}", path)
+        path, url = self._get_paths(model_id, filename)
+        await self._download(url, path)
 
         # 3. Create & Load
         num_experts = getattr(config, 'num_local_experts', 8)
@@ -184,25 +170,21 @@ class LayerLoader:
         return router
 
     async def load_moe_expert(self, model_id: str, layer_idx: int, expert_idx: int, device="cuda"):
-        """Load a specific expert from an MoE layer."""
         cache_key = f"{model_id}:expert:{layer_idx}:{expert_idx}"
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
 
-        sanitized = model_id.replace("/", "_")
-
         # 1. Config
-        config_path = self.cache_dir / f"{sanitized}_config.json"
-        await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+        config_path, config_url = self._get_paths(model_id, "config.json")
+        await self._download(config_url, config_path)
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
         # 2. Weights
         filename = f"layer_{layer_idx}_expert_{expert_idx}.pt"
-        path = self.cache_dir / f"{sanitized}_{filename}"
-        await self._download(f"{self.registry_url}/layers/{sanitized}/{filename}", path)
+        path, url = self._get_paths(model_id, filename)
+        await self._download(url, path)
 
         # 3. Create & Load
-        # Basic MLP Expert (Mixtral style)
         class ExpertFFN(torch.nn.Module):
             def __init__(self, hidden_size, intermediate_size):
                 super().__init__()
@@ -228,14 +210,12 @@ class LayerLoader:
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
 
-        sanitized = model_id.replace("/", "_")
-
-        config_path = self.cache_dir / f"{sanitized}_config.json"
-        await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+        config_path, config_url = self._get_paths(model_id, "config.json")
+        await self._download(config_url, config_path)
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
-        path = self.cache_dir / f"{sanitized}_embeddings.pt"
-        await self._download(f"{self.registry_url}/layers/{sanitized}/embeddings.pt", path)
+        path, url = self._get_paths(model_id, "embeddings.pt")
+        await self._download(url, path)
 
         emb = torch.nn.Embedding(config.vocab_size, config.hidden_size).to(device).half()
         state_dict = await self._load_weights_safe(path)
@@ -250,14 +230,12 @@ class LayerLoader:
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
 
-        sanitized = model_id.replace("/", "_")
-
-        config_path = self.cache_dir / f"{sanitized}_config.json"
-        await self._download(f"{self.registry_url}/layers/{sanitized}/config.json", config_path)
+        config_path, config_url = self._get_paths(model_id, "config.json")
+        await self._download(config_url, config_path)
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
-        path = self.cache_dir / f"{sanitized}_lm_head.pt"
-        await self._download(f"{self.registry_url}/layers/{sanitized}/lm_head.pt", path)
+        path, url = self._get_paths(model_id, "lm_head.pt")
+        await self._download(url, path)
 
         head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False).to(device).half()
         state_dict = await self._load_weights_safe(path)

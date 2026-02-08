@@ -188,7 +188,7 @@ class MoEWorker:
         target_base = url.replace("/tensor_in", "").rstrip("/")
 
         # Prepare Metadata
-        np_tensor = tensor.detach().cpu().numpy()
+        np_tensor = tensor.detach().cpu().contiguous().numpy()
         dtype_str = str(np_tensor.dtype)
         shape_json = json.dumps(list(np_tensor.shape))
 

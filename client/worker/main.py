@@ -277,33 +277,51 @@ class MoEWorker:
     async def process_dense(self, msg, ws):
         job_id = msg['job_id']
         model_id = msg['model_id']
-        layer_idx = msg['layer_idx']
+        layer_idx = msg.get('layer_idx', -1)
         next_hop = msg.get('next_hop')
         next_layer_idx = msg.get('next_layer_idx')
 
         print(f"🔵 [DENSE] Processing job {job_id[:8]}, layer_idx={layer_idx}")
+
         await self._ensure_model(model_id)
         ctx = await self._get_context(job_id, create=True)
 
-        hidden_states = None
-
-        # --- JIT Embeddings ---
+        # --- JIT Embedding ---
         if msg.get('is_first'):
-            print(f"   🔤 Tokenizing prompt...")
-            prompt = msg['input']
-            tokenizer = AutoTokenizer.from_pretrained(model_id, token=HF_TOKEN, trust_remote_code=True)
-            inputs = tokenizer(prompt, return_tensors="pt").to(self.device)
-
             if not self.embeddings:
-                print(f"⚡ Loading embeddings...")
+                print(f"📦 Loading embeddings...")
                 self.embeddings = await self.loader.load_embeddings(model_id, self.device)
 
-            with torch.no_grad():
-                hidden_states = self.embeddings(inputs['input_ids'])
+            # FIX: Load and cache tokenizer for embeddings
+            if not self.tokenizer:
+                print(f"📖 Loading Tokenizer for embeddings...")
+                sanitized = model_id.replace("/", "_")
+                config_path = self.loader.cache_dir / sanitized
+
+                # Download tokenizer files if not cached
+                for filename in ["config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"]:
+                    file_path, file_url = self.loader._get_paths(model_id, filename)
+                    try:
+                        await self.loader._download(file_url, file_path)
+                    except Exception as e:
+                        if "tokenizer" in filename:
+                            print(f"   ⚠️ Optional file {filename} not found: {e}")
+
+                # Load tokenizer from cached directory
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    str(config_path),
+                    token=HF_TOKEN,
+                    trust_remote_code=True,
+                    local_files_only=True
+                )
+                print(f"   ✅ Tokenizer loaded (vocab_size={len(self.tokenizer)})")
+
+            input_ids = self.tokenizer.encode(msg['input'], return_tensors='pt').to(self.device)
+            hidden_states = self.embeddings(input_ids)
         else:
             queue = ctx.get_layer_input_queue(layer_idx)
-            print(f"   ⏳ Waiting for input tensor...")
             try:
+                print(f"   ⏳ Waiting for input tensor...")
                 hidden_states = await asyncio.wait_for(queue.get(), timeout=P2P_TIMEOUT)
             except asyncio.TimeoutError:
                 print(f"❌ [Job {job_id[:8]}] Timeout waiting for input")
@@ -326,26 +344,73 @@ class MoEWorker:
                 print(f"🔚 Loading LM Head...")
                 self.lm_head = await self.loader.load_lm_head(model_id, self.device)
 
-            # FIX: Load and cache tokenizer once
+            # CRITICAL FIX: Load tokenizer from the SAME sharded directory as config
             if not self.tokenizer:
-                self.tokenizer = AutoTokenizer.from_pretrained(model_id, token=HF_TOKEN, trust_remote_code=True)
+                print(f"📖 Loading Tokenizer for decode...")
+                sanitized = model_id.replace("/", "_")
+                config_path = self.loader.cache_dir / sanitized
+
+                # Download tokenizer files if not cached
+                for filename in ["config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"]:
+                    file_path, file_url = self.loader._get_paths(model_id, filename)
+                    try:
+                        await self.loader._download(file_url, file_path)
+                    except Exception as e:
+                        if "tokenizer" in filename:
+                            print(f"   ⚠️ Optional file {filename} not found: {e}")
+
+                # Load tokenizer from cached directory (same place as config.json)
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    str(config_path),
+                    token=HF_TOKEN,
+                    trust_remote_code=True,
+                    local_files_only=True
+                )
+                print(f"   ✅ Tokenizer loaded (vocab_size={len(self.tokenizer)})")
+
+            # Validate vocab size matches lm_head
+            if len(self.tokenizer) != self.lm_head.out_features:
+                error_msg = (
+                    f"CRITICAL: Vocabulary size mismatch! "
+                    f"Tokenizer vocab_size={len(self.tokenizer)}, "
+                    f"LM Head out_features={self.lm_head.out_features}"
+                )
+                print(f"   ❌ {error_msg}")
+                await ws.send(json.dumps({
+                    "type": "RESULT",
+                    "job_id": job_id,
+                    "status": "failed",
+                    "error": error_msg
+                }))
+                del self.active_jobs[job_id]
+                return
 
             with torch.no_grad():
                 logits = self.lm_head(layer_out[:, -1, :])
                 token_id = torch.argmax(logits, dim=-1).item()
 
-            # FIX: Validate token_id before decoding
+            # Validate token_id before decoding
             if token_id < 0 or token_id >= len(self.tokenizer):
                 print(f"   ❌ Invalid token_id {token_id} (vocab_size={len(self.tokenizer)})")
                 print(f"   📊 logits.shape={logits.shape}, LM head out_features={self.lm_head.out_features}")
-                await ws.send(json.dumps({"type": "RESULT", "job_id": job_id, "status": "failed", "error": f"Invalid token_id {token_id}"}))
+                await ws.send(json.dumps({
+                    "type": "RESULT",
+                    "job_id": job_id,
+                    "status": "failed",
+                    "error": f"Invalid token_id {token_id}"
+                }))
                 del self.active_jobs[job_id]
                 return
 
             text = self.tokenizer.decode([token_id])
-            print(f"   🎉 GENERATED TOKEN: '{text}'")
+            print(f"   🎉 GENERATED TOKEN: '{text}' (token_id={token_id})")
 
-            await ws.send(json.dumps({"type": "RESULT", "job_id": job_id, "status": "completed", "output": text}))
+            await ws.send(json.dumps({
+                "type": "RESULT",
+                "job_id": job_id,
+                "status": "completed",
+                "output": text
+            }))
             del self.active_jobs[job_id]
             return
 
@@ -355,7 +420,7 @@ class MoEWorker:
                 "job_id": job_id,
                 "type": "input",
                 "target_layer_idx": next_layer_idx
-            }, layer_out) # Send tensor as arg
+            }, layer_out)
 
     async def process_moe_router(self, msg, ws):
         job_id = msg['job_id']

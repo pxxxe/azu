@@ -430,8 +430,41 @@ class LayerStore:
                     raise RuntimeError(f"LM head file was not created: {head_file}")
                 print(f"      ✅ LM head saved")
 
-            # 7. Metadata
+            # 7. Metadata & Tokenizer
             config.save_pretrained(out_dir)
+
+            # CRITICAL FIX: Save tokenizer to ensure vocab alignment
+            try:
+                print("   💾 Saving tokenizer...")
+                from transformers import AutoTokenizer as TokenizerClass
+                tokenizer = TokenizerClass.from_pretrained(
+                    model_path,
+                    token=hf_token,
+                    trust_remote_code=True
+                )
+                tokenizer.save_pretrained(out_dir)
+
+                # Verify vocab size matches lm_head if it was saved
+                head_file = out_dir / "lm_head.safetensors"
+                if head_file.exists():
+                    head_state = load_safetensors(head_file)
+                    head_vocab_size = head_state['weight'].shape[0]
+                    tokenizer_vocab_size = len(tokenizer)
+
+                    if head_vocab_size != tokenizer_vocab_size:
+                        print(f"      ⚠️ WARNING: Vocab size mismatch!")
+                        print(f"         LM Head: {head_vocab_size}")
+                        print(f"         Tokenizer: {tokenizer_vocab_size}")
+                    else:
+                        print(f"      ✅ Tokenizer saved (vocab_size={tokenizer_vocab_size}, matches LM head)")
+                else:
+                    print(f"      ✅ Tokenizer saved (vocab_size={len(tokenizer)})")
+
+            except Exception as e:
+                print(f"      ⚠️ Warning: Could not save tokenizer: {e}")
+                print(f"         Workers will fall back to loading from HuggingFace")
+                # Non-fatal - worker can fall back to HF if needed
+
             structure = {
                 "model_id": model_id,
                 "num_layers": num_layers,

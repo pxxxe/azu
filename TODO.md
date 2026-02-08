@@ -8,4 +8,4 @@
 - [ ] Raw binary for tensor transfer
 - [ ] Disallow untrusted code
 - [ ] Implement secure communication channels
-- [ ] Implement BYO Scheduling strategy s
+- [ ] Implement BYO Scheduling strategy

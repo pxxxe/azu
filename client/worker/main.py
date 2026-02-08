@@ -70,6 +70,7 @@ class MoEWorker:
         # Model Components
         self.embeddings = None
         self.lm_head = None
+        self.tokenizer = None  # FIX: Add tokenizer caching
         self.dense_layers = {}
         self.moe_routers = {}
         self.moe_experts = {}
@@ -263,6 +264,7 @@ class MoEWorker:
 
             self.embeddings = None
             self.lm_head = None
+            self.tokenizer = None  # FIX: Clear tokenizer cache
             self.dense_layers.clear()
             self.moe_routers.clear()
             self.moe_experts.clear()
@@ -324,12 +326,23 @@ class MoEWorker:
                 print(f"🔚 Loading LM Head...")
                 self.lm_head = await self.loader.load_lm_head(model_id, self.device)
 
+            # FIX: Load and cache tokenizer once
+            if not self.tokenizer:
+                self.tokenizer = AutoTokenizer.from_pretrained(model_id, token=HF_TOKEN, trust_remote_code=True)
+
             with torch.no_grad():
                 logits = self.lm_head(layer_out[:, -1, :])
                 token_id = torch.argmax(logits, dim=-1).item()
 
-            tokenizer = AutoTokenizer.from_pretrained(model_id, token=HF_TOKEN, trust_remote_code=True)
-            text = tokenizer.decode([token_id])
+            # FIX: Validate token_id before decoding
+            if token_id < 0 or token_id >= len(self.tokenizer):
+                print(f"   ❌ Invalid token_id {token_id} (vocab_size={len(self.tokenizer)})")
+                print(f"   📊 logits.shape={logits.shape}, LM head out_features={self.lm_head.out_features}")
+                await ws.send(json.dumps({"type": "RESULT", "job_id": job_id, "status": "failed", "error": f"Invalid token_id {token_id}"}))
+                del self.active_jobs[job_id]
+                return
+
+            text = self.tokenizer.decode([token_id])
             print(f"   🎉 GENERATED TOKEN: '{text}'")
 
             await ws.send(json.dumps({"type": "RESULT", "job_id": job_id, "status": "completed", "output": text}))

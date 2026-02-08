@@ -223,8 +223,9 @@ class LayerLoader:
         path, url = self._get_paths(model_id, "lm_head.safetensors")
         await self._download(url, path)
 
-        head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False).to(device).half()
         state_dict = await self._load_weights_safe(path)
+        actual_vocab_size = state_dict['weight'].shape[0]
+        head = torch.nn.Linear(config.hidden_size, actual_vocab_size, bias=False).to(device).half()
         head.load_state_dict(state_dict)
         head.eval()
 

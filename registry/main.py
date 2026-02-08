@@ -49,40 +49,115 @@ async def background_shard_task(model_id: str, hf_token: str):
         await r.set(f"shard_status:{model_id}", f"failed: {err_msg}")
 
 @app.post("/models/shard")
-async def shard_model(req: ShardRequest, background_tasks: BackgroundTasks):
-    try:
-        # FORCE MODE: Delete existing files and re-shard
-        if req.force:
-            sanitized = req.model_id.replace("/", "_")
-            model_dir = store.storage_path / sanitized
-            if model_dir.exists():
-                print(f"🗑️ FORCE MODE: Deleting existing model directory {model_dir}")
-                shutil.rmtree(model_dir)
-                print(f"✅ Deleted {model_dir}")
+async def shard_model(model_id: str):
+    model_dir = os.path.join(LAYER_DIR, model_id.replace('/', '_'))
+    os.makedirs(model_dir, exist_ok=True)
 
-            # Clear Redis status
-            await r.delete(f"shard_status:{req.model_id}")
-            print(f"🔄 FORCE MODE: Re-sharding {req.model_id} from scratch")
+    logger.info(f"🔽 Downloading {model_id} from HuggingFace...")
 
-        # 1. Check if physically exists (after potential deletion)
-        if store.has_model(req.model_id):
-            return {"status": "ready", "message": "Model already exists"}
+    cache_dir = snapshot_download(
+        repo_id=model_id,
+        token=os.getenv("HF_TOKEN"),
+        ignore_patterns=["*.md", "*.txt"]
+    )
 
-        # 2. Check if currently sharding
-        status = await r.get(f"shard_status:{req.model_id}")
-        if status == "processing":
-            return {"status": "processing", "message": "Sharding in progress"}
+    import shutil
+    tokenizer_files = [
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "special_tokens_map.json",
+        "tokenizer.model",
+        "vocab.json",
+        "merges.txt"
+    ]
 
-        # 3. Begin Sharding
-        await r.set(f"shard_status:{req.model_id}", "processing")
-        background_tasks.add_task(background_shard_task, req.model_id, settings.HF_TOKEN)
+    for fname in tokenizer_files:
+        src = os.path.join(cache_dir, fname)
+        dst = os.path.join(model_dir, fname)
+        if os.path.exists(src):
+            shutil.copy2(src, dst)
+            logger.info(f"   ✓ Copied {fname}")
 
-        return {"status": "processing", "message": "Sharding started"}
+    config_path = os.path.join(cache_dir, "config.json")
+    with open(config_path) as f:
+        cfg = json.load(f)
 
-    except Exception as e:
-        print(f"❌ Shard endpoint error: {e}")
-        traceback.print_exc()
-        raise HTTPException(500, str(e))
+    num_hidden_layers = cfg.get("num_hidden_layers")
+    architectures = cfg.get("architectures", [])
+    is_moe = any("Moe" in arch or "MoE" in arch for arch in architectures)
+
+    logger.info(f"📊 Model: {num_hidden_layers} layers, MoE={is_moe}")
+
+    layer_files = [f for f in os.listdir(cache_dir) if f.endswith('.safetensors') or f.endswith('.bin')]
+    layer_files.sort()
+
+    full_sd = {}
+    for lf in layer_files:
+        path = os.path.join(cache_dir, lf)
+        if lf.endswith('.safetensors'):
+            from safetensors.torch import load_file
+            full_sd.update(load_file(path))
+        else:
+            full_sd.update(torch.load(path, map_location='cpu'))
+
+    structure = {"layers": []}
+
+    # Embedding layer
+    embed_layer = {k: v for k, v in full_sd.items() if 'embed' in k.lower()}
+    torch.save(embed_layer, os.path.join(model_dir, "layer_embed.pt"))
+    structure["layers"].append({"type": "embed", "layer_idx": -1, "file": "layer_embed.pt"})
+    logger.info("   ✅ Sharded embedding layer")
+
+    # Hidden layers
+    for i in range(num_hidden_layers):
+        prefix = f"model.layers.{i}."
+        layer_weights = {k: v for k, v in full_sd.items() if k.startswith(prefix)}
+
+        if is_moe:
+            # Extract router
+            router_weights = {k: v for k, v in layer_weights.items() if 'gate' in k or 'router' in k or ('block_sparse_moe.gate' in k)}
+            router_file = f"layer_{i}_router.pt"
+            torch.save(router_weights, os.path.join(model_dir, router_file))
+
+            # Extract experts
+            num_experts = cfg.get("num_local_experts", 8)
+            expert_files = []
+            for e in range(num_experts):
+                expert_weights = {k: v for k, v in layer_weights.items() if f".experts.{e}." in k}
+                expert_file = f"layer_{i}_expert_{e}.pt"
+                torch.save(expert_weights, os.path.join(model_dir, expert_file))
+                expert_files.append(expert_file)
+
+            structure["layers"].append({
+                "type": "moe",
+                "layer_idx": i,
+                "router_file": router_file,
+                "expert_files": expert_files
+            })
+            logger.info(f"   ✅ Sharded MoE layer {i} (router + {num_experts} experts)")
+        else:
+            # Dense layer
+            dense_file = f"layer_{i}_dense.pt"
+            torch.save(layer_weights, os.path.join(model_dir, dense_file))
+            structure["layers"].append({
+                "type": "dense",
+                "layer_idx": i,
+                "file": dense_file
+            })
+            logger.info(f"   ✅ Sharded dense layer {i}")
+
+    # LM head
+    lm_head = {k: v for k, v in full_sd.items() if 'lm_head' in k or 'output' in k}
+    torch.save(lm_head, os.path.join(model_dir, "layer_lm_head.pt"))
+    structure["layers"].append({"type": "lm_head", "layer_idx": num_hidden_layers, "file": "layer_lm_head.pt"})
+    logger.info("   ✅ Sharded LM head")
+
+    # Save structure
+    with open(os.path.join(model_dir, "structure.json"), 'w') as f:
+        json.dump(structure, f, indent=2)
+
+    await r.set(f"shard_status:{model_id}", "completed")
+    logger.info(f"✅ Sharding complete for {model_id}")
 
 @app.get("/models/status")
 async def model_status(model_id: str):

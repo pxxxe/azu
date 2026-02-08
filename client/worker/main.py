@@ -7,6 +7,7 @@ import traceback
 import aiohttp
 import urllib.request
 import gc
+import numpy as np
 from typing import Dict, Optional, Tuple, Set
 import websockets
 from aiohttp import web, ClientSession, TCPConnector, ClientTimeout
@@ -56,7 +57,6 @@ class MoEWorker:
             print("⚠️ No GPU detected, using simulated 32GB RAM")
 
         # --- LOADER ---
-        # self.loader = LayerLoader(REGISTRY_URL, "layer_cache")
         self.loader = LayerLoader(REGISTRY_URL)
 
         # --- LOCKS (ROBUSTNESS) ---
@@ -103,28 +103,9 @@ class MoEWorker:
         await runner.setup()
         site = web.TCPSite(runner, '0.0.0.0', P2P_PORT)
         await site.start()
-        print(f"👂 [P2P] Server listening on :{P2P_PORT} (Max Payload: 1GB)")
+        print(f"👂 [P2P] Server listening on :{P2P_PORT} (Binary/High-Perf)")
         sys.stdout.flush()
 
-    # --- TENSOR UTILS ---
-    def _decode_tensor(self, data: dict) -> torch.Tensor:
-        import numpy as np
-        # Uses numpy buffer to avoid base64 overhead, but supports hex encoding
-        arr = np.frombuffer(bytes.fromhex(data['data']), dtype=data['dtype'])
-        arr = arr.reshape(data['shape'])
-        # Create tensor and ensure it's on the correct device
-        return torch.from_numpy(arr.copy()).to(self.device)
-
-    def _encode_tensor(self, tensor: torch.Tensor) -> dict:
-        # Move to CPU and convert to numpy
-        np_tensor = tensor.detach().cpu().numpy()
-        return {
-            "shape": list(np_tensor.shape),
-            "dtype": str(np_tensor.dtype), # FIX: Returns 'float16', not 'torch.float16'
-            "data": np_tensor.tobytes().hex()
-        }
-
-    # --- SHARED SESSION (THE FIX) ---
     async def _get_p2p_session(self):
         """Lazy-load a shared session for P2P traffic to prevent socket exhaustion."""
         if self.p2p_session is None or self.p2p_session.closed:
@@ -134,7 +115,6 @@ class MoEWorker:
             self.p2p_session = ClientSession(connector=connector, timeout=timeout)
         return self.p2p_session
 
-    # --- INGRESS LOGIC ---
     async def _get_context(self, job_id, create=False):
         async with self._context_lock:
             if job_id not in self.active_jobs:
@@ -144,71 +124,128 @@ class MoEWorker:
                     return None
             return self.active_jobs[job_id]
 
+    # --- NEW: Binary Ingress Handler ---
     async def handle_tensor_ingress(self, request):
         try:
-            data = await request.json()
-            await self.process_ingress_data(data)
-            return web.Response(text="OK")
-        except Exception as e:
-            print(f"❌ [P2P] Error handling ingress: {e}")
-            traceback.print_exc()
-            return web.Response(status=500, text=str(e))
+            # 1. Read Metadata from Headers
+            headers = request.headers
+            job_id = headers.get("x-job-id")
+            if not job_id: return web.Response(status=400, text="Missing job_id")
 
-    async def process_ingress_data(self, data):
-        job_id = data['job_id']
-        msg_type = data.get('type', 'input')
-        tensor = self._decode_tensor(data['tensor'])
+            msg_type = headers.get("x-msg-type", "input")
+            dtype_str = headers.get("x-dtype", "float16")
+            shape = json.loads(headers.get("x-shape", "[]"))
 
-        ctx = await self._get_context(job_id, create=True)
+            # 2. Read RAW Binary Body
+            data = await request.read()
 
-        if msg_type == 'input':
-            expert_idx = data.get('expert_idx')
-            layer_idx = data.get('layer_idx')
-            target_layer_idx = data.get('target_layer_idx')
+            # 3. Reconstruct Tensor (Zero-Copy-ish)
+            dtype = getattr(np, dtype_str)
+            # copy() is needed to make the array writable/contiguous for torch
+            arr = np.frombuffer(data, dtype=dtype).reshape(shape).copy()
+            tensor = torch.from_numpy(arr).to(self.device)
 
-            if expert_idx is not None and layer_idx is not None:
-                queue = ctx.get_expert_queue(layer_idx, expert_idx)
-                await queue.put(tensor)
-            elif target_layer_idx is not None:
-                queue = ctx.get_layer_input_queue(target_layer_idx)
-                await queue.put(tensor)
+            # 4. Route
+            ctx = await self._get_context(job_id, create=True)
 
-        elif msg_type == 'expert_result':
-            expert_idx = data.get('expert_idx')
-            layer_idx = data.get('layer_idx')
-            if expert_idx is not None and layer_idx is not None:
+            if msg_type == 'input':
+                # Parse optional routing headers
+                expert_idx = headers.get("x-expert-idx")
+                layer_idx = headers.get("x-layer-idx")
+                target_layer_idx = headers.get("x-target-layer-idx")
+
+                if expert_idx is not None and layer_idx is not None:
+                    queue = ctx.get_expert_queue(int(layer_idx), int(expert_idx))
+                    await queue.put(tensor)
+                elif target_layer_idx is not None:
+                    queue = ctx.get_layer_input_queue(int(target_layer_idx))
+                    await queue.put(tensor)
+
+            elif msg_type == 'expert_result':
+                expert_idx = int(headers.get("x-expert-idx"))
+                layer_idx = int(headers.get("x-layer-idx"))
                 key = (layer_idx, expert_idx)
                 if key in ctx.pending_expert_requests:
                     future = ctx.pending_expert_requests[key]
                     if not future.done():
                         future.set_result(tensor)
 
-    # --- EXECUTION LOGIC ---
-    async def _send_p2p(self, url, payload):
-        """Send tensor to another worker. Includes LOOPBACK OPTIMIZATION."""
+            return web.Response(text="OK")
+        except Exception as e:
+            print(f"❌ [P2P] Error handling ingress: {e}")
+            traceback.print_exc()
+            return web.Response(status=500, text=str(e))
+
+    # --- NEW: Binary Egress (Sender) ---
+    async def _send_p2p(self, url, payload_meta, tensor: torch.Tensor):
+        """
+        Sends tensor as raw binary body with metadata in headers.
+        Includes LOOPBACK OPTIMIZATION from original code.
+        """
         # 1. Loopback Check
         my_p2p = self.get_p2p_url().rstrip("/")
         target_base = url.replace("/tensor_in", "").rstrip("/")
 
+        # Prepare Metadata
+        np_tensor = tensor.detach().cpu().numpy()
+        dtype_str = str(np_tensor.dtype)
+        shape_json = json.dumps(list(np_tensor.shape))
+
+        headers = {
+            "x-job-id": payload_meta["job_id"],
+            "x-msg-type": payload_meta.get("type", "input"),
+            "x-dtype": dtype_str,
+            "x-shape": shape_json
+        }
+
+        # Add specific routing fields to headers
+        if "expert_idx" in payload_meta: headers["x-expert-idx"] = str(payload_meta["expert_idx"])
+        if "layer_idx" in payload_meta: headers["x-layer-idx"] = str(payload_meta["layer_idx"])
+        if "target_layer_idx" in payload_meta:
+            if payload_meta["target_layer_idx"] is not None:
+                headers["x-target-layer-idx"] = str(payload_meta["target_layer_idx"])
+
         if my_p2p == target_base:
-            # Short-circuit: Inject directly into local handler
+            # Short-circuit: Mock a request object for local processing
+            # We skip serialization for loopback to save even more time
             try:
-                await self.process_ingress_data(payload)
+                # Direct injection into context queues (Skipping HTTP layer entirely)
+                ctx = await self._get_context(payload_meta['job_id'], create=True)
+                msg_type = payload_meta.get('type', 'input')
+
+                if msg_type == 'input':
+                    e_idx = payload_meta.get("expert_idx")
+                    l_idx = payload_meta.get("layer_idx")
+                    t_idx = payload_meta.get("target_layer_idx")
+
+                    if e_idx is not None and l_idx is not None:
+                        await ctx.get_expert_queue(l_idx, e_idx).put(tensor)
+                    elif t_idx is not None:
+                        await ctx.get_layer_input_queue(t_idx).put(tensor)
+
+                elif msg_type == 'expert_result':
+                     e_idx = payload_meta.get("expert_idx")
+                     l_idx = payload_meta.get("layer_idx")
+                     key = (l_idx, e_idx)
+                     if key in ctx.pending_expert_requests:
+                        future = ctx.pending_expert_requests[key]
+                        if not future.done(): future.set_result(tensor)
                 return
             except Exception as e:
                 print(f"❌ Local P2P Error: {e}")
-                traceback.print_exc()
                 return
 
-        # 2. Network Transfer (Using Shared Session)
+        # 2. Network Transfer (Binary)
         session = await self._get_p2p_session()
+        data_bytes = np_tensor.tobytes()
+
         for attempt in range(3):
             try:
-                async with session.post(url, json=payload) as resp:
-                    if resp.status == 200:
-                        return
-                    else:
-                        print(f"   ⚠️ P2P Handshake Rejected {resp.status} from {url}")
+                # Content-Type application/octet-stream is standard for binary
+                headers["Content-Type"] = "application/octet-stream"
+                async with session.post(url, data=data_bytes, headers=headers) as resp:
+                    if resp.status == 200: return
+                    else: print(f"   ⚠️ P2P Handshake Rejected {resp.status} from {url}")
             except Exception as e:
                 print(f"   ⚠️ Connection Failed (attempt {attempt+1}) to {url}: {e}")
                 await asyncio.sleep(0.2)
@@ -304,9 +341,8 @@ class MoEWorker:
             await self._send_p2p(next_hop, {
                 "job_id": job_id,
                 "type": "input",
-                "target_layer_idx": next_layer_idx,
-                "tensor": self._encode_tensor(layer_out)
-            })
+                "target_layer_idx": next_layer_idx
+            }, layer_out) # Send tensor as arg
 
     async def process_moe_router(self, msg, ws):
         job_id = msg['job_id']
@@ -359,9 +395,8 @@ class MoEWorker:
                 "job_id": job_id,
                 "type": "input",
                 "layer_idx": layer_idx,
-                "expert_idx": expert_idx,
-                "tensor": self._encode_tensor(sliced)
-            })))
+                "expert_idx": expert_idx
+            }, sliced))) # Send tensor as arg
 
         if send_tasks:
             await asyncio.gather(*send_tasks)
@@ -398,9 +433,8 @@ class MoEWorker:
             await self._send_p2p(next_hop, {
                 "job_id": job_id,
                 "type": "input",
-                "target_layer_idx": next_layer_idx,
-                "tensor": self._encode_tensor(final_output)
-            })
+                "target_layer_idx": next_layer_idx
+            }, final_output) # Send tensor as arg
 
     async def process_moe_expert(self, msg, ws):
         job_id = msg['job_id']
@@ -433,9 +467,8 @@ class MoEWorker:
             "job_id": job_id,
             "type": "expert_result",
             "layer_idx": layer_idx,
-            "expert_idx": expert_idx,
-            "tensor": self._encode_tensor(output)
-        })
+            "expert_idx": expert_idx
+        }, output) # Send tensor as arg
 
     async def _safe_task_wrapper(self, coro, task_name):
         try:

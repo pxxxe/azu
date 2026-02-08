@@ -7,6 +7,7 @@ import asyncio
 import concurrent.futures
 from pathlib import Path
 from transformers import AutoConfig
+from safetensors.torch import load_file as load_safetensors
 
 class LayerLoader:
     def __init__(self, registry_url, cache_dir=None):
@@ -35,7 +36,7 @@ class LayerLoader:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             self.executor,
-            lambda: torch.load(path, map_location="cpu")
+            lambda: load_safetensors(path, device="cpu")
         )
 
     async def _download(self, url: str, path: Path):
@@ -49,8 +50,6 @@ class LayerLoader:
             self.download_locks[lock_key] = asyncio.Lock()
 
         async with self.download_locks[lock_key]:
-            # === THE FIX IS HERE ===
-            # If sharing a volume with Registry, this check will pass immediately
             if path.exists() and path.stat().st_size > 0:
                 print(f"   ✓ Using cached {path.name}")
                 sys.stdout.flush()
@@ -69,14 +68,12 @@ class LayerLoader:
                             raise Exception(f"Download failed [{resp.status}]: {url}")
 
                         with open(temp, 'wb') as f:
-                            downloaded = 0
                             async for chunk in resp.content.iter_chunked(4 * 1024 * 1024):
                                 f.write(chunk)
-                                downloaded += len(chunk)
                                 await asyncio.sleep(0)
 
                     os.rename(temp, path)
-                    print(f"   ✅ Downloaded {path.name} ({downloaded / (1024*1024):.2f} MB)")
+                    print(f"   ✅ Downloaded {path.name}")
                     sys.stdout.flush()
 
                 except Exception as e:
@@ -109,10 +106,8 @@ class LayerLoader:
         except Exception as e:
             raise ValueError(f"Could not load layer class for {arch}: {e}")
 
-    # === UPDATE HELPER FOR PATHS ===
     def _get_paths(self, model_id, filename):
         sanitized = model_id.replace("/", "_")
-        # UPDATED: Use subdirectory structure matching Registry
         path = self.cache_dir / sanitized / filename
         url = f"{self.registry_url}/layers/{sanitized}/{filename}"
         return path, url
@@ -122,17 +117,14 @@ class LayerLoader:
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
 
-        # 1. Config
         config_path, config_url = self._get_paths(model_id, "config.json")
         await self._download(config_url, config_path)
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
-        # 2. Weights
-        filename = f"layer_{layer_idx}_dense.pt"
+        filename = f"layer_{layer_idx}_dense.safetensors"
         path, url = self._get_paths(model_id, filename)
         await self._download(url, path)
 
-        # 3. Create & Load
         LayerClass = self._get_layer_class(config)
         layer = LayerClass(config, layer_idx=layer_idx).to(device).half()
 
@@ -148,17 +140,14 @@ class LayerLoader:
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
 
-        # 1. Config
         config_path, config_url = self._get_paths(model_id, "config.json")
         await self._download(config_url, config_path)
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
-        # 2. Weights
-        filename = f"layer_{layer_idx}_router.pt"
+        filename = f"layer_{layer_idx}_router.safetensors"
         path, url = self._get_paths(model_id, filename)
         await self._download(url, path)
 
-        # 3. Create & Load
         num_experts = getattr(config, 'num_local_experts', 8)
         router = torch.nn.Linear(config.hidden_size, num_experts, bias=False).to(device).half()
 
@@ -174,17 +163,14 @@ class LayerLoader:
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
 
-        # 1. Config
         config_path, config_url = self._get_paths(model_id, "config.json")
         await self._download(config_url, config_path)
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
-        # 2. Weights
-        filename = f"layer_{layer_idx}_expert_{expert_idx}.pt"
+        filename = f"layer_{layer_idx}_expert_{expert_idx}.safetensors"
         path, url = self._get_paths(model_id, filename)
         await self._download(url, path)
 
-        # 3. Create & Load
         class ExpertFFN(torch.nn.Module):
             def __init__(self, hidden_size, intermediate_size):
                 super().__init__()
@@ -214,7 +200,7 @@ class LayerLoader:
         await self._download(config_url, config_path)
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
-        path, url = self._get_paths(model_id, "embeddings.pt")
+        path, url = self._get_paths(model_id, "embeddings.safetensors")
         await self._download(url, path)
 
         emb = torch.nn.Embedding(config.vocab_size, config.hidden_size).to(device).half()
@@ -234,7 +220,7 @@ class LayerLoader:
         await self._download(config_url, config_path)
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
-        path, url = self._get_paths(model_id, "lm_head.pt")
+        path, url = self._get_paths(model_id, "lm_head.safetensors")
         await self._download(url, path)
 
         head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False).to(device).half()

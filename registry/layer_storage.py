@@ -9,6 +9,8 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.utils import ContextManagers
 from accelerate import init_empty_weights
 from safetensors.torch import load_file as load_safetensors
+# --- CHANGE: Import save_file ---
+from safetensors.torch import save_file as save_safetensors
 import glob
 
 class LayerStore:
@@ -183,7 +185,11 @@ class LayerStore:
                 # Try finding without model prefix if wrapped? No, usually precise.
                 print(f"      ⚠️ Warning: Missing key {global_key} (checked alias: {target_key})")
 
-        torch.save(state_dict, output_path)
+        # --- CHANGE: .pt -> .safetensors ---
+        # 1. Ensure contiguous (required for safetensors)
+        state_dict = {k: v.contiguous() for k, v in state_dict.items()}
+        # 2. Save
+        save_safetensors(state_dict, output_path)
         return output_path.stat().st_size / (1024**2)
 
     def shard_model(self, model_id: str, hf_token: str):
@@ -273,7 +279,8 @@ class LayerStore:
 
                     # 1. Router/Gate — extract from checkpoint
                     router_attr = "gate" if hasattr(moe_module, "gate") else "router"
-                    router_file = out_dir / f"layer_{i}_router.pt"
+                    # --- CHANGE: .pt -> .safetensors ---
+                    router_file = out_dir / f"layer_{i}_router.safetensors"
                     router_prefix = f"{moe_prefix}.{router_attr}"
 
                     # Build router state dict manually from weight_map
@@ -309,7 +316,9 @@ class LayerStore:
                                     break
 
                     if router_state:
-                        torch.save(router_state, router_file)
+                        # --- CHANGE: save_file + contiguous ---
+                        router_state = {k: v.contiguous() for k, v in router_state.items()}
+                        save_safetensors(router_state, router_file)
                         if not router_file.exists():
                             raise RuntimeError(f"Router file was not created: {router_file}")
                         print(f"      ✅ Router saved ({router_file.stat().st_size / (1024**2):.2f}MB)")
@@ -338,7 +347,8 @@ class LayerStore:
                         print(f"      🔍 Sample expert keys for layer {i}: {sample_expert_keys[:3]}")
 
                     for exp_idx in range(num_experts):
-                        expert_file = out_dir / f"layer_{i}_expert_{exp_idx}.pt"
+                        # --- CHANGE: .pt -> .safetensors ---
+                        expert_file = out_dir / f"layer_{i}_expert_{exp_idx}.safetensors"
 
                         # Build state dict by finding all keys for this expert in weight_map
                         expert_state = {}
@@ -365,7 +375,10 @@ class LayerStore:
                             # This is actually a critical error for MoE models
                             raise RuntimeError(f"Expert {exp_idx} has no weights in checkpoint")
 
-                        torch.save(expert_state, expert_file)
+                        # --- CHANGE: save_file + contiguous ---
+                        expert_state = {k: v.contiguous() for k, v in expert_state.items()}
+                        save_safetensors(expert_state, expert_file)
+
                         sz = expert_file.stat().st_size / (1024**2)
                         expert_size_acc += sz
 
@@ -382,7 +395,8 @@ class LayerStore:
 
                 else:
                     # Dense Layer
-                    dense_file = out_dir / f"layer_{i}_dense.pt"
+                    # --- CHANGE: .pt -> .safetensors ---
+                    dense_file = out_dir / f"layer_{i}_dense.safetensors"
                     sz = self._save_module(layer, layer_prefix, model_path, weight_map, dense_file, loaded_shards)
 
                     if not dense_file.exists():
@@ -401,14 +415,16 @@ class LayerStore:
             # 6. Embeddings & Head
             print("   💾 Saving embeddings & head...")
             if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
-                emb_file = out_dir / "embeddings.pt"
+                # --- CHANGE: .pt -> .safetensors ---
+                emb_file = out_dir / "embeddings.safetensors"
                 self._save_module(model.model.embed_tokens, "model.embed_tokens", model_path, weight_map, emb_file, loaded_shards)
                 if not emb_file.exists():
                     raise RuntimeError(f"Embeddings file was not created: {emb_file}")
                 print(f"      ✅ Embeddings saved")
 
             if hasattr(model, "lm_head"):
-                head_file = out_dir / "lm_head.pt"
+                # --- CHANGE: .pt -> .safetensors ---
+                head_file = out_dir / "lm_head.safetensors"
                 self._save_module(model.lm_head, "lm_head", model_path, weight_map, head_file, loaded_shards)
                 if not head_file.exists():
                     raise RuntimeError(f"LM head file was not created: {head_file}")
@@ -438,7 +454,8 @@ class LayerStore:
                     raise RuntimeError(f"Critical file missing: {cf}")
 
             # List all files created
-            all_files = list(out_dir.glob("*.pt")) + list(out_dir.glob("*.json"))
+            # --- CHANGE: glob .safetensors ---
+            all_files = list(out_dir.glob("*.safetensors")) + list(out_dir.glob("*.json"))
             print(f"   📁 Created {len(all_files)} files in {out_dir}")
 
             print(f"✅ Sharding Complete. Total Size: {total_size_mb:.1f}MB")

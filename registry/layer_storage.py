@@ -4,6 +4,7 @@ import sys
 import json
 import gc
 import shutil
+import glob # <--- ADDED for Nuclear Option
 from pathlib import Path
 from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.utils import ContextManagers
@@ -11,7 +12,6 @@ from accelerate import init_empty_weights
 from safetensors.torch import load_file as load_safetensors
 # --- CHANGE: Import save_file ---
 from safetensors.torch import save_file as save_safetensors
-import glob
 
 class LayerStore:
     def __init__(self, storage_path="/data/layers"):
@@ -209,7 +209,7 @@ class LayerStore:
             model_path = snapshot_download(
                 repo_id=model_id,
                 token=hf_token,
-                allow_patterns=["*.json", "*.safetensors", "*.bin", "*.model"]
+                allow_patterns=["*.json", "*.safetensors", "*.bin", "*.model", "*.txt", "*.py"]
             )
             print(f"   ✅ Model available at: {model_path}")
 
@@ -431,11 +431,11 @@ class LayerStore:
                 print(f"      ✅ LM head saved")
 
             # 7. Metadata & Tokenizer
+            print("   💾 Saving metadata and tokenizer assets...")
             config.save_pretrained(out_dir)
 
-            # CRITICAL FIX: Save tokenizer to ensure vocab alignment
+            # A. Try standard save_pretrained
             try:
-                print("   💾 Saving tokenizer...")
                 from transformers import AutoTokenizer as TokenizerClass
                 tokenizer = TokenizerClass.from_pretrained(
                     model_path,
@@ -443,27 +443,25 @@ class LayerStore:
                     trust_remote_code=True
                 )
                 tokenizer.save_pretrained(out_dir)
-
-                # Verify vocab size matches lm_head if it was saved
-                head_file = out_dir / "lm_head.safetensors"
-                if head_file.exists():
-                    head_state = load_safetensors(head_file)
-                    head_vocab_size = head_state['weight'].shape[0]
-                    tokenizer_vocab_size = len(tokenizer)
-
-                    if head_vocab_size != tokenizer_vocab_size:
-                        print(f"      ⚠️ WARNING: Vocab size mismatch!")
-                        print(f"         LM Head: {head_vocab_size}")
-                        print(f"         Tokenizer: {tokenizer_vocab_size}")
-                    else:
-                        print(f"      ✅ Tokenizer saved (vocab_size={tokenizer_vocab_size}, matches LM head)")
-                else:
-                    print(f"      ✅ Tokenizer saved (vocab_size={len(tokenizer)})")
-
             except Exception as e:
-                print(f"      ⚠️ Warning: Could not save tokenizer: {e}")
-                print(f"         Workers will fall back to loading from HuggingFace")
-                # Non-fatal - worker can fall back to HF if needed
+                print(f"      ⚠️ standard save_pretrained failed: {e}")
+
+            # B. "NUCLEAR" COPY STRATEGY
+            # Copy ANY file that looks like metadata/config/tokenizer/code
+            aux_extensions = ['*.json', '*.model', '*.txt', '*.py']
+            for ext in aux_extensions:
+                for src_path in glob.glob(os.path.join(model_path, ext)):
+                    filename = os.path.basename(src_path)
+
+                    # Skip hidden files or index files if huge
+                    if filename.startswith(".") or "index" in filename: continue
+
+                    dst_path = out_dir / filename
+
+                    # Copy if it doesn't exist (e.g. tokenizer.model often missed by save_pretrained)
+                    if not dst_path.exists():
+                        shutil.copy2(src_path, dst_path)
+                        print(f"      📦 Manually copied: {filename}")
 
             structure = {
                 "model_id": model_id,

@@ -299,20 +299,36 @@ class MoEWorker:
                 config_path = self.loader.cache_dir / sanitized
 
                 # Download tokenizer files if not cached
-                for filename in ["config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"]:
+                # STRICTLY OFFLINE MODE: Try to download everything the Registry *might* have.
+                # Suppress errors for optional files.
+                potential_files = [
+                    "config.json",
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                    "special_tokens_map.json",
+                    "tokenizer.model",
+                    "vocab.json",
+                    "merges.txt",
+                    "added_tokens.json",
+                    "generation_config.json"
+                ]
+
+                for filename in potential_files:
                     file_path, file_url = self.loader._get_paths(model_id, filename)
                     try:
-                        await self.loader._download(file_url, file_path)
+                        # quiet=True for optional files so we don't spam logs with 404s
+                        await self.loader._download(file_url, file_path, quiet=(filename != "config.json"))
                     except Exception as e:
-                        if "tokenizer" in filename:
-                            print(f"   ⚠️ Optional file {filename} not found: {e}")
+                        if filename == "config.json":
+                            print(f"   ❌ FATAL: config.json missing in Registry!")
+                            raise e
 
                 # Load tokenizer from cached directory
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     str(config_path),
                     token=HF_TOKEN,
                     trust_remote_code=True,
-                    local_files_only=True
+                    local_files_only=True # <--- CRITICAL: NEVER HIT HF
                 )
                 print(f"   ✅ Tokenizer loaded (vocab_size={len(self.tokenizer)})")
 
@@ -350,14 +366,25 @@ class MoEWorker:
                 sanitized = model_id.replace("/", "_")
                 config_path = self.loader.cache_dir / sanitized
 
-                # Download tokenizer files if not cached
-                for filename in ["config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"]:
+                # Same Robust Download Logic
+                potential_files = [
+                    "config.json",
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                    "special_tokens_map.json",
+                    "tokenizer.model",
+                    "vocab.json",
+                    "merges.txt",
+                    "added_tokens.json",
+                    "generation_config.json"
+                ]
+
+                for filename in potential_files:
                     file_path, file_url = self.loader._get_paths(model_id, filename)
                     try:
-                        await self.loader._download(file_url, file_path)
+                        await self.loader._download(file_url, file_path, quiet=(filename != "config.json"))
                     except Exception as e:
-                        if "tokenizer" in filename:
-                            print(f"   ⚠️ Optional file {filename} not found: {e}")
+                        if filename == "config.json": raise e
 
                 # Load tokenizer from cached directory (same place as config.json)
                 self.tokenizer = AutoTokenizer.from_pretrained(

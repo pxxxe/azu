@@ -39,7 +39,7 @@ class LayerLoader:
             lambda: load_safetensors(path, device="cpu")
         )
 
-    async def _download(self, url: str, path: Path):
+    async def _download(self, url: str, path: Path, quiet: bool = False):
         """Helper to download a file from Registry to Worker Disk"""
 
         # Ensure parent directory exists (for model subfolders)
@@ -51,13 +51,15 @@ class LayerLoader:
 
         async with self.download_locks[lock_key]:
             if path.exists() and path.stat().st_size > 0:
-                print(f"   ✓ Using cached {path.name}")
-                sys.stdout.flush()
+                if not quiet:
+                    print(f"   ✓ Using cached {path.name}")
+                    sys.stdout.flush()
                 return
 
             async with self.sem:
-                print(f"   ⬇️ Downloading {url}...")
-                sys.stdout.flush()
+                if not quiet:
+                    print(f"   ⬇️ Downloading {url}...")
+                    sys.stdout.flush()
 
                 temp = path.with_suffix('.tmp')
 
@@ -73,12 +75,16 @@ class LayerLoader:
                                 await asyncio.sleep(0)
 
                     os.rename(temp, path)
-                    print(f"   ✅ Downloaded {path.name}")
-                    sys.stdout.flush()
+                    if not quiet:
+                        print(f"   ✅ Downloaded {path.name}")
+                        sys.stdout.flush()
 
                 except Exception as e:
-                    print(f"   ❌ Error downloading {url}: {e}")
-                    sys.stdout.flush()
+                    # If quiet is True (for optional files), don't print
+                    if not quiet:
+                        print(f"   ❌ Error downloading {url}: {e}")
+                        sys.stdout.flush()
+
                     if os.path.exists(temp):
                         os.remove(temp)
                     raise e

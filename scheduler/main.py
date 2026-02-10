@@ -32,6 +32,7 @@ class JobState:
     input_prompt: str
     owner: str
     topology: List[dict] = field(default_factory=list)
+    max_tokens: int = 50
 
 class MoEScheduler:
     def __init__(self, registry_url: str):
@@ -106,10 +107,7 @@ class MoEScheduler:
                 node['expert_map'] = {}
                 num_experts = layer.get('num_experts', 0)
                 # FIX (Bug 2): The registry writes total expert size into the
-                # 'size_mb' field of layer_metadata.  This code previously read
-                # 'total_size_mb' which does not exist, so it always got 0 —
-                # experts were placed with zero VRAM cost and the planner's
-                # capacity tracking was completely broken.
+                # 'size_mb' field of layer_metadata.
                 expert_size = layer.get('size_mb', 0) / max(1, num_experts)
 
                 for exp_idx in range(num_experts):
@@ -130,10 +128,6 @@ class MoEScheduler:
             return None
 
         # Bookend the topology with explicit embed and decode nodes.
-        # layer_idx=-1 tells the worker to run embeddings (is_first) or lm_head (is_last)
-        # without running any transformer layer. This is what was broken: the old code
-        # assumed topology[0] was dense and set is_first: i==0, but for Mixtral (and any
-        # pure-MoE model) layer 0 is MoE so embeddings were never dispatched.
         first_worker = topology[0]
         last_worker = topology[-1]
 
@@ -223,7 +217,7 @@ class MoEScheduler:
                     await r.rpush("job_queue", item[1])
                     continue
 
-                job = JobState(raw_job['id'], model_id, raw_job['input_prompt'], raw_job['owner'], plan)
+                job = JobState(raw_job['id'], model_id, raw_job['input_prompt'], raw_job['owner'], plan, max_tokens=raw_job.get('tokens', 50))
                 self.active_jobs[job_id] = job
                 await self._dispatch(job)
 
@@ -234,6 +228,10 @@ class MoEScheduler:
 
     async def _dispatch(self, job: JobState):
         print(f"📦 Dispatching Job {job.id} (Smart Route)")
+
+        # Calculate the feedback loop endpoint (where the first worker lives)
+        first_node_endpoint = job.topology[0]['endpoint']
+
         for i, node in enumerate(job.topology):
             w = self.workers.get(node['worker_id'])
             if not w:
@@ -263,7 +261,9 @@ class MoEScheduler:
                     "type": "EXECUTE_DENSE",
                     "input": job.input_prompt if role == 'embed' else None,
                     "is_first": role == 'embed',
-                    "is_last": role == 'decode'
+                    "is_last": role == 'decode',
+                    "max_tokens": job.max_tokens, # Pass max tokens for generation control
+                    "first_node_endpoint": first_node_endpoint if role == 'decode' else None # Pass loop target
                 })
                 await w.ws.send_json(payload)
 

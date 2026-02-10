@@ -9,3 +9,4 @@
 - [ ] Disallow untrusted code
 - [ ] Implement secure communication channels
 - [ ] Implement BYO Scheduling strategy
+- [ ] OpenAI adapter compatibility

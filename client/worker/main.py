@@ -372,7 +372,7 @@ class MoEWorker:
                         try:
                             # Wait for token from the last worker
                             token_id = await asyncio.wait_for(ctx.token_queue.get(), timeout=P2P_TIMEOUT)
-                            input_tensor = torch.tensor([[token_id]], device=self.device).unsqueeze(0)
+                            input_tensor = torch.tensor([[token_id]], device=self.device)
                         except asyncio.TimeoutError:
                             if ctx.done: break # Normal exit
                             print(f"❌ [Job {job_id[:8]}] Timeout waiting for loopback token")

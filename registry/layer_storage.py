@@ -450,7 +450,7 @@ class LayerStore:
             # Copy ANY file that looks like metadata/config/tokenizer/code
             aux_extensions = ['*.json', '*.model', '*.txt', '*.py']
             for ext in aux_extensions:
-                for src_path in glob.glob(os.path.join(model_path, ext)):
+                for src_path in Path(model_path).rglob(ext):
                     filename = os.path.basename(src_path)
 
                     # Skip hidden files or index files if huge

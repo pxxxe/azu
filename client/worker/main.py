@@ -300,33 +300,75 @@ class MoEWorker:
             self.current_model_id = model_id
 
     async def _load_tokenizer(self, model_id):
-        """Helper to safely load tokenizer components"""
+        """Load tokenizer from registry only (never HuggingFace)"""
         if not self.tokenizer:
-            print(f"📖 Loading Tokenizer...")
+            print(f"📖 Loading Tokenizer for {model_id}...")
             sanitized = model_id.replace("/", "_")
             config_path = self.loader.cache_dir / sanitized
 
-            # Download tokenizer files if not cached
-            potential_files = [
-                "config.json", "tokenizer.json", "tokenizer_config.json",
-                "special_tokens_map.json", "tokenizer.model", "vocab.json",
-                "merges.txt", "added_tokens.json", "generation_config.json"
-            ]
+            # All possible tokenizer files
+            tokenizer_files = {
+                "config.json": True,  # Required
+                "tokenizer_config.json": False,
+                "tokenizer.model": False,  # SentencePiece (Llama/Mistral/Mixtral)
+                "vocab.json": False,
+                "merges.txt": False,
+                "tokenizer.json": False,
+                "special_tokens_map.json": False,
+                "added_tokens.json": False,
+                "generation_config.json": False,
+            }
 
-            for filename in potential_files:
+            downloaded_files = []
+            failed_required = []
+
+            for filename, is_required in tokenizer_files.items():
                 file_path, file_url = self.loader._get_paths(model_id, filename)
                 try:
                     await self.loader._download(file_url, file_path, quiet=(filename != "config.json"))
+                    if file_path.exists():
+                        size = file_path.stat().st_size
+                        if size == 0:
+                            if is_required:
+                                raise RuntimeError(f"{filename} is empty")
+                        else:
+                            downloaded_files.append(filename)
+                            if filename.endswith('.model'):
+                                print(f"      ✅ {filename} ({size/1024:.1f} KB)")
                 except Exception as e:
-                    if filename == "config.json": raise e
+                    if is_required:
+                        failed_required.append(filename)
 
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                str(config_path),
-                token=HF_TOKEN,
-                trust_remote_code=True,
-                local_files_only=True
-            )
-            print(f"   ✅ Tokenizer loaded (vocab_size={len(self.tokenizer)})")
+            if failed_required:
+                raise RuntimeError(f"Missing required files: {failed_required}")
+
+            print(f"      📦 Downloaded {len(downloaded_files)} files")
+
+            try:
+                # CRITICAL: token=None prevents HuggingFace fallback
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    str(config_path),
+                    token=None,
+                    trust_remote_code=True,
+                    local_files_only=True
+                )
+
+                # Test tokenizer works
+                test_ids = self.tokenizer.encode("Hello, world!")
+                test_decoded = self.tokenizer.decode(test_ids)
+                if '<unk>' in test_decoded or len(test_ids) == 1:
+                    raise RuntimeError(
+                        f"Tokenizer broken. Encoded: {test_ids}, Decoded: '{test_decoded}'. "
+                        f"tokenizer.model likely missing."
+                    )
+
+                print(f"      ✅ Tokenizer OK (vocab_size={len(self.tokenizer)})")
+
+            except Exception as e:
+                print(f"\n❌ TOKENIZER LOAD FAILED: {e}")
+                print(f"Downloaded: {downloaded_files}")
+                print(f"Registry must serve ALL tokenizer files from {self.loader.registry_url}\n")
+                raise
 
     async def process_dense(self, msg, ws):
         job_id = msg['job_id']

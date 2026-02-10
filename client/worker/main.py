@@ -14,7 +14,6 @@ from aiohttp import web, ClientSession, TCPConnector, ClientTimeout
 from transformers import AutoTokenizer, AutoConfig
 from dataclasses import dataclass, field
 
-# === ROBUST LOADER IMPORT ===
 from layer_loader import LayerLoader
 
 # Config
@@ -78,6 +77,7 @@ class MoEWorker:
         self.embeddings = None
         self.lm_head = None
         self.tokenizer = None  # FIX: Add tokenizer caching
+        self.final_norm = None
         self.dense_layers = {}
         self.moe_routers = {}
         self.moe_experts = {}
@@ -289,6 +289,7 @@ class MoEWorker:
 
             self.embeddings = None
             self.lm_head = None
+            self.final_norm = None
             self.tokenizer = None  # FIX: Clear tokenizer cache
             self.dense_layers.clear()
             self.moe_routers.clear()
@@ -464,10 +465,15 @@ class MoEWorker:
                     if not self.lm_head:
                         print(f"🔚 Loading LM Head...")
                         self.lm_head = await self.loader.load_lm_head(model_id, self.device)
+                        self.final_norm = await self.loader.load_final_norm(model_id, self.device)
                         await self._load_tokenizer(model_id)
 
                     with torch.no_grad():
-                        logits = self.lm_head(layer_out[:, -1, :])
+                        if self.final_norm:
+                            latents = self.final_norm(layer_out[:, -1, :])
+                        else:
+                            latents = layer_out[:, -1, :]
+                        logits = self.lm_head(latents)
                         token_id = torch.argmax(logits, dim=-1).item()
 
                     # Record Generation

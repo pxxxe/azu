@@ -237,3 +237,69 @@ class LayerLoader:
 
         self.loaded_cache[cache_key] = head
         return head
+
+    def _get_norm_class(self, config):
+        """Dynamically load the RMSNorm/LayerNorm class for this architecture"""
+        arch = config.architectures[0]
+        try:
+            # Handle standard naming conventions
+            if arch.endswith("ForCausalLM"):
+                base = arch[:-len("ForCausalLM")]
+            elif arch.endswith("LMHeadModel"):
+                base = arch[:-len("LMHeadModel")]
+            else:
+                base = arch
+
+            module_name = base.lower()
+            # LlamaRMSNorm, MixtralRMSNorm, etc.
+            class_name = f"{base}RMSNorm"
+
+            # Fallback for older models (LayerNorm)
+            if "GPT" in arch or "Bloom" in arch:
+                  return torch.nn.LayerNorm
+
+            import importlib
+            full_module = f"transformers.models.{module_name}.modeling_{module_name}"
+            mod = importlib.import_module(full_module)
+            return getattr(mod, class_name)
+        except Exception as e:
+            print(f"⚠️ Could not load specific Norm class for {arch}, falling back to torch.nn.RMSNorm: {e}")
+            # Fallback for torch 2.1+
+            try:
+                return torch.nn.RMSNorm
+            except:
+                raise ValueError(f"Could not load Norm class: {e}")
+
+    async def load_final_norm(self, model_id: str, device="cuda"):
+        cache_key = f"{model_id}:final_norm"
+        if cache_key in self.loaded_cache:
+            return self.loaded_cache[cache_key]
+
+        config_path, config_url = self._get_paths(model_id, "config.json")
+        await self._download(config_url, config_path)
+        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+
+        path, url = self._get_paths(model_id, "final_norm.safetensors")
+        # Allow failure if model doesn't have one (though Mixtral does)
+        try:
+            await self._download(url, path)
+        except:
+            print(f"   ⚠️ No final_norm found for {model_id}, skipping.")
+            return None
+
+        NormClass = self._get_norm_class(config)
+
+        # Instantiate
+        if hasattr(config, "rms_norm_eps"):
+            norm = NormClass(config.hidden_size, eps=config.rms_norm_eps).to(device).half()
+        elif hasattr(config, "layer_norm_eps"):
+            norm = NormClass(config.hidden_size, eps=config.layer_norm_eps).to(device).half()
+        else:
+              norm = NormClass(config.hidden_size).to(device).half()
+
+        state_dict = await self._load_weights_safe(path)
+        norm.load_state_dict(state_dict)
+        norm.eval()
+
+        self.loaded_cache[cache_key] = norm
+        return norm

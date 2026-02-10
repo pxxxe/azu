@@ -412,15 +412,37 @@ class LayerStore:
                 loaded_shards.clear()
                 gc.collect()
 
-            # 6. Embeddings & Head
-            print("   💾 Saving embeddings & head...")
+            # 6. Embeddings, Norm & Head
+            print("   💾 Saving embeddings, final norm & head...")
+
+            # A. Embeddings
             if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
-                # --- CHANGE: .pt -> .safetensors ---
                 emb_file = out_dir / "embeddings.safetensors"
                 self._save_module(model.model.embed_tokens, "model.embed_tokens", model_path, weight_map, emb_file, loaded_shards)
                 if not emb_file.exists():
-                    raise RuntimeError(f"Embeddings file was not created: {emb_file}")
+                      raise RuntimeError(f"Embeddings file was not created: {emb_file}")
                 print(f"      ✅ Embeddings saved")
+
+            # B. Final Norm (CRITICAL FIX)
+            # Support Llama/Mistral/Mixtral (model.norm) and others (transformer.ln_f)
+            final_norm_module = None
+            final_norm_prefix = None
+
+            if hasattr(model, "model") and hasattr(model.model, "norm"):
+                final_norm_module = model.model.norm
+                final_norm_prefix = "model.norm"
+            elif hasattr(model, "transformer") and hasattr(model.transformer, "ln_f"):
+                final_norm_module = model.transformer.ln_f
+                final_norm_prefix = "transformer.ln_f"
+
+            if final_norm_module:
+                norm_file = out_dir / "final_norm.safetensors"
+                self._save_module(final_norm_module, final_norm_prefix, model_path, weight_map, norm_file, loaded_shards)
+                if not norm_file.exists():
+                    raise RuntimeError(f"Final Norm file was not created: {norm_file}")
+                print(f"      ✅ Final Norm saved")
+            else:
+                print("      ⚠️ Warning: No final normalization layer found (might be correct for some architectures)")
 
             if hasattr(model, "lm_head"):
                 # --- CHANGE: .pt -> .safetensors ---

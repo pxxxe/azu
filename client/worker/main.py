@@ -32,11 +32,9 @@ class JobContext:
         self.expert_input_queues: Dict[Tuple[int, int], asyncio.Queue] = {}
         self.pending_expert_requests: Dict[Tuple[int, int], asyncio.Future] = {}
 
-        # --- KV Cache & Autoregression State ---
-        # kv_cache[layer_idx] = (key_tensor, value_tensor)
         self.kv_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self.generated_ids: List[int] = []
-        self.token_queue: asyncio.Queue = asyncio.Queue() # Receives tokens from loopback
+        self.token_queue: asyncio.Queue = asyncio.Queue()
         self.done = False
 
     def get_layer_input_queue(self, layer_idx: int) -> asyncio.Queue:
@@ -52,18 +50,17 @@ class JobContext:
 
 class MoEWorker:
     def __init__(self):
-        # --- HARDWARE ---
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.loader = LayerLoader(REGISTRY_URL)
+        self.device = self.loader.device
+        self.dtype = self.loader.dtype
+
         if torch.cuda.is_available():
             props = torch.cuda.get_device_properties(0)
             self.vram_total_mb = int(props.total_memory / (1024**2))
-            print(f"🎮 GPU Detected: {props.name} | VRAM: {self.vram_total_mb} MB")
+            print(f"🎮 GPU Detected: {props.name} | VRAM: {self.vram_total_mb} MB | Dtype: {self.dtype}")
         else:
             self.vram_total_mb = 32000
             print("⚠️ No GPU detected, using simulated 32GB RAM")
-
-        # --- LOADER ---
-        self.loader = LayerLoader(REGISTRY_URL)
 
         # --- LOCKS (ROBUSTNESS) ---
         self._model_lock = asyncio.Lock()   # Prevents model switching race conditions
@@ -169,7 +166,8 @@ class MoEWorker:
             dtype = getattr(np, dtype_str)
             # copy() is needed to make the array writable/contiguous for torch
             arr = np.frombuffer(data, dtype=dtype).reshape(shape).copy()
-            tensor = torch.from_numpy(arr).to(self.device)
+
+            tensor = torch.from_numpy(arr).to(self.device).to(self.dtype)
 
             # 4. Route
             ctx = await self._get_context(job_id, create=True)
@@ -213,7 +211,9 @@ class MoEWorker:
         target_base = url.replace("/tensor_in", "").rstrip("/")
 
         # Prepare Metadata
-        np_tensor = tensor.detach().cpu().contiguous().numpy()
+        # --- FIX: Handle BFloat16 -> Numpy conversion ---
+        # Numpy crashes on BFloat16. We must detach().cpu().float() before numpy().
+        np_tensor = tensor.detach().cpu().float().contiguous().numpy()
         dtype_str = str(np_tensor.dtype)
         shape_json = json.dumps(list(np_tensor.shape))
 
@@ -238,6 +238,9 @@ class MoEWorker:
                 # Direct injection into context queues (Skipping HTTP layer entirely)
                 ctx = await self._get_context(payload_meta['job_id'], create=True)
                 msg_type = payload_meta.get('type', 'input')
+
+                # --- FIX: Ensure tensor matches model dtype even in loopback ---
+                tensor = tensor.to(self.dtype)
 
                 if msg_type == 'input':
                     e_idx = payload_meta.get("expert_idx")
@@ -387,27 +390,21 @@ class MoEWorker:
         await self._ensure_model(model_id)
         ctx = await self._get_context(job_id, create=True)
 
-        # === AUTOREGRESSIVE LOOP START ===
-        # We process inputs in a loop until the job is done or flagged as complete
         while not ctx.done:
             try:
                 # --- JIT Embedding ---
                 if is_first:
                     if not self.embeddings:
                         print(f"📦 Loading embeddings...")
-                        self.embeddings = await self.loader.load_embeddings(model_id, self.device)
+                        self.embeddings = await self.loader.load_embeddings(model_id)
                         await self._load_tokenizer(model_id)
 
-                    # LOGIC: Check if we have an initial Prompt OR a feedback Token
                     input_tensor = None
 
-                    # 1. Initial Prompt (only if we haven't generated anything)
                     if not ctx.generated_ids and msg.get('input'):
                         print(f"   📝 Encoding Prompt...")
-                        # Clear cache for new job
                         ctx.kv_cache.clear()
                         input_tensor = self.tokenizer.encode(msg['input'], return_tensors='pt').to(self.device)
-                        # Clear the input so we don't re-process it in loop
                         msg['input'] = None
 
                     # 2. Feedback Token (Loop)
@@ -427,27 +424,27 @@ class MoEWorker:
                     # Middle Layer Input
                     queue = ctx.get_layer_input_queue(layer_idx)
                     try:
-                        # print(f"   ⏳ Waiting for input tensor...")
+                        print(f"   ⏳ Waiting for input tensor...")
                         hidden_states = await asyncio.wait_for(queue.get(), timeout=P2P_TIMEOUT)
                     except asyncio.TimeoutError:
                         print(f"❌ [Job {job_id[:8]}] Timeout waiting for input")
                         break
+
+                hidden_states = hidden_states.to(self.dtype)
 
                 # --- JIT Dense Layer & KV Cache ---
                 layer_out = hidden_states
                 if layer_idx != -1:
                     if layer_idx not in self.dense_layers:
                         print(f"📦 Loading dense layer {layer_idx}...")
-                        self.dense_layers[layer_idx] = await self.loader.load_dense_layer(model_id, layer_idx, self.device)
+                        self.dense_layers[layer_idx] = await self.loader.load_dense_layer(model_id, layer_idx)
 
                     # Get KV Cache for this layer
                     past_kv = ctx.kv_cache.get(layer_idx, None)
 
                     with torch.no_grad():
-                        # Pass past_key_values and use_cache=True
-                        # Standard HF implementations return (hidden_states, past_key_values) or tuple
                         out = self.dense_layers[layer_idx](
-                            hidden_states.half(),
+                            hidden_states,
                             past_key_values=past_kv,
                             use_cache=True
                         )
@@ -464,8 +461,8 @@ class MoEWorker:
                 if is_last:
                     if not self.lm_head:
                         print(f"🔚 Loading LM Head...")
-                        self.lm_head = await self.loader.load_lm_head(model_id, self.device)
-                        self.final_norm = await self.loader.load_final_norm(model_id, self.device)
+                        self.lm_head = await self.loader.load_lm_head(model_id)
+                        self.final_norm = await self.loader.load_final_norm(model_id)
                         await self._load_tokenizer(model_id)
 
                     with torch.no_grad():
@@ -479,7 +476,7 @@ class MoEWorker:
                     # Record Generation
                     ctx.generated_ids.append(token_id)
                     gen_text = self.tokenizer.decode([token_id])
-                    # print(f"   ✨ Gen: {gen_text}")
+                    print(f"   ✨ Gen: {gen_text}")
 
                     # Check Stop Conditions
                     stop = False
@@ -504,10 +501,7 @@ class MoEWorker:
                         del self.active_jobs[job_id]
                         return
                     else:
-                        # Feed back to start
                         if first_node_endpoint:
-                            # Send token_id back to first worker via P2P
-                            # We construct a simple JSON payload
                             session = await self._get_p2p_session()
                             try:
                                 target = f"{first_node_endpoint}/token_in"
@@ -522,7 +516,7 @@ class MoEWorker:
 
                 # --- Forward to Next Worker ---
                 elif next_hop:
-                    # print(f"   ➡️ Forwarding to {next_hop}")
+                    print(f"   ➡️ Forwarding to {next_hop}")
                     await self._send_p2p(next_hop, {
                         "job_id": job_id,
                         "type": "input",
@@ -533,7 +527,6 @@ class MoEWorker:
                 print(f"❌ Error in dense loop: {e}")
                 traceback.print_exc()
                 break
-        # === LOOP END ===
 
     async def process_moe_router(self, msg, ws):
         job_id = msg['job_id']
@@ -551,20 +544,22 @@ class MoEWorker:
             try:
                 queue = ctx.get_layer_input_queue(layer_idx)
                 try:
-                    # print(f"   ⏳ Waiting for input tensor...")
+                    print(f"   ⏳ Waiting for input tensor...")
                     hidden_states = await asyncio.wait_for(queue.get(), timeout=P2P_TIMEOUT)
                 except asyncio.TimeoutError:
                     if ctx.done: break
                     print(f"❌ [Job {job_id[:8]}] Router input timeout")
                     break
 
+                hidden_states = hidden_states.to(self.dtype)
+
                 # --- JIT Router ---
                 if layer_idx not in self.moe_routers:
                     print(f"📦 Loading router {layer_idx}...")
-                    self.moe_routers[layer_idx] = await self.loader.load_moe_router(model_id, layer_idx, self.device)
+                    self.moe_routers[layer_idx] = await self.loader.load_moe_router(model_id, layer_idx)
 
                 with torch.no_grad():
-                    logits = self.moe_routers[layer_idx](hidden_states.half())
+                    logits = self.moe_routers[layer_idx](hidden_states)
                     routing_weights, selected_indices = torch.topk(logits, k=2, dim=-1)
                     routing_weights = torch.nn.functional.softmax(routing_weights, dim=-1)
 
@@ -606,14 +601,14 @@ class MoEWorker:
 
                 # Merge
                 batch, seq, hidden = hidden_states.shape
-                final_output = torch.zeros((batch, seq, hidden), dtype=torch.float16, device=self.device)
+                final_output = torch.zeros((batch, seq, hidden), dtype=self.dtype, device=self.device)
                 top_weights_dev = routing_weights.to(self.device)
                 top_indices_dev = selected_indices.to(self.device)
 
                 with torch.no_grad():
                     for expert_idx, future in local_pending.items():
                         if not future.done(): continue
-                        res = future.result().to(self.device)
+                        res = future.result().to(self.device).to(self.dtype)
                         mask = (top_indices_dev == expert_idx)
                         rows, cols, k_idx = torch.where(mask)
                         w = top_weights_dev[rows, cols, k_idx].unsqueeze(-1)
@@ -655,14 +650,17 @@ class MoEWorker:
                     print(f"⏭️ [Job {job_id[:8]}] Expert {expert_idx} not used (timeout)")
                     break
 
+                # --- FIX: Precision Guard ---
+                hidden_states = hidden_states.to(self.dtype)
+
                 # --- JIT Expert ---
                 cache_key = (layer_idx, expert_idx)
                 if cache_key not in self.moe_experts:
                     print(f"📦 Loading expert {expert_idx}...")
-                    self.moe_experts[cache_key] = await self.loader.load_moe_expert(model_id, layer_idx, expert_idx, self.device)
+                    self.moe_experts[cache_key] = await self.loader.load_moe_expert(model_id, layer_idx, expert_idx)
 
                 with torch.no_grad():
-                    output = self.moe_experts[cache_key](hidden_states.half())
+                    output = self.moe_experts[cache_key](hidden_states)
 
                 await self._send_p2p(f"{return_url}/tensor_in", {
                     "job_id": job_id,

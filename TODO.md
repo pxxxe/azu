@@ -10,3 +10,4 @@
 - [ ] Implement secure communication channels
 - [ ] Implement BYO Scheduling strategy
 - [ ] OpenAI adapter compatibility
+- [ ] Self Attention and Layer Normalization

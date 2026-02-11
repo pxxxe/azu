@@ -126,6 +126,36 @@ class LayerLoader:
         url = f"{self.registry_url}/layers/{sanitized}/{filename}"
         return path, url
 
+    # =========================================================================
+    # Load Shared Components (Attention + Norms) for MoE Layers
+    # =========================================================================
+    async def load_moe_shared(self, model_id: str, layer_idx: int):
+        cache_key = f"{model_id}:shared:{layer_idx}"
+        if cache_key in self.loaded_cache:
+            return self.loaded_cache[cache_key]
+
+        config_path, config_url = self._get_paths(model_id, "config.json")
+        await self._download(config_url, config_path)
+        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+
+        filename = f"layer_{layer_idx}_shared.safetensors"
+        path, url = self._get_paths(model_id, filename)
+        await self._download(url, path)
+
+        LayerClass = self._get_layer_class(config)
+        # Load the whole layer structure...
+        layer = LayerClass(config, layer_idx=layer_idx).to(self.device).to(self.dtype)
+
+        state_dict = await self._load_weights_safe(path)
+
+        # ...but only populate the shared keys (attn, norms).
+        # strict=False is REQUIRED because we are missing experts/router weights here.
+        layer.load_state_dict(state_dict, strict=False)
+        layer.eval()
+
+        self.loaded_cache[cache_key] = layer
+        return layer
+
     async def load_dense_layer(self, model_id: str, layer_idx: int):
         cache_key = f"{model_id}:dense:{layer_idx}"
         if cache_key in self.loaded_cache:

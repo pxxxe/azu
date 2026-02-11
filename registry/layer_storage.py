@@ -137,7 +137,7 @@ class LayerStore:
         if not filename:
             # Maybe it's a non-sharded model (bin/safetensors directly)
             # We assume sharded for large models, but handle fallback?
-            pass
+            return None # Fail gracefully so we can try patterns
 
         filepath = os.path.join(model_path, filename)
 
@@ -229,7 +229,12 @@ class LayerStore:
                 print("   ℹ️ Single file model detected.")
                 files = glob.glob(os.path.join(model_path, "*.safetensors")) or glob.glob(os.path.join(model_path, "*.bin"))
                 file_name = os.path.basename(files[0])
-                weight_map = None # Will populate later
+
+                # We need a temp model to generate the keys for the map
+                with init_empty_weights():
+                    temp_model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+                weight_map = {k: file_name for k in temp_model.state_dict().keys()}
+                del temp_model
 
             # 3. Instantiate Meta Model (Zero RAM)
             print("   🏗️ Building Meta Model...")
@@ -268,6 +273,51 @@ class LayerStore:
                     print(f"   Layer {i}: Dense")
 
                 if is_moe:
+                    # =====================================================
+                    # SAVE SHARED ATTENTION & NORMS
+                    # =====================================================
+                    # The MoE layer is not JUST experts. It has Attention and Norms.
+                    # We need to save these so the worker can run the Attention block.
+
+                    shared_file = out_dir / f"layer_{i}_shared.safetensors"
+                    shared_state = {}
+                    shared_size_mb = 0
+
+                    # Components to extract (Standard Transformer structure)
+                    # 1. Input Norm (before Attn)
+                    if hasattr(layer, 'input_layernorm'):
+                        prefix = f"{layer_prefix}.input_layernorm"
+                        for name, _ in layer.input_layernorm.named_parameters():
+                            key = f"{prefix}.{name}"
+                            if key in weight_map:
+                                shared_state[f"input_layernorm.{name}"] = self._load_tensor_for_key(key, model_path, weight_map, loaded_shards)
+
+                    # 2. Self Attention
+                    if hasattr(layer, 'self_attn'):
+                        prefix = f"{layer_prefix}.self_attn"
+                        for name, _ in layer.self_attn.named_parameters(recurse=True):
+                            key = f"{prefix}.{name}"
+                            if key in weight_map:
+                                shared_state[f"self_attn.{name}"] = self._load_tensor_for_key(key, model_path, weight_map, loaded_shards)
+
+                    # 3. Post Attention Norm (before MoE)
+                    if hasattr(layer, 'post_attention_layernorm'):
+                        prefix = f"{layer_prefix}.post_attention_layernorm"
+                        for name, _ in layer.post_attention_layernorm.named_parameters():
+                            key = f"{prefix}.{name}"
+                            if key in weight_map:
+                                shared_state[f"post_attention_layernorm.{name}"] = self._load_tensor_for_key(key, model_path, weight_map, loaded_shards)
+
+                    if shared_state:
+                        # Save safely
+                        shared_state = {k: v.contiguous() for k, v in shared_state.items()}
+                        save_safetensors(shared_state, shared_file)
+                        shared_size_mb = shared_file.stat().st_size / (1024**2)
+                        print(f"      ✅ Shared (Attn+Norm) saved ({shared_size_mb:.2f}MB)")
+                    else:
+                        print(f"      ⚠️ WARNING: No shared weights found for layer {i} (Unusual for MoE)")
+
+
                     # Navigate to the MoE block (e.g. layer.mlp for Mixtral).
                     moe_module = layer
                     if moe_rel_path:  # guard: empty string means layer itself is the block
@@ -388,10 +438,13 @@ class LayerStore:
 
                     print(f" Layer {i} MoE done ({num_experts} experts)")
 
+                    # Update metadata with Total Size = Experts + Shared
+                    total_moe_size = expert_size_acc + shared_size_mb
+
                     layer_metadata.append({
-                        "layer_idx": i, "type": "moe", "size_mb": expert_size_acc, "num_experts": num_experts
+                        "layer_idx": i, "type": "moe", "size_mb": total_moe_size, "num_experts": num_experts
                     })
-                    total_size_mb += expert_size_acc
+                    total_size_mb += total_moe_size
 
                 else:
                     # Dense Layer

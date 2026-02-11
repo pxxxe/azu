@@ -424,7 +424,7 @@ class MoEWorker:
                     # Middle Layer Input
                     queue = ctx.get_layer_input_queue(layer_idx)
                     try:
-                        print(f"   ⏳ Waiting for input tensor...")
+                        # print(f"   ⏳ Waiting for input tensor...")
                         hidden_states = await asyncio.wait_for(queue.get(), timeout=P2P_TIMEOUT)
                     except asyncio.TimeoutError:
                         print(f"❌ [Job {job_id[:8]}] Timeout waiting for input")
@@ -516,7 +516,7 @@ class MoEWorker:
 
                 # --- Forward to Next Worker ---
                 elif next_hop:
-                    print(f"   ➡️ Forwarding to {next_hop}")
+                    # print(f"   ➡️ Forwarding to {next_hop}")
                     await self._send_p2p(next_hop, {
                         "job_id": job_id,
                         "type": "input",
@@ -544,7 +544,7 @@ class MoEWorker:
             try:
                 queue = ctx.get_layer_input_queue(layer_idx)
                 try:
-                    print(f"   ⏳ Waiting for input tensor...")
+                    # print(f"   ⏳ Waiting for input tensor...")
                     hidden_states = await asyncio.wait_for(queue.get(), timeout=P2P_TIMEOUT)
                 except asyncio.TimeoutError:
                     if ctx.done: break
@@ -552,6 +552,52 @@ class MoEWorker:
                     break
 
                 hidden_states = hidden_states.to(self.dtype)
+
+                # =========================================================
+                # STEP 1: Execute Shared Attention & Norms
+                # =========================================================
+
+                shared_layer = await self.loader.load_moe_shared(model_id, layer_idx)
+                past_kv = ctx.kv_cache.get(layer_idx, None)
+
+                # A. Input Residual & Norm
+                residual = hidden_states
+                if hasattr(shared_layer, 'input_layernorm'):
+                    hidden_states = shared_layer.input_layernorm(hidden_states)
+
+                # B. Self Attention
+                if hasattr(shared_layer, 'self_attn'):
+                    seq_len = hidden_states.shape[1]
+                    past_len = 0
+                    if past_kv is not None:
+                        past_len = past_kv[0].shape[2]
+
+                    # Generate position IDs for RoPE
+                    position_ids = torch.arange(past_len, past_len + seq_len, dtype=torch.long, device=self.device)
+                    position_ids = position_ids.unsqueeze(0).view(-1, seq_len)
+
+                    attn_out, new_kv = shared_layer.self_attn(
+                        hidden_states,
+                        position_ids=position_ids,
+                        past_key_values=past_kv,
+                        use_cache=True
+                    )
+                    hidden_states = attn_out
+                    ctx.kv_cache[layer_idx] = new_kv
+
+                # C. First Residual Connection
+                hidden_states = residual + hidden_states
+
+                # D. Save state for Post-MoE Residual
+                post_attn_residual = hidden_states
+
+                # E. Post-Attention Norm (Pre-MoE Norm)
+                if hasattr(shared_layer, 'post_attention_layernorm'):
+                    hidden_states = shared_layer.post_attention_layernorm(hidden_states)
+
+                # =========================================================
+                # STEP 2: Router logic
+                # =========================================================
 
                 # --- JIT Router ---
                 if layer_idx not in self.moe_routers:
@@ -580,6 +626,7 @@ class MoEWorker:
                     local_pending[expert_idx] = future
                     ctx.pending_expert_requests[(layer_idx, expert_idx)] = future
 
+                    # Dispatch to experts in PARALLEL
                     send_tasks.append(asyncio.create_task(self._send_p2p(f"{target_url}/tensor_in", {
                         "job_id": job_id,
                         "type": "input",
@@ -599,9 +646,11 @@ class MoEWorker:
                         print(f"❌ [Job {job_id[:8]}] Expert results timeout")
                         break
 
-                # Merge
+                # =========================================================
+                # STEP 3: Merge & Final Residual
+                # =========================================================
                 batch, seq, hidden = hidden_states.shape
-                final_output = torch.zeros((batch, seq, hidden), dtype=self.dtype, device=self.device)
+                moe_output = torch.zeros((batch, seq, hidden), dtype=self.dtype, device=self.device)
                 top_weights_dev = routing_weights.to(self.device)
                 top_indices_dev = selected_indices.to(self.device)
 
@@ -612,7 +661,10 @@ class MoEWorker:
                         mask = (top_indices_dev == expert_idx)
                         rows, cols, k_idx = torch.where(mask)
                         w = top_weights_dev[rows, cols, k_idx].unsqueeze(-1)
-                        final_output.index_put_((rows, cols), res * w, accumulate=True)
+                        moe_output.index_put_((rows, cols), res * w, accumulate=True)
+
+                # Final Residual: (Attn Output) + (MoE Output)
+                final_output = post_attn_residual + moe_output
 
                 for expert_idx in local_pending:
                     ctx.pending_expert_requests.pop((layer_idx, expert_idx), None)

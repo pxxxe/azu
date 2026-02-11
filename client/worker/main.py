@@ -320,29 +320,27 @@ class MoEWorker:
                 print(f"   ⚙️ Initializing Rotary Embeddings for {model_id}...")
                 config_path, config_url = self.loader._get_paths(model_id, "config.json")
                 if not config_path.exists():
-                     await self.loader._download(config_url, config_path)
+                      await self.loader._download(config_url, config_path)
 
                 self.config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
                 if MixtralRotaryEmbedding:
-                    # Initialize RoPE cache (standard Mixtral settings)
-                    # Note: Mixtral/Llama typically use these params
-                    dim = getattr(self.config, 'hidden_size', 4096) // getattr(self.config, 'num_attention_heads', 32)
-                    max_pos = getattr(self.config, 'max_position_embeddings', 32768)
-                    base = getattr(self.config, 'rope_theta', 10000.0)
+                    # TRANSFORMERS 5.0+ FIX: Pass config object instead of individual params
+                    # The new API signature is: MixtralRotaryEmbedding(config=config, device=device)
 
                     self.rotary_emb = MixtralRotaryEmbedding(
-                        dim=dim,
-                        max_position_embeddings=max_pos,
-                        base=base,
+                        config=self.config,
                         device=self.device
-                    )
-                    # Ensure dtype matches
-                    self.rotary_emb = self.rotary_emb.to(self.dtype)
-                    print(f"   ✅ RoPE Initialized (dim={dim}, base={base})")
+                    ).to(self.dtype)
+
+                    print(f"   ✅ RoPE Initialized (head_dim={self.config.hidden_size // self.config.num_attention_heads}, "
+                          f"base={getattr(self.config, 'rope_theta', 10000.0)})")
+
             except Exception as e:
                 print(f"   ⚠️ Failed to init RoPE: {e}")
                 traceback.print_exc()
+                # Set to None so code can continue without RoPE (will fail later, but more gracefully)
+                self.rotary_emb = None
 
             self.current_model_id = model_id
 

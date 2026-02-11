@@ -416,55 +416,36 @@ class MoEWorker:
                 raise
 
     def _prepare_inputs(self, hidden_states, past_kv):
-        """
-        V5 COMPAT: Pre-compute position embeddings and mask.
-        Returns: (position_embeddings, attention_mask)
-        """
         seq_len = hidden_states.shape[1]
         past_len = 0
         if past_kv is not None:
             past_len = past_kv[0].shape[2]
 
-        # 1. Position IDs
         position_ids = torch.arange(
             past_len, past_len + seq_len, dtype=torch.long, device=self.device
         ).unsqueeze(0).view(-1, seq_len)
 
-        # 2. Rotary Embeddings (Cos, Sin)
-        # transformers v5/v4.36+ expects (cos, sin) tuple
         position_embeddings = None
         if self.rotary_emb:
-            # We call the RoPE module. It returns cos, sin
-            # Note: The signature of forward might vary, usually it takes (x, seq_len) or (x, position_ids)
-            # MixtralRotaryEmbedding.forward(x, position_ids) -> cos, sin
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        # 3. Attention Mask
-        # For inference (ragged/single batch), usually 4D: (batch, 1, q_len, kv_len)
-        # We need to mask out future tokens if seq_len > 1 (prefill)
-        # If seq_len == 1 (decode), it's all ones.
         total_len = past_len + seq_len
 
-        # Create causal mask
-        # (1, 1, seq_len, total_len)
+        # Create causal mask (1, 1, seq_len, total_len)
         mask = torch.full(
             (1, 1, seq_len, total_len),
-            0, # 0 means unmasked in some versions, but standard is min_dtype for masked
+            0,
             dtype=self.dtype,
             device=self.device
         )
 
-        # If prefill (seq_len > 1), we need causality (triangular)
-        if seq_len > 1:
-             # Standard causal mask: -inf above diagonal
-             causal_mask = torch.triu(
-                 torch.full((seq_len, total_len), float("-inf"), device=self.device),
-                 diagonal=1
-             )
-             mask = mask + causal_mask.unsqueeze(0).unsqueeze(0)
-
-        # NOTE: Transformers often expects 0 for "attend", -inf for "mask"
-        # Since we initialized with 0, we are good.
+        # FIXED: Apply causal masking accounting for KV cache
+        # Always apply causality, even for seq_len=1 (though it has no effect)
+        causal_mask = torch.triu(
+            torch.full((seq_len, total_len), float("-inf"), device=self.device),
+            diagonal=past_len + 1  # ✅ FIXED - accounts for KV cache offset
+        )
+        mask = mask + causal_mask.unsqueeze(0).unsqueeze(0)
 
         return position_embeddings, mask, position_ids
 

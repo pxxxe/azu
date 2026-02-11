@@ -14,6 +14,16 @@ from aiohttp import web, ClientSession, TCPConnector, ClientTimeout
 from transformers import AutoTokenizer, AutoConfig
 from dataclasses import dataclass, field
 
+# --- NEW: Import Rotary Embeddings for v5 Compatibility ---
+try:
+    from transformers.models.mixtral.modeling_mixtral import MixtralRotaryEmbedding
+except ImportError:
+    try:
+        from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding as MixtralRotaryEmbedding
+    except ImportError:
+        print("⚠️ Could not import RotaryEmbedding. v5 Compat mode might fail.")
+        MixtralRotaryEmbedding = None
+
 from layer_loader import LayerLoader
 
 # Config
@@ -71,7 +81,9 @@ class MoEWorker:
         self.current_model_id = None
 
         # Model Components
+        self.config = None
         self.embeddings = None
+        self.rotary_emb = None # NEW: Global RoPE cache
         self.lm_head = None
         self.tokenizer = None  # FIX: Add tokenizer caching
         self.final_norm = None
@@ -290,7 +302,9 @@ class MoEWorker:
             print(f"🧹 New model {model_id} requested. Clearing VRAM...")
             sys.stdout.flush()
 
+            self.config = None
             self.embeddings = None
+            self.rotary_emb = None
             self.lm_head = None
             self.final_norm = None
             self.tokenizer = None  # FIX: Clear tokenizer cache
@@ -300,6 +314,35 @@ class MoEWorker:
             self.active_jobs.clear()
             gc.collect()
             torch.cuda.empty_cache()
+
+            # --- V5 COMPAT: Initialize Global Rotary Embeddings ---
+            try:
+                print(f"   ⚙️ Initializing Rotary Embeddings for {model_id}...")
+                config_path, config_url = self.loader._get_paths(model_id, "config.json")
+                if not config_path.exists():
+                     await self.loader._download(config_url, config_path)
+
+                self.config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+
+                if MixtralRotaryEmbedding:
+                    # Initialize RoPE cache (standard Mixtral settings)
+                    # Note: Mixtral/Llama typically use these params
+                    dim = getattr(self.config, 'hidden_size', 4096) // getattr(self.config, 'num_attention_heads', 32)
+                    max_pos = getattr(self.config, 'max_position_embeddings', 32768)
+                    base = getattr(self.config, 'rope_theta', 10000.0)
+
+                    self.rotary_emb = MixtralRotaryEmbedding(
+                        dim=dim,
+                        max_position_embeddings=max_pos,
+                        base=base,
+                        device=self.device
+                    )
+                    # Ensure dtype matches
+                    self.rotary_emb = self.rotary_emb.to(self.dtype)
+                    print(f"   ✅ RoPE Initialized (dim={dim}, base={base})")
+            except Exception as e:
+                print(f"   ⚠️ Failed to init RoPE: {e}")
+                traceback.print_exc()
 
             self.current_model_id = model_id
 
@@ -374,6 +417,59 @@ class MoEWorker:
                 print(f"Registry must serve ALL tokenizer files from {self.loader.registry_url}\n")
                 raise
 
+    def _prepare_inputs(self, hidden_states, past_kv):
+        """
+        V5 COMPAT: Pre-compute position embeddings and mask.
+        Returns: (position_embeddings, attention_mask)
+        """
+        seq_len = hidden_states.shape[1]
+        past_len = 0
+        if past_kv is not None:
+            past_len = past_kv[0].shape[2]
+
+        # 1. Position IDs
+        position_ids = torch.arange(
+            past_len, past_len + seq_len, dtype=torch.long, device=self.device
+        ).unsqueeze(0).view(-1, seq_len)
+
+        # 2. Rotary Embeddings (Cos, Sin)
+        # transformers v5/v4.36+ expects (cos, sin) tuple
+        position_embeddings = None
+        if self.rotary_emb:
+            # We call the RoPE module. It returns cos, sin
+            # Note: The signature of forward might vary, usually it takes (x, seq_len) or (x, position_ids)
+            # MixtralRotaryEmbedding.forward(x, position_ids) -> cos, sin
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        # 3. Attention Mask
+        # For inference (ragged/single batch), usually 4D: (batch, 1, q_len, kv_len)
+        # We need to mask out future tokens if seq_len > 1 (prefill)
+        # If seq_len == 1 (decode), it's all ones.
+        total_len = past_len + seq_len
+
+        # Create causal mask
+        # (1, 1, seq_len, total_len)
+        mask = torch.full(
+            (1, 1, seq_len, total_len),
+            0, # 0 means unmasked in some versions, but standard is min_dtype for masked
+            dtype=self.dtype,
+            device=self.device
+        )
+
+        # If prefill (seq_len > 1), we need causality (triangular)
+        if seq_len > 1:
+             # Standard causal mask: -inf above diagonal
+             causal_mask = torch.triu(
+                 torch.full((seq_len, total_len), float("-inf"), device=self.device),
+                 diagonal=1
+             )
+             mask = mask + causal_mask.unsqueeze(0).unsqueeze(0)
+
+        # NOTE: Transformers often expects 0 for "attend", -inf for "mask"
+        # Since we initialized with 0, we are good.
+
+        return position_embeddings, mask, position_ids
+
     async def process_dense(self, msg, ws):
         job_id = msg['job_id']
         model_id = msg['model_id']
@@ -442,11 +538,18 @@ class MoEWorker:
                     # Get KV Cache for this layer
                     past_kv = ctx.kv_cache.get(layer_idx, None)
 
+                    # --- V5 FIX: Prepare Positional Args ---
+                    pos_emb, attn_mask, pos_ids = self._prepare_inputs(hidden_states, past_kv)
+
                     with torch.no_grad():
                         out = self.dense_layers[layer_idx](
                             hidden_states,
                             past_key_values=past_kv,
-                            use_cache=True
+                            use_cache=True,
+                            # Explicitly pass V5 required args
+                            position_embeddings=pos_emb,
+                            attention_mask=attn_mask,
+                            position_ids=pos_ids
                         )
 
                         if isinstance(out, tuple):
@@ -556,29 +659,25 @@ class MoEWorker:
                 # =========================================================
                 # STEP 1: Execute Shared Attention & Norms
                 # =========================================================
-
                 shared_layer = await self.loader.load_moe_shared(model_id, layer_idx)
                 past_kv = ctx.kv_cache.get(layer_idx, None)
+
+                # --- V5 FIX: Prepare Positional Args ---
+                pos_emb, attn_mask, pos_ids = self._prepare_inputs(hidden_states, past_kv)
 
                 # A. Input Residual & Norm
                 residual = hidden_states
                 if hasattr(shared_layer, 'input_layernorm'):
                     hidden_states = shared_layer.input_layernorm(hidden_states)
 
-                # B. Self Attention
+                # B. Self Attention (V5 SAFE CALL)
                 if hasattr(shared_layer, 'self_attn'):
-                    seq_len = hidden_states.shape[1]
-                    past_len = 0
-                    if past_kv is not None:
-                        past_len = past_kv[0].shape[2]
-
-                    # Generate position IDs for RoPE
-                    position_ids = torch.arange(past_len, past_len + seq_len, dtype=torch.long, device=self.device)
-                    position_ids = position_ids.unsqueeze(0).view(-1, seq_len)
-
+                    # Explicitly pass the required args for V5
                     attn_out, new_kv = shared_layer.self_attn(
                         hidden_states,
-                        position_ids=position_ids,
+                        position_embeddings=pos_emb,
+                        attention_mask=attn_mask,
+                        position_ids=pos_ids,
                         past_key_values=past_kv,
                         use_cache=True
                     )

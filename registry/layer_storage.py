@@ -312,7 +312,10 @@ class LayerStore:
                         # Save safely
                         shared_state = {k: v.contiguous() for k, v in shared_state.items()}
                         save_safetensors(shared_state, shared_file)
+
+                        # --- CAPTURE EXACT SHARED SIZE ---
                         shared_size_mb = shared_file.stat().st_size / (1024**2)
+
                         print(f"      ✅ Shared (Attn+Norm) saved ({shared_size_mb:.2f}MB)")
                     else:
                         print(f"      ⚠️ WARNING: No shared weights found for layer {i} (Unusual for MoE)")
@@ -332,6 +335,7 @@ class LayerStore:
                     # --- CHANGE: .pt -> .safetensors ---
                     router_file = out_dir / f"layer_{i}_router.safetensors"
                     router_prefix = f"{moe_prefix}.{router_attr}"
+                    router_size_mb = 0
 
                     # Build router state dict manually from weight_map
                     router_state = {}
@@ -371,7 +375,11 @@ class LayerStore:
                         save_safetensors(router_state, router_file)
                         if not router_file.exists():
                             raise RuntimeError(f"Router file was not created: {router_file}")
-                        print(f"      ✅ Router saved ({router_file.stat().st_size / (1024**2):.2f}MB)")
+
+                        # --- CAPTURE EXACT ROUTER SIZE ---
+                        router_size_mb = router_file.stat().st_size / (1024**2)
+
+                        print(f"      ✅ Router saved ({router_size_mb:.2f}MB)")
                     else:
                         # CRITICAL: Router is mandatory for MoE layers
                         print(f"      ❌ CRITICAL: No router weights found!")
@@ -439,10 +447,21 @@ class LayerStore:
                     print(f" Layer {i} MoE done ({num_experts} experts)")
 
                     # Update metadata with Total Size = Experts + Shared
-                    total_moe_size = expert_size_acc + shared_size_mb
+                    total_moe_size = expert_size_acc + shared_size_mb + router_size_mb
+
+                    # --- NEW: Calculate Avg Expert Size ---
+                    avg_expert_size = expert_size_acc / max(1, num_experts)
 
                     layer_metadata.append({
-                        "layer_idx": i, "type": "moe", "size_mb": total_moe_size, "num_experts": num_experts
+                        "layer_idx": i,
+                        "type": "moe",
+                        "num_experts": num_experts,
+                        # Detailed metadata for Scheduler
+                        "shared_size_mb": shared_size_mb,
+                        "router_size_mb": router_size_mb,
+                        "expert_size_mb": avg_expert_size,
+                        # Legacy field
+                        "size_mb": total_moe_size
                     })
                     total_size_mb += total_moe_size
 
@@ -456,7 +475,10 @@ class LayerStore:
                         raise RuntimeError(f"Dense layer file was not created: {dense_file}")
 
                     layer_metadata.append({
-                        "layer_idx": i, "type": "dense", "size_mb": sz, "num_experts": 0
+                        "layer_idx": i,
+                        "type": "dense",
+                        "size_mb": sz,
+                        "num_experts": 0
                     })
                     total_size_mb += sz
                     print(f"   Layer {i} Dense done ({sz:.2f}MB)")

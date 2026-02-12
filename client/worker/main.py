@@ -810,6 +810,27 @@ class MoEWorker:
             traceback.print_exc()
             sys.stdout.flush()
 
+    # --- NEW: Heartbeat to report real status to Scheduler ---
+    async def heartbeat(self, ws):
+        while True:
+            try:
+                if torch.cuda.is_available():
+                    free_bytes, total_bytes = torch.cuda.mem_get_info()
+                    free_mb = int(free_bytes / (1024**2))
+                    # Optional: GC if fragmentation is high?
+                    # gc.collect()
+                else:
+                    free_mb = self.vram_total_mb
+
+                await ws.send(json.dumps({
+                    "type": "HEARTBEAT",
+                    "vram_free_mb": free_mb
+                }))
+                await asyncio.sleep(1.0)
+            except Exception:
+                # Socket closed or error
+                break
+
     async def run(self):
         await self.start_p2p_server()
         while True:
@@ -829,6 +850,9 @@ class MoEWorker:
                     }))
                     print(f"✅ Connected & Registered")
 
+                    # START HEARTBEAT
+                    heartbeat_task = asyncio.create_task(self.heartbeat(ws))
+
                     async for raw in ws:
                         msg = json.loads(raw)
                         msg_type = msg['type']
@@ -845,6 +869,9 @@ class MoEWorker:
                                 self.process_moe_expert(msg, ws), f"EXECUTE_EXPERT-{job_id}"))
                         else:
                             print(f"⚠️ Unknown message type: {msg_type}")
+
+                    # Cleanup task on disconnect
+                    heartbeat_task.cancel()
             except Exception as e:
                 print(f"❌ Connection Error: {e}")
                 await asyncio.sleep(5)

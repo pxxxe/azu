@@ -27,7 +27,7 @@ from solders.transaction import Transaction
 CORE_IMG = 'pxxxe/azu-core:latest'
 WORKER_IMG = 'pxxxe/azu-worker:latest'
 TEST_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
-
+# TEST_MODEL = "Qwen/Qwen3-4B-Thinking-2507"
 
 
 VOLUME_ID = os.getenv("VOLUME_ID")

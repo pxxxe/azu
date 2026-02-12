@@ -45,6 +45,11 @@ class LayerLoader:
 
     async def _load_weights_safe(self, path):
         loop = asyncio.get_running_loop()
+
+        # --- FIX: Aggressive defrag before loading ---
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
+
         # Load directly to CPU first, standard practice for safetensors to avoid OOM
         return await loop.run_in_executor(
             self.executor,

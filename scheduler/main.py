@@ -18,6 +18,10 @@ class WorkerState:
     specs: dict
     vram_total_mb: int
     vram_used_mb: int = 0
+
+    # Truth from Heartbeat (Precision Tracking)
+    actual_free_mb: int = 0
+
     cached_layers: Set[str] = field(default_factory=set)
     last_heartbeat: float = field(default_factory=time.time)
 
@@ -43,7 +47,8 @@ class MoEScheduler:
     async def register_worker(self, ws: WebSocket, specs: dict) -> str:
         wid = specs['pubkey']
         vram = specs.get('vram_mb', 24000)
-        self.workers[wid] = WorkerState(pubkey=wid, ws=ws, specs=specs, vram_total_mb=vram)
+        # Init actual_free to total until first heartbeat
+        self.workers[wid] = WorkerState(pubkey=wid, ws=ws, specs=specs, vram_total_mb=vram, actual_free_mb=vram)
         print(f"✅ Registered: {wid} | VRAM: {vram}MB")
         return wid
 
@@ -52,26 +57,49 @@ class MoEScheduler:
             del self.workers[wid]
             print(f"❌ Worker {wid} disconnected")
 
-    def _find_best_worker(self, size_mb: int, previous_worker_id: str = None, cache_key: str = None) -> Optional[WorkerState]:
+    async def handle_heartbeat(self, wid: str, data: dict):
+        if wid in self.workers:
+            self.workers[wid].actual_free_mb = data.get('vram_free_mb', 0)
+            self.workers[wid].last_heartbeat = time.time()
+
+    def _find_best_worker(self, size_mb: int, current_job_allocations: Dict[str, int],
+                          previous_worker_id: str = None, cache_key: str = None) -> Optional[WorkerState]:
         candidates = list(self.workers.values())
         if not candidates: return None
 
         valid = []
         for w in candidates:
-            has_cache = cache_key in w.cached_layers
-            if has_cache or w.vram_free_mb >= size_mb:
-                valid.append(w)
+            # Check if cached
+            is_cached = cache_key in w.cached_layers
+
+            # Ledger Logic:
+            # Available = (Reported Free) - (Allocated in CURRENT planning session)
+            pending_load = current_job_allocations.get(w.pubkey, 0)
+
+            # Cost is 0 if already cached (assuming cache persists)
+            cost = 0 if is_cached else size_mb
+
+            predicted_free = w.actual_free_mb - pending_load
+
+            if predicted_free >= cost:
+                valid.append((w, cost))
 
         if not valid: return None
 
-        def score(w):
+        def score(item):
+            w, cost = item
             s = 0
-            if cache_key and cache_key in w.cached_layers: s += 10000
+            if cost == 0: s += 10000 # Prefer cached
             if previous_worker_id and w.pubkey == previous_worker_id: s += 5000
-            s += (w.vram_free_mb / 1024)
+            s += (w.actual_free_mb / 1024)
             return s
 
-        return max(valid, key=score)
+        chosen_worker, cost = max(valid, key=score)
+
+        # Update ledger
+        current_job_allocations[chosen_worker.pubkey] = current_job_allocations.get(chosen_worker.pubkey, 0) + cost
+
+        return chosen_worker
 
     def _plan_job(self, model_info) -> Optional[List[dict]]:
         layers = model_info.get('layer_metadata', [])
@@ -80,39 +108,65 @@ class MoEScheduler:
         topology = []
         prev_worker_id = None
 
+        # Ephemeral ledger for this specific plan
+        current_job_allocations = {}
+
         for layer in layers:
             layer_idx = layer['layer_idx']
             l_type = layer.get('type', 'dense')
-            main_size = layer.get('size_mb', 0) if l_type == 'dense' else 50
-            cache_key = f"{model_info['model_id']}:{layer_idx}:main"
 
-            target_worker = self._find_best_worker(main_size, prev_worker_id, cache_key)
-            if not target_worker:
-                print(f"⚠️ Cluster Full! Cannot place layer {layer_idx}")
-                return None
+            if l_type == 'dense':
+                size = layer.get('size_mb', 0)
+                cache_key = f"{model_info['model_id']}:{layer_idx}:main"
 
-            if cache_key not in target_worker.cached_layers:
-                target_worker.vram_used_mb += main_size
-                target_worker.cached_layers.add(cache_key)
+                target_worker = self._find_best_worker(size, current_job_allocations, prev_worker_id, cache_key)
+                if not target_worker:
+                    print(f"⚠️ Cluster Full! Cannot place layer {layer_idx}")
+                    return None
 
-            node = {
-                "layer_idx": layer_idx,
-                "type": l_type,
-                "worker_id": target_worker.pubkey,
-                "endpoint": target_worker.specs.get('p2p_url')
-            }
-            prev_worker_id = target_worker.pubkey
+                if cache_key not in target_worker.cached_layers:
+                    target_worker.vram_used_mb += size
+                    target_worker.cached_layers.add(cache_key)
 
-            if l_type == 'moe':
-                node['expert_map'] = {}
+                node = {
+                    "layer_idx": layer_idx,
+                    "type": l_type,
+                    "worker_id": target_worker.pubkey,
+                    "endpoint": target_worker.specs.get('p2p_url')
+                }
+                prev_worker_id = target_worker.pubkey
+                topology.append(node)
+
+            elif l_type == 'moe':
+                # 1. Place Router + Shared
+                # Use precise sizes from Registry if available
+                shared_size = layer.get('shared_size_mb', 0) + layer.get('router_size_mb', 0)
+                if shared_size == 0: shared_size = 300 # Fallback
+
+                shared_key = f"{model_info['model_id']}:{layer_idx}:shared"
+
+                router_worker = self._find_best_worker(shared_size, current_job_allocations, prev_worker_id, shared_key)
+                if not router_worker: return None
+
+                if shared_key not in router_worker.cached_layers:
+                     router_worker.vram_used_mb += shared_size
+                     router_worker.cached_layers.add(shared_key)
+
+                node = {
+                    "layer_idx": layer_idx, "type": "moe",
+                    "worker_id": router_worker.pubkey, "endpoint": router_worker.specs.get('p2p_url'),
+                    "expert_map": {}
+                }
+                prev_worker_id = router_worker.pubkey
+
+                # 2. Place Experts
                 num_experts = layer.get('num_experts', 0)
-                # FIX (Bug 2): The registry writes total expert size into the
-                # 'size_mb' field of layer_metadata.
-                expert_size = layer.get('size_mb', 0) / max(1, num_experts)
+                expert_size = layer.get('expert_size_mb', 0)
+                if expert_size == 0: expert_size = (layer.get('size_mb', 0) / max(1, num_experts))
 
                 for exp_idx in range(num_experts):
                     exp_key = f"{model_info['model_id']}:{layer_idx}:expert:{exp_idx}"
-                    exp_worker = self._find_best_worker(expert_size, node['worker_id'], exp_key)
+                    exp_worker = self._find_best_worker(expert_size, current_job_allocations, node['worker_id'], exp_key)
 
                     if not exp_worker: return None
 
@@ -122,7 +176,7 @@ class MoEScheduler:
 
                     node['expert_map'][str(exp_idx)] = exp_worker.specs.get('p2p_url')
 
-            topology.append(node)
+                topology.append(node)
 
         if not topology:
             return None
@@ -320,5 +374,7 @@ async def ws_endpoint(ws: WebSocket):
                 data = await ws.receive_json()
                 if data['type'] == "RESULT":
                     await scheduler.handle_result(wid, data)
+                elif data['type'] == "HEARTBEAT":
+                    await scheduler.handle_heartbeat(wid, data)
     except:
         if wid: await scheduler.unregister_worker(wid)

@@ -72,10 +72,15 @@ class MoEScheduler:
             # Cost is 0 if already cached (assuming cache persists)
             cost = 0 if is_cached else size_mb
 
-            predicted_free = w.actual_free_mb - pending_load
+            # --- FIX START: Use Internal Ledger + Safety Margin ---
+            # Don't trust actual_free_mb (laggy race condition). Use internal vram_used_mb.
+            # 90% Cap to allow for PyTorch overhead/activations
+            safe_limit = w.vram_total_mb * 0.90
+            projected_usage = w.vram_used_mb + pending_load
 
-            if predicted_free >= cost:
+            if (projected_usage + cost) <= safe_limit:
                 valid.append((w, cost))
+            # --- FIX END ---
 
         if not valid: return None
 
@@ -86,7 +91,12 @@ class MoEScheduler:
 
             # USE ACTUAL AVAILABLE after pending allocations
             pending = current_job_allocations.get(w.pubkey, 0)
-            available = (w.actual_free_mb - pending) / 1024
+
+            # --- FIX START: Score based on internal ledger ---
+            safe_limit = w.vram_total_mb * 0.90
+            projected_usage = w.vram_used_mb + pending
+            available = (safe_limit - projected_usage) / 1024
+            # --- FIX END ---
 
             # Locality as multiplier not flat bonus
             if previous_worker_id and w.pubkey == previous_worker_id:

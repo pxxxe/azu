@@ -82,14 +82,17 @@ class MoEScheduler:
         def score(item):
             w, cost = item
             s = 0
-            if cost == 0: s += 10000  # Cached still dominates
+            if cost == 0: s += 10000 # Cached
 
-            base = w.actual_free_mb / 1024  # Free VRAM in GB
+            # USE ACTUAL AVAILABLE after pending allocations
+            pending = current_job_allocations.get(w.pubkey, 0)
+            available = (w.actual_free_mb - pending) / 1024
 
+            # Locality as multiplier not flat bonus
             if previous_worker_id and w.pubkey == previous_worker_id:
-                base *= 1.2  # 20% boost for locality
+                available *= 1.2
 
-            s += base
+            s += available
             return s
 
         chosen_worker, cost = max(valid, key=score)

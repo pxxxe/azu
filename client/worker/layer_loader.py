@@ -148,12 +148,26 @@ class LayerLoader:
         await self._download(url, path)
 
         LayerClass = self._get_layer_class(config)
-        # Load the whole layer structure...
-        layer = LayerClass(config, layer_idx=layer_idx).to(self.device).to(self.dtype)
+
+        # --- VRAM LEAK FIX: INSTANTIATE ON CPU FIRST ---
+        # We must create the layer on CPU to perform surgery before moving to GPU.
+        # Otherwise, 'MixtralDecoderLayer' initializes 8 full experts in VRAM (3GB+)
+        # even though we only need the Attention/Norms (200MB).
+        layer = LayerClass(config, layer_idx=layer_idx)
+
+        # --- LOBOTOMY: Remove Experts from the container ---
+        if hasattr(layer, "block_sparse_moe"):
+            del layer.block_sparse_moe
+            layer.block_sparse_moe = None
+        elif hasattr(layer, "mlp"):
+            del layer.mlp
+            layer.mlp = None
+
+        # Now move the slimmed-down layer to GPU
+        layer = layer.to(self.device).to(self.dtype)
 
         state_dict = await self._load_weights_safe(path)
 
-        # ...but only populate the shared keys (attn, norms).
         # strict=False is REQUIRED because we are missing experts/router weights here.
         layer.load_state_dict(state_dict, strict=False)
         layer.eval()

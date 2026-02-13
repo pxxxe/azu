@@ -302,15 +302,35 @@ def main():
             raise Exception("Registry failed to become healthy")
 
         # ==========================================
-        # 2. Shard Model
+        # 2. Shard Model (CHECK FIRST)
         # ==========================================
-        log_section(f"⚡ 2. Sharding {TEST_MODEL}")
-        print("   (This takes time for large models so we preload)")
+        log_section(f"⚡ 2. Checking Model Status")
 
-        shard_res = requests.post(f"{reg_url}/models/shard", json={"model_id": TEST_MODEL}, timeout=900)
-        if shard_res.status_code != 200:
-            raise Exception(f"Sharding Failed: {shard_res.text}")
-        print(f"   ✅ Sharding Complete: {shard_res.json()}")
+        status_res = requests.get(f"{reg_url}/models/status", params={"model_id": TEST_MODEL}, timeout=10)
+        if status_res.status_code == 200:
+            status = status_res.json().get('status')
+            print(f"   📊 Model status: {status}")
+
+            if status == 'ready':
+                print(f"   ✅ Model already sharded, skipping...")
+            elif status == 'processing':
+                print(f"   ⏳ Sharding already in progress, waiting...")
+                # Wait for it to finish
+                for i in range(180):
+                    time.sleep(5)
+                    check = requests.get(f"{reg_url}/models/status", params={"model_id": TEST_MODEL}, timeout=5)
+                    if check.status_code == 200 and check.json().get('status') == 'ready':
+                        print(f"   ✅ Sharding complete!")
+                        break
+            else:
+                print(f"   🔪 Triggering shard...")
+                shard_res = requests.post(f"{reg_url}/models/shard", json={"model_id": TEST_MODEL}, timeout=900)
+                if shard_res.status_code != 200:
+                    raise Exception(f"Sharding Failed: {shard_res.text}")
+                print(f"   ✅ Sharding Complete: {shard_res.json()}")
+        else:
+            print(f"   ⚠️ Could not get status, will attempt to shard...")
+            shard_res = requests.post(f"{reg_url}/models/shard", json={"model_id": TEST_MODEL}, timeout=900)
 
         # ==========================================
         # 3. Deploy Workers (DYNAMIC PROVISIONING)

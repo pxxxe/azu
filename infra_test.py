@@ -37,6 +37,7 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 
 # Prioritize High-RAM GPUs for Stability
 GPU_TYPES_SECURE = [
+  "NVIDIA GeForce RTX 4090",          # 24GB
     "NVIDIA H200 NVL",                  # 143GB
     "NVIDIA H100 NVL",                  # 94GB
     "NVIDIA RTX PRO 6000",              # 96GB
@@ -48,7 +49,6 @@ GPU_TYPES_SECURE = [
     "NVIDIA RTX A6000",                 # 48GB
     "NVIDIA L40S",                      # 48GB
     "NVIDIA L40",                       # 48GB
-    "NVIDIA GeForce RTX 4090",          # 24GB
     "NVIDIA RTX A5000",                 # 24GB
     "NVIDIA GeForce RTX 3090",          # 24GB
     "NVIDIA L4",                        # 24GB
@@ -154,7 +154,7 @@ def resolve_connection(pod_id, port, max_wait=120):
     print("      ⚠️ Timeout waiting for port check. Assuming Proxy is valid.")
     return proxy_url
 
-def deploy_pod_with_retry(name, image, env_vars, gpu_type, max_retries=3):
+def deploy_pod_with_retry(name, image, env_vars, gpu_type, max_retries=1):
     """Deploy pod with retries."""
     print(f"   🎯 Trying GPU type: {gpu_type}")
 

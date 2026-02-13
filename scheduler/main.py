@@ -2,6 +2,7 @@ import redis.asyncio as redis
 import asyncio
 import json
 import time
+import sys
 import aiohttp
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
@@ -53,8 +54,6 @@ class MoEScheduler:
 
     async def handle_heartbeat(self, wid: str, data: dict):
         if wid in self.workers:
-            # We record this for observability, but we DO NOT use it for planning
-            # because it lags behind the downloads.
             self.workers[wid].actual_free_mb = data.get('vram_free_mb', 0)
             self.workers[wid].last_heartbeat = time.time()
 
@@ -64,42 +63,46 @@ class MoEScheduler:
         if not candidates: return None
 
         valid = []
+        print(f"--- Planning allocation for {size_mb:.0f}MB layer ---")
+
         for w in candidates:
-            # 1. Determine Safety Cap (85% to save room for KV Cache & Overhead)
-            safe_limit = w.vram_total_mb * 0.85
+            # 1. Determine Safety Cap (80% STRICT LIMIT)
+            safe_limit = w.vram_total_mb * 0.80
 
             # 2. Check Capacity using INTERNAL LEDGER
-            # vram_used_mb: What we assigned in previous jobs
-            # pending_load: What we assigned in this current job loop
-            # cost: What we want to assign now
             pending_load = current_job_allocations.get(w.pubkey, 0)
 
-            # Check if cached (cost is 0 if so)
             is_cached = cache_key in w.cached_layers
             allocation_cost = 0 if is_cached else size_mb
 
+            # Calculate total projected usage
             projected_usage = w.vram_used_mb + pending_load + allocation_cost
+
+            # EXPLICIT DEBUG LOGGING
+            print(f"   Worker {w.pubkey[:8]}: Used(Persist)={w.vram_used_mb:.0f} + Pending(Job)={pending_load:.0f} + Cost={allocation_cost:.0f} = {projected_usage:.0f} / {safe_limit:.0f} (Cap)")
 
             if projected_usage <= safe_limit:
                  valid.append((w, allocation_cost))
+            else:
+                 # Print REJECTION reason
+                 print(f"   ❌ Rejected {w.pubkey[:8]}: Proj {projected_usage:.0f}MB > Limit {safe_limit:.0f}MB")
 
-        if not valid: return None
+        if not valid:
+            print(f"   ⚠️ NO WORKERS FIT {size_mb:.0f}MB")
+            return None
 
         def score(item):
             w, cost = item
             s = 0
-            if cost == 0: s += 10000 # Heavily prefer cached
+            if cost == 0: s += 10000
 
-            # Score based on INTERNAL ledger remaining capacity
             pending = current_job_allocations.get(w.pubkey, 0)
             projected_usage = w.vram_used_mb + pending
-
-            safe_limit = w.vram_total_mb * 0.85
+            safe_limit = w.vram_total_mb * 0.80
             available_room = safe_limit - projected_usage
 
             s += (available_room / 1024)
 
-            # Locality bonus
             if previous_worker_id and w.pubkey == previous_worker_id:
                 s += 5
 
@@ -108,7 +111,12 @@ class MoEScheduler:
         chosen_worker, cost = max(valid, key=score)
 
         # Update ephemeral ledger
-        current_job_allocations[chosen_worker.pubkey] = current_job_allocations.get(chosen_worker.pubkey, 0) + cost
+        new_load = current_job_allocations.get(chosen_worker.pubkey, 0) + cost
+        current_job_allocations[chosen_worker.pubkey] = new_load
+
+        # Log the winner
+        print(f"   ✅ Selected {chosen_worker.pubkey[:8]}. New Job Load: {new_load:.0f}MB. Total Proj: {chosen_worker.vram_used_mb + new_load:.0f}MB")
+        sys.stdout.flush()
 
         return chosen_worker
 
@@ -118,9 +126,9 @@ class MoEScheduler:
 
         topology = []
         prev_worker_id = None
-
-        # Ephemeral ledger tracks usage during this single planning loop
         current_job_allocations = {}
+
+        print(f"\n🧠 Planning Job for {model_info['model_id']} ({len(layers)} layers)...")
 
         for layer in layers:
             layer_idx = layer['layer_idx']
@@ -130,10 +138,9 @@ class MoEScheduler:
                 size = layer.get('size_mb', 0)
                 cache_key = f"{model_info['model_id']}:{layer_idx}:main"
 
+                print(f"Layer {layer_idx} (Dense): Need {size:.0f}MB")
                 target_worker = self._find_best_worker(size, current_job_allocations, prev_worker_id, cache_key)
-                if not target_worker:
-                    print(f"⚠️ Cluster Full! Cannot place layer {layer_idx}")
-                    return None
+                if not target_worker: return None
 
                 node = {
                     "layer_idx": layer_idx,
@@ -149,13 +156,11 @@ class MoEScheduler:
                 shared_size = layer.get('shared_size_mb', 0)
                 router_size = layer.get('router_size_mb', 0)
                 combined_size = shared_size + router_size
-
                 shared_key = f"{model_info['model_id']}:{layer_idx}:shared"
 
+                print(f"Layer {layer_idx} (Router): Need {combined_size:.0f}MB")
                 router_worker = self._find_best_worker(combined_size, current_job_allocations, prev_worker_id, shared_key)
-                if not router_worker:
-                    print(f"⚠️ Network at capacity! Cannot place MoE shared+router for layer {layer_idx} (needs {combined_size:.1f}MB)")
-                    return None
+                if not router_worker: return None
 
                 node = {
                     "layer_idx": layer_idx, "type": "moe",
@@ -170,10 +175,11 @@ class MoEScheduler:
 
                 for exp_idx in range(num_experts):
                     exp_key = f"{model_info['model_id']}:{layer_idx}:expert:{exp_idx}"
+                    # print(f"Layer {layer_idx} (Expert {exp_idx}): Need {expert_size:.0f}MB")
                     exp_worker = self._find_best_worker(expert_size, current_job_allocations, node['worker_id'], exp_key)
 
                     if not exp_worker:
-                        print(f"⚠️ Network at capacity! Cannot place expert {exp_idx} for layer {layer_idx} (needs {expert_size:.1f}MB)")
+                        print(f"⚠️ Cluster Full! Cannot place expert {exp_idx}")
                         return None
 
                     node['expert_map'][str(exp_idx)] = exp_worker.specs.get('p2p_url')
@@ -181,7 +187,7 @@ class MoEScheduler:
                 topology.append(node)
 
         # COMMIT: The plan is valid. Now update the persistent WorkerState.
-        # This locks the memory so subsequent jobs know it is taken.
+        print("💾 Committing Plan to Persistent Ledger...")
         for node in topology:
             w = self.workers.get(node['worker_id'])
             if not w: continue
@@ -214,6 +220,10 @@ class MoEScheduler:
                          if exp_key not in w_exp.cached_layers:
                              w_exp.vram_used_mb += exp_size
                              w_exp.cached_layers.add(exp_key)
+
+        # Log final states
+        for w in self.workers.values():
+            print(f"   🏁 Worker {w.pubkey[:8]} Final Usage: {w.vram_used_mb:.0f}MB / {w.vram_total_mb:.0f}MB")
 
         # Bookend the topology
         first_worker = topology[0]
@@ -259,7 +269,6 @@ class MoEScheduler:
                 job_id = raw_job['id']
                 model_id = raw_job['model_id']
 
-                # 1. Check Status
                 status = await self._check_model_status(model_id)
 
                 if status == 'ready':
@@ -282,7 +291,6 @@ class MoEScheduler:
                     await asyncio.sleep(5)
                     continue
 
-                # 2. Plan
                 model_info = None
                 try:
                     async with aiohttp.ClientSession() as sess:
@@ -329,7 +337,7 @@ class MoEScheduler:
             next_layer_idx = job.topology[i + 1]['layer_idx'] if not is_last_node else None
             role = node.get('role')
 
-            print(f"  Layer {i}: type={node['type']}, worker={w.pubkey[:8]}, next_hop={next_hop}")
+            # print(f"  Layer {i}: type={node['type']}, worker={w.pubkey[:8]}, next_hop={next_hop}")
 
             payload = {
                 "job_id": job.id,

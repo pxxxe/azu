@@ -98,14 +98,20 @@ class MoEScheduler:
             if cost == 0: s += 10000
 
             pending = current_job_allocations.get(w.pubkey, 0)
-            projected_usage = w.vram_used_mb + pending
+            projected_usage = w.vram_used_mb + pending + cost  # FIX: Added + cost
             safe_limit = w.vram_total_mb * 0.70
             available_room = safe_limit - projected_usage
 
-            s += (available_room / 1024)
+            utilization = projected_usage / safe_limit
+            if utilization > 0.90: s -= 10000
+            elif utilization > 0.85: s -= 5000
+            elif utilization > 0.80: s -= 1000
+            elif utilization > 0.75: s -= 100
+
+            s += (available_room / 1024) * 10  # FIX: 10x multiplier
 
             if previous_worker_id and w.pubkey == previous_worker_id:
-                s += 5
+                s += 2  # FIX: Reduced from 5 to 2
 
             return s
 

@@ -111,29 +111,43 @@ class MoEWorker:
         except:
             return f"http://127.0.0.1:{P2P_PORT}"
 
-    # --- HELPER: VRAM STATS LOGGING ---
+    # --- HELPER: VRAM STATS LOGGING (CRASH PROOF) ---
     def _print_vram_stats(self, tag: str, ctx: JobContext = None):
         if not torch.cuda.is_available(): return
 
         # 1. Physical Memory
-        free_bytes, total_bytes = torch.cuda.mem_get_info()
-        free_gb = free_bytes / (1024**3)
-        total_gb = total_bytes / (1024**3)
-        used_gb = total_gb - free_gb
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            free_gb = free_bytes / (1024**3)
+            total_gb = total_bytes / (1024**3)
+            used_gb = total_gb - free_gb
 
-        # 2. PyTorch Allocator
-        allocated_gb = torch.cuda.memory_allocated() / (1024**3)
-        reserved_gb = torch.cuda.memory_reserved() / (1024**3)
+            # 2. PyTorch Allocator
+            allocated_gb = torch.cuda.memory_allocated() / (1024**3)
+            reserved_gb = torch.cuda.memory_reserved() / (1024**3)
 
-        # 3. KV Cache Size
-        kv_mb = 0.0
-        if ctx:
-            for k, v in ctx.kv_cache.values():
-                kv_mb += (k.element_size() * k.nelement()) / (1024**2)
-                kv_mb += (v.element_size() * v.nelement()) / (1024**2)
+            # 3. KV Cache Size (Safe Iteration)
+            kv_mb = 0.0
+            if ctx:
+                for val in ctx.kv_cache.values():
+                    # Standard Tuple(k, v)
+                    if isinstance(val, (tuple, list)):
+                        for t in val:
+                            if torch.is_tensor(t):
+                                kv_mb += (t.element_size() * t.nelement()) / (1024**2)
+                    # New HuggingFace Cache object
+                    elif hasattr(val, 'key_cache') and hasattr(val, 'value_cache'):
+                         # Try to sum up cache contents if exposed
+                         try:
+                             for t_list in val.key_cache + val.value_cache:
+                                if torch.is_tensor(t_list):
+                                    kv_mb += (t_list.element_size() * t_list.nelement()) / (1024**2)
+                         except: pass
 
-        print(f"   📊 [{tag}] Used: {used_gb:.2f}GB (Alloc: {allocated_gb:.2f}GB | Res: {reserved_gb:.2f}GB) | Free: {free_gb:.2f}GB | KV: {kv_mb:.1f}MB")
-        sys.stdout.flush()
+            print(f"   📊 [{tag}] Used: {used_gb:.2f}GB (Alloc: {allocated_gb:.2f}GB | Res: {reserved_gb:.2f}GB) | Free: {free_gb:.2f}GB | KV: {kv_mb:.1f}MB")
+            sys.stdout.flush()
+        except Exception as e:
+            print(f"   ⚠️ VRAM Stats Error: {e}")
 
     # --- P2P SERVER ---
     async def start_p2p_server(self):
@@ -447,7 +461,12 @@ class MoEWorker:
         seq_len = hidden_states.shape[1]
         past_len = 0
         if past_kv is not None:
-            past_len = past_kv[0].shape[2]
+            # Handle standard tuple kv
+            if isinstance(past_kv, tuple) and len(past_kv) > 0:
+                past_len = past_kv[0].shape[2]
+            # Handle HuggingFace Cache object (best effort)
+            elif hasattr(past_kv, 'get_seq_length'):
+                 past_len = past_kv.get_seq_length()
 
         position_ids = torch.arange(
             past_len, past_len + seq_len, dtype=torch.long, device=self.device

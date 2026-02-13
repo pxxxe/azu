@@ -111,6 +111,30 @@ class MoEWorker:
         except:
             return f"http://127.0.0.1:{P2P_PORT}"
 
+    # --- HELPER: VRAM STATS LOGGING ---
+    def _print_vram_stats(self, tag: str, ctx: JobContext = None):
+        if not torch.cuda.is_available(): return
+
+        # 1. Physical Memory
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        free_gb = free_bytes / (1024**3)
+        total_gb = total_bytes / (1024**3)
+        used_gb = total_gb - free_gb
+
+        # 2. PyTorch Allocator
+        allocated_gb = torch.cuda.memory_allocated() / (1024**3)
+        reserved_gb = torch.cuda.memory_reserved() / (1024**3)
+
+        # 3. KV Cache Size
+        kv_mb = 0.0
+        if ctx:
+            for k, v in ctx.kv_cache.values():
+                kv_mb += (k.element_size() * k.nelement()) / (1024**2)
+                kv_mb += (v.element_size() * v.nelement()) / (1024**2)
+
+        print(f"   📊 [{tag}] Used: {used_gb:.2f}GB (Alloc: {allocated_gb:.2f}GB | Res: {reserved_gb:.2f}GB) | Free: {free_gb:.2f}GB | KV: {kv_mb:.1f}MB")
+        sys.stdout.flush()
+
     # --- P2P SERVER ---
     async def start_p2p_server(self):
         # MAX SIZE 1GB IS CRITICAL FOR MoE TENSORS
@@ -315,6 +339,9 @@ class MoEWorker:
             gc.collect()
             torch.cuda.empty_cache()
 
+            # Log clear state
+            self._print_vram_stats("Cleared")
+
             # --- V5 COMPAT: Initialize Global Rotary Embeddings ---
             try:
                 print(f"   ⚙️ Initializing Rotary Embeddings for {model_id}...")
@@ -342,6 +369,7 @@ class MoEWorker:
                 # Set to None so code can continue without RoPE (will fail later, but more gracefully)
                 self.rotary_emb = None
 
+            self._print_vram_stats("Init")
             self.current_model_id = model_id
 
     async def _load_tokenizer(self, model_id):
@@ -464,6 +492,7 @@ class MoEWorker:
 
         await self._ensure_model(model_id)
         ctx = await self._get_context(job_id, create=True)
+        self._print_vram_stats(f"Dense Start {layer_idx}", ctx)
 
         while not ctx.done:
             try:
@@ -473,6 +502,7 @@ class MoEWorker:
                         print(f"📦 Loading embeddings...")
                         self.embeddings = await self.loader.load_embeddings(model_id)
                         await self._load_tokenizer(model_id)
+                        self._print_vram_stats("Loaded Emb", ctx)
 
                     input_tensor = None
 
@@ -513,6 +543,7 @@ class MoEWorker:
                     if layer_idx not in self.dense_layers:
                         print(f"📦 Loading dense layer {layer_idx}...")
                         self.dense_layers[layer_idx] = await self.loader.load_dense_layer(model_id, layer_idx)
+                        self._print_vram_stats(f"Loaded Dense {layer_idx}", ctx)
 
                     # Get KV Cache for this layer
                     past_kv = ctx.kv_cache.get(layer_idx, None)
@@ -539,6 +570,8 @@ class MoEWorker:
                         else:
                             layer_out = out
 
+                    self._print_vram_stats(f"Dense Inf {layer_idx}", ctx)
+
                 # --- JIT Head & Decode ---
                 if is_last:
                     if not self.lm_head:
@@ -546,6 +579,7 @@ class MoEWorker:
                         self.lm_head = await self.loader.load_lm_head(model_id)
                         self.final_norm = await self.loader.load_final_norm(model_id)
                         await self._load_tokenizer(model_id)
+                        self._print_vram_stats("Loaded Head", ctx)
 
                     with torch.no_grad():
                         if self.final_norm:
@@ -621,6 +655,7 @@ class MoEWorker:
         print(f"🟢 [ROUTER] Processing job {job_id[:8]}, layer_idx={layer_idx}")
         await self._ensure_model(model_id)
         ctx = await self._get_context(job_id, create=True)
+        self._print_vram_stats(f"Router Start {layer_idx}", ctx)
 
         while not ctx.done:
             try:
@@ -639,6 +674,7 @@ class MoEWorker:
                 # STEP 1: Execute Shared Attention & Norms
                 # =========================================================
                 shared_layer = await self.loader.load_moe_shared(model_id, layer_idx)
+                self._print_vram_stats(f"Loaded Shared {layer_idx}", ctx)
                 past_kv = ctx.kv_cache.get(layer_idx, None)
 
                 # --- V5 FIX: Prepare Positional Args ---
@@ -681,6 +717,7 @@ class MoEWorker:
                 if layer_idx not in self.moe_routers:
                     print(f"📦 Loading router {layer_idx}...")
                     self.moe_routers[layer_idx] = await self.loader.load_moe_router(model_id, layer_idx)
+                    self._print_vram_stats(f"Loaded Router {layer_idx}", ctx)
 
                 with torch.no_grad():
                     logits = self.moe_routers[layer_idx](hidden_states)
@@ -723,6 +760,8 @@ class MoEWorker:
                     except asyncio.TimeoutError:
                         print(f"❌ [Job {job_id[:8]}] Expert results timeout")
                         break
+
+                self._print_vram_stats(f"Router Inf {layer_idx}", ctx)
 
                 # =========================================================
                 # STEP 3: Merge & Final Residual
@@ -769,6 +808,7 @@ class MoEWorker:
         print(f"🟡 [EXPERT] Processing expert {expert_idx} (Layer {layer_idx})")
         await self._ensure_model(model_id)
         ctx = await self._get_context(job_id, create=True)
+        self._print_vram_stats(f"Expert Start {layer_idx}:{expert_idx}", ctx)
 
         while not ctx.done:
             try:
@@ -788,6 +828,7 @@ class MoEWorker:
                 if cache_key not in self.moe_experts:
                     print(f"📦 Loading expert {expert_idx}...")
                     self.moe_experts[cache_key] = await self.loader.load_moe_expert(model_id, layer_idx, expert_idx)
+                    self._print_vram_stats(f"Loaded Expert {layer_idx}:{expert_idx}", ctx)
 
                 with torch.no_grad():
                     output = self.moe_experts[cache_key](hidden_states)
@@ -798,6 +839,9 @@ class MoEWorker:
                     "layer_idx": layer_idx,
                     "expert_idx": expert_idx
                 }, output) # Send tensor as arg
+
+                self._print_vram_stats(f"Expert Inf {layer_idx}:{expert_idx}", ctx)
+
             except Exception as e:
                  print(f"❌ Error in expert loop: {e}")
                  break

@@ -68,12 +68,17 @@ class MoEScheduler:
         # print(f"--- Planning allocation for {size_mb:.0f}MB layer ---")
 
         for w in candidates:
-            # 1. Determine Safety Cap (70% STRICT LIMIT)
-            # 24GB -> ~16.8GB Usable for weights.
-            # 7.2GB reserved for PyTorch Context (~1GB), Activations (~1-2GB), Fragmentation, and Buffers.
-            safe_limit = w.vram_total_mb * 0.70
+            # 1. Determine Safety Cap with RUNTIME OVERHEAD
+            # A 24GB card loses ~4GB to PyTorch Context, KV Cache, and Fragmentation.
+            # We must subtract this BEFORE applying the % limit.
+            RUNTIME_RESERVE_MB = 4096
+            usable_vram = max(0, w.vram_total_mb - RUNTIME_RESERVE_MB)
 
-            # 2. Check Capacity using INTERNAL LEDGER
+            # 2. Strict Limit (80% of Usable)
+            # This ensures we don't hit the physical OOM wall during inference
+            safe_limit = usable_vram * 0.80
+
+            # 3. Check Capacity using INTERNAL LEDGER
             pending_load = current_job_allocations.get(w.pubkey, 0)
 
             is_cached = cache_key in w.cached_layers
@@ -99,13 +104,19 @@ class MoEScheduler:
 
             pending = current_job_allocations.get(w.pubkey, 0)
             projected_usage = w.vram_used_mb + pending
-            safe_limit = w.vram_total_mb * 0.70
+
+            # Recalculate limits for scoring
+            RUNTIME_RESERVE_MB = 4096
+            usable_vram = max(0, w.vram_total_mb - RUNTIME_RESERVE_MB)
+            safe_limit = usable_vram * 0.80
+
             available_room = safe_limit - projected_usage
 
             s += (available_room / 1024)
 
+            # Reduce locality bonus to prevent "clumping" on one worker until it bursts
             if previous_worker_id and w.pubkey == previous_worker_id:
-                s += 5
+                s += 2 # Reduced from 5
 
             return s
 
@@ -138,7 +149,7 @@ class MoEScheduler:
                 size = layer.get('size_mb', 0)
                 cache_key = f"{model_info['model_id']}:{layer_idx}:main"
 
-                print(f"Layer {layer_idx} (Dense): Need {size:.0f}MB")
+                # print(f"Layer {layer_idx} (Dense): Need {size:.0f}MB")
                 target_worker = self._find_best_worker(size, current_job_allocations, prev_worker_id, cache_key)
                 if not target_worker: return None
 
@@ -158,7 +169,7 @@ class MoEScheduler:
                 combined_size = shared_size + router_size
                 shared_key = f"{model_info['model_id']}:{layer_idx}:shared"
 
-                print(f"Layer {layer_idx} (Router): Need {combined_size:.0f}MB")
+                # print(f"Layer {layer_idx} (Router): Need {combined_size:.0f}MB")
                 router_worker = self._find_best_worker(combined_size, current_job_allocations, prev_worker_id, shared_key)
                 if not router_worker: return None
 

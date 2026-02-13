@@ -18,6 +18,7 @@ class WorkerState:
     specs: dict
     vram_total_mb: int
     actual_free_mb: int
+    # Tracks the size of layers we have ASSIGNED to this worker
     vram_used_mb: int = 0
     last_heartbeat: float = field(default_factory=time.time)
     cached_layers: Set[str] = field(default_factory=set)
@@ -52,6 +53,8 @@ class MoEScheduler:
 
     async def handle_heartbeat(self, wid: str, data: dict):
         if wid in self.workers:
+            # We record this for observability, but we DO NOT use it for planning
+            # because it lags behind the downloads.
             self.workers[wid].actual_free_mb = data.get('vram_free_mb', 0)
             self.workers[wid].last_heartbeat = time.time()
 
@@ -62,52 +65,49 @@ class MoEScheduler:
 
         valid = []
         for w in candidates:
-            # Check if cached
-            is_cached = cache_key in w.cached_layers
+            # 1. Determine Safety Cap (85% to save room for KV Cache & Overhead)
+            safe_limit = w.vram_total_mb * 0.85
 
-            # Ledger Logic:
-            # Available = (Reported Free) - (Allocated in CURRENT planning session)
+            # 2. Check Capacity using INTERNAL LEDGER
+            # vram_used_mb: What we assigned in previous jobs
+            # pending_load: What we assigned in this current job loop
+            # cost: What we want to assign now
             pending_load = current_job_allocations.get(w.pubkey, 0)
 
-            # Cost is 0 if already cached (assuming cache persists)
-            cost = 0 if is_cached else size_mb
+            # Check if cached (cost is 0 if so)
+            is_cached = cache_key in w.cached_layers
+            allocation_cost = 0 if is_cached else size_mb
 
-            # --- FIX START: Use Internal Ledger + Safety Margin ---
-            # Don't trust actual_free_mb (laggy race condition). Use internal vram_used_mb.
-            # 90% Cap to allow for PyTorch overhead/activations
-            safe_limit = w.vram_total_mb * 0.90
-            projected_usage = w.vram_used_mb + pending_load
+            projected_usage = w.vram_used_mb + pending_load + allocation_cost
 
-            if (projected_usage + cost) <= safe_limit:
-                valid.append((w, cost))
-            # --- FIX END ---
+            if projected_usage <= safe_limit:
+                 valid.append((w, allocation_cost))
 
         if not valid: return None
 
         def score(item):
             w, cost = item
             s = 0
-            if cost == 0: s += 10000 # Cached
+            if cost == 0: s += 10000 # Heavily prefer cached
 
-            # USE ACTUAL AVAILABLE after pending allocations
+            # Score based on INTERNAL ledger remaining capacity
             pending = current_job_allocations.get(w.pubkey, 0)
-
-            # --- FIX START: Score based on internal ledger ---
-            safe_limit = w.vram_total_mb * 0.90
             projected_usage = w.vram_used_mb + pending
-            available = (safe_limit - projected_usage) / 1024
-            # --- FIX END ---
 
-            # Locality as multiplier not flat bonus
+            safe_limit = w.vram_total_mb * 0.85
+            available_room = safe_limit - projected_usage
+
+            s += (available_room / 1024)
+
+            # Locality bonus
             if previous_worker_id and w.pubkey == previous_worker_id:
-                available *= 1.2
+                s += 5
 
-            s += available
             return s
 
         chosen_worker, cost = max(valid, key=score)
 
-        # Update ledger
+        # Update ephemeral ledger
         current_job_allocations[chosen_worker.pubkey] = current_job_allocations.get(chosen_worker.pubkey, 0) + cost
 
         return chosen_worker
@@ -119,7 +119,7 @@ class MoEScheduler:
         topology = []
         prev_worker_id = None
 
-        # Ephemeral ledger for this specific plan
+        # Ephemeral ledger tracks usage during this single planning loop
         current_job_allocations = {}
 
         for layer in layers:
@@ -134,10 +134,6 @@ class MoEScheduler:
                 if not target_worker:
                     print(f"⚠️ Cluster Full! Cannot place layer {layer_idx}")
                     return None
-
-                if cache_key not in target_worker.cached_layers:
-                    target_worker.vram_used_mb += size
-                    target_worker.cached_layers.add(cache_key)
 
                 node = {
                     "layer_idx": layer_idx,
@@ -161,10 +157,6 @@ class MoEScheduler:
                     print(f"⚠️ Network at capacity! Cannot place MoE shared+router for layer {layer_idx} (needs {combined_size:.1f}MB)")
                     return None
 
-                if shared_key not in router_worker.cached_layers:
-                     router_worker.vram_used_mb += combined_size
-                     router_worker.cached_layers.add(shared_key)
-
                 node = {
                     "layer_idx": layer_idx, "type": "moe",
                     "worker_id": router_worker.pubkey, "endpoint": router_worker.specs.get('p2p_url'),
@@ -184,18 +176,46 @@ class MoEScheduler:
                         print(f"⚠️ Network at capacity! Cannot place expert {exp_idx} for layer {layer_idx} (needs {expert_size:.1f}MB)")
                         return None
 
-                    if exp_key not in exp_worker.cached_layers:
-                        exp_worker.vram_used_mb += expert_size
-                        exp_worker.cached_layers.add(exp_key)
-
                     node['expert_map'][str(exp_idx)] = exp_worker.specs.get('p2p_url')
 
                 topology.append(node)
 
-        if not topology:
-            return None
+        # COMMIT: The plan is valid. Now update the persistent WorkerState.
+        # This locks the memory so subsequent jobs know it is taken.
+        for node in topology:
+            w = self.workers.get(node['worker_id'])
+            if not w: continue
 
-        # Bookend the topology with explicit embed and decode nodes.
+            if node['type'] == 'dense':
+                 l_meta = next(l for l in layers if l['layer_idx'] == node['layer_idx'])
+                 size = l_meta.get('size_mb', 0)
+                 cache_key = f"{model_info['model_id']}:{node['layer_idx']}:main"
+
+                 if cache_key not in w.cached_layers:
+                     w.vram_used_mb += size
+                     w.cached_layers.add(cache_key)
+
+            elif node['type'] == 'moe':
+                 l_meta = next(l for l in layers if l['layer_idx'] == node['layer_idx'])
+
+                 # Router/Shared
+                 combined = l_meta.get('shared_size_mb', 0) + l_meta.get('router_size_mb', 0)
+                 shared_key = f"{model_info['model_id']}:{node['layer_idx']}:shared"
+                 if shared_key not in w.cached_layers:
+                     w.vram_used_mb += combined
+                     w.cached_layers.add(shared_key)
+
+                 # Experts
+                 exp_size = l_meta.get('expert_size_mb', 0)
+                 for exp_idx, url in node['expert_map'].items():
+                     w_exp = next((wk for wk in self.workers.values() if wk.specs.get('p2p_url') == url), None)
+                     if w_exp:
+                         exp_key = f"{model_info['model_id']}:{node['layer_idx']}:expert:{exp_idx}"
+                         if exp_key not in w_exp.cached_layers:
+                             w_exp.vram_used_mb += exp_size
+                             w_exp.cached_layers.add(exp_key)
+
+        # Bookend the topology
         first_worker = topology[0]
         last_worker = topology[-1]
 
@@ -243,7 +263,6 @@ class MoEScheduler:
                 status = await self._check_model_status(model_id)
 
                 if status == 'ready':
-                    # Proceed to plan
                     pass
                 elif status == 'processing':
                     print(f"⏳ JIT: Model {model_id} is processing. Re-queueing...")
@@ -253,7 +272,7 @@ class MoEScheduler:
                 elif status == 'failed':
                     print(f"❌ JIT: Model {model_id} failed to shard. Dropping job.")
                     continue
-                else: # idle or unknown
+                else:
                     print(f"⬇️ JIT: Triggering download for {model_id}")
                     try:
                         async with aiohttp.ClientSession() as sess:
@@ -297,7 +316,6 @@ class MoEScheduler:
     async def _dispatch(self, job: JobState):
         print(f"📦 Dispatching Job {job.id} (Smart Route)")
 
-        # Calculate the feedback loop endpoint (where the first worker lives)
         first_node_endpoint = job.topology[0]['endpoint']
 
         for i, node in enumerate(job.topology):
@@ -308,10 +326,7 @@ class MoEScheduler:
 
             is_last_node = (i == len(job.topology) - 1)
             next_hop = job.topology[i + 1]['endpoint'] + "/tensor_in" if not is_last_node else None
-
-            # NEW: Include target layer index for next hop
             next_layer_idx = job.topology[i + 1]['layer_idx'] if not is_last_node else None
-
             role = node.get('role')
 
             print(f"  Layer {i}: type={node['type']}, worker={w.pubkey[:8]}, next_hop={next_hop}")
@@ -321,7 +336,7 @@ class MoEScheduler:
                 "model_id": job.model_id,
                 "layer_idx": node['layer_idx'],
                 "next_hop": next_hop,
-                "next_layer_idx": next_layer_idx  # NEW: Add target layer index
+                "next_layer_idx": next_layer_idx
             }
 
             if node['type'] == 'dense':
@@ -330,8 +345,8 @@ class MoEScheduler:
                     "input": job.input_prompt if role == 'embed' else None,
                     "is_first": role == 'embed',
                     "is_last": role == 'decode',
-                    "max_tokens": job.max_tokens, # Pass max tokens for generation control
-                    "first_node_endpoint": first_node_endpoint if role == 'decode' else None # Pass loop target
+                    "max_tokens": job.max_tokens,
+                    "first_node_endpoint": first_node_endpoint if role == 'decode' else None
                 })
                 await w.ws.send_json(payload)
 
@@ -342,7 +357,6 @@ class MoEScheduler:
                 })
                 await w.ws.send_json(payload)
 
-                # Group experts by worker so we batch the sends
                 tasks = {}
                 for exp_idx, url in node['expert_map'].items():
                     exp_w = next((wk for wk in self.workers.values() if wk.specs.get('p2p_url') == url), None)
@@ -361,7 +375,6 @@ class MoEScheduler:
                             "expert_idx": idx,
                             "return_url": node['endpoint']
                         })
-
 
     async def handle_result(self, wid: str, data: dict):
         job_id = data.get('job_id')

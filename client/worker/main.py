@@ -11,7 +11,7 @@ import numpy as np
 from typing import Dict, Optional, Tuple, Set, List
 import websockets
 from aiohttp import web, ClientSession, TCPConnector, ClientTimeout
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoTokenizer, AutoConfig, DynamicCache
 from dataclasses import dataclass, field
 
 # --- NEW: Import Rotary Embeddings for v5 Compatibility ---
@@ -42,7 +42,7 @@ class JobContext:
         self.expert_input_queues: Dict[Tuple[int, int], asyncio.Queue] = {}
         self.pending_expert_requests: Dict[Tuple[int, int], asyncio.Future] = {}
 
-        self.kv_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self.kv_cache = DynamicCache()
         self.generated_ids: List[int] = []
         self.token_queue: asyncio.Queue = asyncio.Queue()
         self.done = False
@@ -128,21 +128,12 @@ class MoEWorker:
 
             # 3. KV Cache Size (Safe Iteration)
             kv_mb = 0.0
-            if ctx:
-                for val in ctx.kv_cache.values():
-                    # Standard Tuple(k, v)
-                    if isinstance(val, (tuple, list)):
-                        for t in val:
-                            if torch.is_tensor(t):
-                                kv_mb += (t.element_size() * t.nelement()) / (1024**2)
-                    # New HuggingFace Cache object
-                    elif hasattr(val, 'key_cache') and hasattr(val, 'value_cache'):
-                         # Try to sum up cache contents if exposed
-                         try:
-                             for t_list in val.key_cache + val.value_cache:
-                                if torch.is_tensor(t_list):
-                                    kv_mb += (t_list.element_size() * t_list.nelement()) / (1024**2)
-                         except: pass
+            if ctx and hasattr(ctx.kv_cache, 'key_cache') and hasattr(ctx.kv_cache, 'value_cache'):
+                try:
+                    for t_list in ctx.kv_cache.key_cache + ctx.kv_cache.value_cache:
+                        if torch.is_tensor(t_list):
+                            kv_mb += (t_list.element_size() * t_list.nelement()) / (1024**2)
+                except: pass
 
             print(f"   📊 [{tag}] Used: {used_gb:.2f}GB (Alloc: {allocated_gb:.2f}GB | Res: {reserved_gb:.2f}GB) | Free: {free_gb:.2f}GB | KV: {kv_mb:.1f}MB")
             sys.stdout.flush()
@@ -527,7 +518,7 @@ class MoEWorker:
 
                     if not ctx.generated_ids and msg.get('input'):
                         print(f"   📝 Encoding Prompt...")
-                        ctx.kv_cache.clear()
+                        ctx.kv_cache = DynamicCache()
                         input_tensor = self.tokenizer.encode(msg['input'], return_tensors='pt').to(self.device)
                         msg['input'] = None
 
@@ -564,16 +555,13 @@ class MoEWorker:
                         self.dense_layers[layer_idx] = await self.loader.load_dense_layer(model_id, layer_idx)
                         self._print_vram_stats(f"Loaded Dense {layer_idx}", ctx)
 
-                    # Get KV Cache for this layer
-                    past_kv = ctx.kv_cache.get(layer_idx, None)
-
                     # --- V5 FIX: Prepare Positional Args ---
-                    pos_emb, attn_mask, pos_ids = self._prepare_inputs(hidden_states, past_kv)
+                    pos_emb, attn_mask, pos_ids = self._prepare_inputs(hidden_states, ctx.kv_cache)
 
                     with torch.no_grad():
                         out = self.dense_layers[layer_idx](
                             hidden_states,
-                            past_key_values=past_kv,
+                            past_key_values=ctx.kv_cache,
                             use_cache=True,
                             # Explicitly pass V5 required args
                             position_embeddings=pos_emb,
@@ -583,9 +571,6 @@ class MoEWorker:
 
                         if isinstance(out, tuple):
                             layer_out = out[0]
-                            # Update KV Cache
-                            if len(out) > 1:
-                                ctx.kv_cache[layer_idx] = out[1]
                         else:
                             layer_out = out
 
@@ -694,10 +679,9 @@ class MoEWorker:
                 # =========================================================
                 shared_layer = await self.loader.load_moe_shared(model_id, layer_idx)
                 self._print_vram_stats(f"Loaded Shared {layer_idx}", ctx)
-                past_kv = ctx.kv_cache.get(layer_idx, None)
 
                 # --- V5 FIX: Prepare Positional Args ---
-                pos_emb, attn_mask, pos_ids = self._prepare_inputs(hidden_states, past_kv)
+                pos_emb, attn_mask, pos_ids = self._prepare_inputs(hidden_states, ctx.kv_cache)
 
                 # A. Input Residual & Norm
                 residual = hidden_states
@@ -712,11 +696,10 @@ class MoEWorker:
                         position_embeddings=pos_emb,
                         attention_mask=attn_mask,
                         position_ids=pos_ids,
-                        past_key_values=past_kv,
+                        past_key_values=ctx.kv_cache,
                         use_cache=True
                     )
                     hidden_states = attn_out
-                    ctx.kv_cache[layer_idx] = new_kv
 
                 # C. First Residual Connection
                 hidden_states = residual + hidden_states

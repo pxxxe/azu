@@ -98,20 +98,14 @@ class MoEScheduler:
             if cost == 0: s += 10000
 
             pending = current_job_allocations.get(w.pubkey, 0)
-            projected_usage = w.vram_used_mb + pending + cost  # FIX: Added + cost
+            projected_usage = w.vram_used_mb + pending
             safe_limit = w.vram_total_mb * 0.70
             available_room = safe_limit - projected_usage
 
-            utilization = projected_usage / safe_limit
-            if utilization > 0.90: s -= 10000
-            elif utilization > 0.85: s -= 5000
-            elif utilization > 0.80: s -= 1000
-            elif utilization > 0.75: s -= 100
-
-            s += (available_room / 1024) * 10  # FIX: 10x multiplier
+            s += (available_room / 1024)
 
             if previous_worker_id and w.pubkey == previous_worker_id:
-                s += 2  # FIX: Reduced from 5 to 2
+                s += 5
 
             return s
 
@@ -219,12 +213,24 @@ class MoEScheduler:
 
                  # Experts
                  exp_size = l_meta.get('expert_size_mb', 0)
+                 shared_size = l_meta.get('shared_size_mb', 0)
+                 router_size = l_meta.get('router_size_mb', 0)
+
                  for exp_idx, url in node['expert_map'].items():
                      w_exp = next((wk for wk in self.workers.values() if wk.specs.get('p2p_url') == url), None)
                      if w_exp:
                          exp_key = f"{model_info['model_id']}:{node['layer_idx']}:expert:{exp_idx}"
+                         shared_key_exp = f"{model_info['model_id']}:{node['layer_idx']}:shared"
+
                          if exp_key not in w_exp.cached_layers:
-                             w_exp.vram_used_mb += exp_size
+                             # BUG FIX: If worker doesn't have the router/shared for this layer,
+                             # it needs to load them when processing the expert
+                             if shared_key_exp not in w_exp.cached_layers:
+                                 w_exp.vram_used_mb += shared_size + router_size + exp_size
+                                 w_exp.cached_layers.add(shared_key_exp)
+                             else:
+                                 w_exp.vram_used_mb += exp_size
+
                              w_exp.cached_layers.add(exp_key)
 
         # Log final states

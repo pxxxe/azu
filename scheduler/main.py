@@ -54,6 +54,8 @@ class MoEScheduler:
 
     async def handle_heartbeat(self, wid: str, data: dict):
         if wid in self.workers:
+            # We record this for observability, but we DO NOT use it for planning
+            # because it lags behind the downloads.
             self.workers[wid].actual_free_mb = data.get('vram_free_mb', 0)
             self.workers[wid].last_heartbeat = time.time()
 
@@ -63,11 +65,13 @@ class MoEScheduler:
         if not candidates: return None
 
         valid = []
-        print(f"--- Planning allocation for {size_mb:.0f}MB layer ---")
+        # print(f"--- Planning allocation for {size_mb:.0f}MB layer ---")
 
         for w in candidates:
-            # 1. Determine Safety Cap (80% STRICT LIMIT)
-            safe_limit = w.vram_total_mb * 0.80
+            # 1. Determine Safety Cap (70% STRICT LIMIT)
+            # 24GB -> ~16.8GB Usable for weights.
+            # 7.2GB reserved for PyTorch Context (~1GB), Activations (~1-2GB), Fragmentation, and Buffers.
+            safe_limit = w.vram_total_mb * 0.70
 
             # 2. Check Capacity using INTERNAL LEDGER
             pending_load = current_job_allocations.get(w.pubkey, 0)
@@ -75,17 +79,14 @@ class MoEScheduler:
             is_cached = cache_key in w.cached_layers
             allocation_cost = 0 if is_cached else size_mb
 
-            # Calculate total projected usage
             projected_usage = w.vram_used_mb + pending_load + allocation_cost
-
-            # EXPLICIT DEBUG LOGGING
-            print(f"   Worker {w.pubkey[:8]}: Used(Persist)={w.vram_used_mb:.0f} + Pending(Job)={pending_load:.0f} + Cost={allocation_cost:.0f} = {projected_usage:.0f} / {safe_limit:.0f} (Cap)")
 
             if projected_usage <= safe_limit:
                  valid.append((w, allocation_cost))
             else:
-                 # Print REJECTION reason
-                 print(f"   ❌ Rejected {w.pubkey[:8]}: Proj {projected_usage:.0f}MB > Limit {safe_limit:.0f}MB")
+                 # Debug rejection
+                 # print(f"   ❌ Rejected {w.pubkey[:8]}: Proj {projected_usage:.0f}MB > Limit {safe_limit:.0f}MB")
+                 pass
 
         if not valid:
             print(f"   ⚠️ NO WORKERS FIT {size_mb:.0f}MB")
@@ -98,7 +99,7 @@ class MoEScheduler:
 
             pending = current_job_allocations.get(w.pubkey, 0)
             projected_usage = w.vram_used_mb + pending
-            safe_limit = w.vram_total_mb * 0.80
+            safe_limit = w.vram_total_mb * 0.70
             available_room = safe_limit - projected_usage
 
             s += (available_room / 1024)
@@ -114,7 +115,6 @@ class MoEScheduler:
         new_load = current_job_allocations.get(chosen_worker.pubkey, 0) + cost
         current_job_allocations[chosen_worker.pubkey] = new_load
 
-        # Log the winner
         print(f"   ✅ Selected {chosen_worker.pubkey[:8]}. New Job Load: {new_load:.0f}MB. Total Proj: {chosen_worker.vram_used_mb + new_load:.0f}MB")
         sys.stdout.flush()
 
@@ -337,7 +337,7 @@ class MoEScheduler:
             next_layer_idx = job.topology[i + 1]['layer_idx'] if not is_last_node else None
             role = node.get('role')
 
-            # print(f"  Layer {i}: type={node['type']}, worker={w.pubkey[:8]}, next_hop={next_hop}")
+            print(f"  Layer {i}: type={node['type']}, worker={w.pubkey[:8]}, next_hop={next_hop}")
 
             payload = {
                 "job_id": job.id,

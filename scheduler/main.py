@@ -1,15 +1,15 @@
+import redis.asyncio as redis
 import asyncio
 import json
-import redis.asyncio as redis
-import aiohttp
 import time
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from typing import Dict, List, Set, Optional
+import aiohttp
 from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set
+from fastapi import FastAPI, WebSocket
 from shared.config import settings
 
-app = FastAPI()
 r = redis.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, decode_responses=True)
+app = FastAPI()
 
 @dataclass
 class WorkerState:
@@ -17,17 +17,10 @@ class WorkerState:
     ws: WebSocket
     specs: dict
     vram_total_mb: int
+    actual_free_mb: int
     vram_used_mb: int = 0
-
-    # Truth from Heartbeat (Precision Tracking)
-    actual_free_mb: int = 0
-
-    cached_layers: Set[str] = field(default_factory=set)
     last_heartbeat: float = field(default_factory=time.time)
-
-    @property
-    def vram_free_mb(self):
-        return self.vram_total_mb - self.vram_used_mb
+    cached_layers: Set[str] = field(default_factory=set)
 
 @dataclass
 class JobState:
@@ -35,7 +28,7 @@ class JobState:
     model_id: str
     input_prompt: str
     owner: str
-    topology: List[dict] = field(default_factory=list)
+    topology: List[dict]
     max_tokens: int = 50
 
 class MoEScheduler:
@@ -139,17 +132,19 @@ class MoEScheduler:
 
             elif l_type == 'moe':
                 # 1. Place Router + Shared
-                # Use precise sizes from Registry if available
-                shared_size = layer.get('shared_size_mb', 0) + layer.get('router_size_mb', 0)
-                if shared_size == 0: shared_size = 300 # Fallback
+                shared_size = layer.get('shared_size_mb', 0)
+                router_size = layer.get('router_size_mb', 0)
+                combined_size = shared_size + router_size
 
                 shared_key = f"{model_info['model_id']}:{layer_idx}:shared"
 
-                router_worker = self._find_best_worker(shared_size, current_job_allocations, prev_worker_id, shared_key)
-                if not router_worker: return None
+                router_worker = self._find_best_worker(combined_size, current_job_allocations, prev_worker_id, shared_key)
+                if not router_worker:
+                    print(f"⚠️ Network at capacity! Cannot place MoE shared+router for layer {layer_idx} (needs {combined_size:.1f}MB)")
+                    return None
 
                 if shared_key not in router_worker.cached_layers:
-                     router_worker.vram_used_mb += shared_size
+                     router_worker.vram_used_mb += combined_size
                      router_worker.cached_layers.add(shared_key)
 
                 node = {
@@ -162,13 +157,14 @@ class MoEScheduler:
                 # 2. Place Experts
                 num_experts = layer.get('num_experts', 0)
                 expert_size = layer.get('expert_size_mb', 0)
-                if expert_size == 0: expert_size = (layer.get('size_mb', 0) / max(1, num_experts))
 
                 for exp_idx in range(num_experts):
                     exp_key = f"{model_info['model_id']}:{layer_idx}:expert:{exp_idx}"
                     exp_worker = self._find_best_worker(expert_size, current_job_allocations, node['worker_id'], exp_key)
 
-                    if not exp_worker: return None
+                    if not exp_worker:
+                        print(f"⚠️ Network at capacity! Cannot place expert {exp_idx} for layer {layer_idx} (needs {expert_size:.1f}MB)")
+                        return None
 
                     if exp_key not in exp_worker.cached_layers:
                         exp_worker.vram_used_mb += expert_size

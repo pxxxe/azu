@@ -37,13 +37,53 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 
 # Prioritize High-RAM GPUs for Stability
 GPU_TYPES_SECURE = [
-    "NVIDIA RTX A6000",             # 48GB VRAM, usually 128GB+ System RAM
-    "NVIDIA RTX 6000 Ada Generation",
-    "NVIDIA A100 80GB PCIe",
-    "NVIDIA GeForce RTX 4090",
-    "NVIDIA A100-SXM4-80GB",
-    "NVIDIA GeForce RTX 3090",
+    "NVIDIA H200 NVL",                  # 143GB
+    "NVIDIA H100 NVL",                  # 94GB
+    "NVIDIA RTX PRO 6000",              # 96GB
+    "NVIDIA RTX 6000 Ada Generation",   # 48GB
+    "NVIDIA A100 80GB PCIe",            # 80GB
+    "NVIDIA A100-SXM4-80GB",            # 80GB
+    "NVIDIA H100 80GB HBM3",            # 80GB (H100 SXM)
+    "NVIDIA H100 PCIe",                 # 80GB
+    "NVIDIA RTX A6000",                 # 48GB
+    "NVIDIA L40S",                      # 48GB
+    "NVIDIA L40",                       # 48GB
+    "NVIDIA GeForce RTX 4090",          # 24GB
+    "NVIDIA RTX A5000",                 # 24GB
+    "NVIDIA GeForce RTX 3090",          # 24GB
+    "NVIDIA L4",                        # 24GB
+    "NVIDIA RTX PRO 4500",              # 32GB
+    "NVIDIA RTX A4500",                 # 20GB
+    "NVIDIA RTX 4000 Ada Generation",   # 20GB
+    "NVIDIA RTX A4000",                 # 16GB
+    "NVIDIA RTX 2000 Ada Generation",   # 16GB
 ]
+
+# VRAM sizes in GB (approximate)
+GPU_VRAM_MAP = {
+    "NVIDIA H200 NVL": 143,
+    "NVIDIA H100 NVL": 94,
+    "NVIDIA RTX PRO 6000": 96,
+    "NVIDIA RTX 6000 Ada Generation": 48,
+    "NVIDIA A100 80GB PCIe": 80,
+    "NVIDIA A100-SXM4-80GB": 80,
+    "NVIDIA H100 80GB HBM3": 80,
+    "NVIDIA H100 PCIe": 80,
+    "NVIDIA RTX A6000": 48,
+    "NVIDIA L40S": 48,
+    "NVIDIA L40": 48,
+    "NVIDIA GeForce RTX 4090": 24,
+    "NVIDIA RTX A5000": 24,
+    "NVIDIA GeForce RTX 3090": 24,
+    "NVIDIA L4": 24,
+    "NVIDIA RTX PRO 4500": 32,
+    "NVIDIA RTX A4500": 20,
+    "NVIDIA RTX 4000 Ada Generation": 20,
+    "NVIDIA RTX A4000": 16,
+    "NVIDIA RTX 2000 Ada Generation": 16,
+}
+
+TARGET_TOTAL_VRAM = 180  # GB needed for Mixtral test
 
 runpod.api_key = RUNPOD_API_KEY
 
@@ -148,7 +188,7 @@ def deploy_pod_with_retry(name, image, env_vars, gpu_type, max_retries=3):
             if isinstance(response, dict) and response.get('id'):
                 pod_id = response['id']
                 print(f"   ✅ Pod created: {pod_id}")
-                return pod_id
+                return pod_id, gpu_type
 
         except Exception as e:
             err_str = str(e).lower()
@@ -160,14 +200,14 @@ def deploy_pod_with_retry(name, image, env_vars, gpu_type, max_retries=3):
         if attempt < max_retries:
             time.sleep(1)
 
-    return None
+    return None, None
 
 def deploy_with_fallback(name, image, env_vars):
     """Try deploying across multiple GPU types."""
     for gpu_type in GPU_TYPES_SECURE:
-        pod_id = deploy_pod_with_retry(name, image, env_vars, gpu_type)
+        pod_id, gpu = deploy_pod_with_retry(name, image, env_vars, gpu_type)
         if pod_id:
-            return pod_id
+            return pod_id, gpu
     raise Exception(f"❌ Could not deploy {name} on any GPU type")
 
 async def transfer_sol(client, from_kp, to_pubkey, amount_sol):
@@ -192,6 +232,7 @@ def main():
     # TRACKING VARIABLES FOR TEARDOWN
     core_pod_id = None
     worker_ids = []
+    worker_gpus = []
 
     try:
         # ==========================================
@@ -233,7 +274,7 @@ def main():
             'HF_HOME': '/data/hf_cache'
         }
 
-        core_pod_id = deploy_with_fallback("azu-core-moe", CORE_IMG, core_env)
+        core_pod_id, _ = deploy_with_fallback("azu-core-moe", CORE_IMG, core_env)
 
         # Resolve URLs
         api_url = resolve_connection(core_pod_id, 8000)
@@ -272,9 +313,9 @@ def main():
         print(f"   ✅ Sharding Complete: {shard_res.json()}")
 
         # ==========================================
-        # 3. Deploy Workers
+        # 3. Deploy Workers (DYNAMIC PROVISIONING)
         # ==========================================
-        log_section("🚀 3. Deploying 2 Workers")
+        log_section(f"🚀 3. Deploying Workers (Target: {TARGET_TOTAL_VRAM}GB VRAM)")
 
         worker_env = {
             'SCHEDULER_URL': sched_ws_full,
@@ -286,11 +327,27 @@ def main():
             'LAYER_CACHE_DIR': '/data/layers'
         }
 
-        for i in range(4):
-            wid = deploy_with_fallback(f"azu-worker-{i}", WORKER_IMG, worker_env)
+        total_vram = 0
+        worker_count = 0
+
+        while total_vram < TARGET_TOTAL_VRAM:
+            wid, gpu_type = deploy_with_fallback(f"azu-worker-{worker_count}", WORKER_IMG, worker_env)
             worker_ids.append(wid)
+            worker_gpus.append(gpu_type)
+
+            gpu_vram = GPU_VRAM_MAP.get(gpu_type, 24)  # Default to 24GB if unknown
+            total_vram += gpu_vram
+            worker_count += 1
+
+            print(f"   📊 Worker {worker_count}: {gpu_type} ({gpu_vram}GB)")
+            print(f"   📊 Total VRAM: {total_vram}GB / {TARGET_TOTAL_VRAM}GB")
+
+            if total_vram >= TARGET_TOTAL_VRAM:
+                print(f"\n   ✅ Target VRAM reached! Deployed {worker_count} workers with {total_vram}GB total")
+                break
 
         print("\n   ⏳ Waiting for workers to connect to Scheduler...")
+        time.sleep(10)
 
         # ==========================================
         # 4 & 5. Deposit & Inference

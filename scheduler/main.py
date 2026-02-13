@@ -64,69 +64,77 @@ class MoEScheduler:
         candidates = list(self.workers.values())
         if not candidates: return None
 
+        # --- SAFETY PARAMETERS ---
+        # 1. Runtime Reserve: Fixed deduction for PyTorch Context, CUDA Kernels, OS
+        RUNTIME_RESERVE_MB = 4096
+
+        # 2. Weight Safety Factor: Safetensors are packed FP16. PyTorch runtime
+        # needs extra for fragmentation, alignments, and gradients (even if disabled).
+        # Log analysis shows Real Usage ~= 1.6 * Disk Size.
+        WEIGHT_SAFETY_FACTOR = 1.5
+
         valid = []
-        # print(f"--- Planning allocation for {size_mb:.0f}MB layer ---")
 
         for w in candidates:
-            # 1. Determine Safety Cap with RUNTIME OVERHEAD
-            # A 24GB card loses ~4GB to PyTorch Context, KV Cache, and Fragmentation.
-            # We must subtract this BEFORE applying the % limit.
-            RUNTIME_RESERVE_MB = 4096
             usable_vram = max(0, w.vram_total_mb - RUNTIME_RESERVE_MB)
 
-            # 2. Strict Limit (80% of Usable)
-            # This ensures we don't hit the physical OOM wall during inference
-            safe_limit = usable_vram * 0.80
+            # Use the Safety Factor on the WEIGHTS, not the limit
+            # This allows us to accurately track "Effective Load"
 
-            # 3. Check Capacity using INTERNAL LEDGER
             pending_load = current_job_allocations.get(w.pubkey, 0)
 
-            is_cached = cache_key in w.cached_layers
-            allocation_cost = 0 if is_cached else size_mb
+            # Existing load + Pending load
+            current_effective_load = (w.vram_used_mb + pending_load) * WEIGHT_SAFETY_FACTOR
 
-            projected_usage = w.vram_used_mb + pending_load + allocation_cost
+            # New allocation cost (also multiplied)
+            allocation_cost_raw = 0 if (cache_key in w.cached_layers) else size_mb
+            allocation_cost_effective = allocation_cost_raw * WEIGHT_SAFETY_FACTOR
 
-            if projected_usage <= safe_limit:
-                 valid.append((w, allocation_cost))
+            projected_usage = current_effective_load + allocation_cost_effective
+
+            if projected_usage <= usable_vram:
+                 valid.append((w, allocation_cost_effective))
             else:
                  # Debug rejection
-                 # print(f"   ❌ Rejected {w.pubkey[:8]}: Proj {projected_usage:.0f}MB > Limit {safe_limit:.0f}MB")
+                 # print(f"   ❌ Rejected {w.pubkey[:8]}: Proj {projected_usage:.0f} > Usable {usable_vram:.0f}")
                  pass
 
         if not valid:
-            print(f"   ⚠️ NO WORKERS FIT {size_mb:.0f}MB")
+            print(f"   ⚠️ NO WORKERS FIT {size_mb:.0f}MB (Effective: {size_mb * WEIGHT_SAFETY_FACTOR:.0f}MB)")
             return None
 
         def score(item):
-            w, cost = item
+            w, effective_cost = item
             s = 0
-            if cost == 0: s += 10000
+            if effective_cost == 0: s += 10000
 
             pending = current_job_allocations.get(w.pubkey, 0)
-            projected_usage = w.vram_used_mb + pending
 
-            # Recalculate limits for scoring
-            RUNTIME_RESERVE_MB = 4096
-            usable_vram = max(0, w.vram_total_mb - RUNTIME_RESERVE_MB)
-            safe_limit = usable_vram * 0.80
+            # Re-calc for scoring
+            usable = max(0, w.vram_total_mb - RUNTIME_RESERVE_MB)
+            current_effective = (w.vram_used_mb + pending) * WEIGHT_SAFETY_FACTOR
 
-            available_room = safe_limit - projected_usage
-
+            available_room = usable - current_effective
             s += (available_room / 1024)
 
-            # Reduce locality bonus to prevent "clumping" on one worker until it bursts
+            # --- REDUCED LOCALITY BONUS ---
+            # Was 5. Reduced to 2 to prevent "Clumping" (filling one worker to 99% before moving).
+            # We want to spread the load across the 8 workers to reduce OOM risk.
             if previous_worker_id and w.pubkey == previous_worker_id:
-                s += 2 # Reduced from 5
+                s += 2
 
             return s
 
-        chosen_worker, cost = max(valid, key=score)
+        chosen_worker, effective_cost = max(valid, key=score)
 
-        # Update ephemeral ledger
-        new_load = current_job_allocations.get(chosen_worker.pubkey, 0) + cost
+        # Update ephemeral ledger with RAW size (safety factor is applied at read-time)
+        raw_cost = 0 if (cache_key in chosen_worker.cached_layers) else size_mb
+        new_load = current_job_allocations.get(chosen_worker.pubkey, 0) + raw_cost
         current_job_allocations[chosen_worker.pubkey] = new_load
 
-        print(f"   ✅ Selected {chosen_worker.pubkey[:8]}. New Job Load: {new_load:.0f}MB. Total Proj: {chosen_worker.vram_used_mb + new_load:.0f}MB")
+        # Print effective usage for debugging
+        eff_total = (chosen_worker.vram_used_mb + new_load) * WEIGHT_SAFETY_FACTOR
+        print(f"   ✅ Selected {chosen_worker.pubkey[:8]}. Eff Load: {eff_total:.0f}MB / {chosen_worker.vram_total_mb - RUNTIME_RESERVE_MB:.0f}MB")
         sys.stdout.flush()
 
         return chosen_worker
@@ -246,7 +254,9 @@ class MoEScheduler:
 
         # Log final states
         for w in self.workers.values():
-            print(f"   🏁 Worker {w.pubkey[:8]} Final Usage: {w.vram_used_mb:.0f}MB / {w.vram_total_mb:.0f}MB")
+            # Apply safety factor for display
+            eff = w.vram_used_mb * 1.5
+            print(f"   🏁 Worker {w.pubkey[:8]} Usage: {w.vram_used_mb:.0f}MB (Eff: {eff:.0f}MB) / {w.vram_total_mb:.0f}MB")
 
         # Bookend the topology
         first_worker = topology[0]

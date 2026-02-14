@@ -359,6 +359,34 @@ class MoEScheduler:
 
         first_node_endpoint = job.topology[0]['endpoint']
 
+        # === PHASE 1: Send JOB_START to ALL workers with topology ===
+        # This triggers the P2P mesh handshake on each worker
+        all_peer_urls = list(set(node['endpoint'] for node in job.topology))
+        print(f"🔗 [Job {job.id[:8]}] Sending job_start to {len(all_peer_urls)} workers for mesh handshake...")
+
+        job_start_tasks = []
+        for node in job.topology:
+            w = self.workers.get(node['worker_id'])
+            if not w:
+                print(f"⚠️ Worker {node['worker_id']} not found!")
+                continue
+
+            job_start_payload = {
+                "type": "JOB_START",
+                "job_id": job.id,
+                "model_id": job.model_id,
+                "topology": all_peer_urls  # All peer P2P URLs for handshake
+            }
+            job_start_tasks.append(w.ws.send_json(job_start_payload))
+
+        # Wait for all workers to receive job_start
+        if job_start_tasks:
+            await asyncio.gather(*job_start_tasks)
+            print(f"🔗 [Job {job.id[:8]}] All workers received job_start, waiting for handshake...")
+            # Give workers time to complete mesh handshake
+            await asyncio.sleep(2)  # Workers will proceed when ready, this is just safety
+
+        # === PHASE 2: Send EXECUTE messages (original logic) ===
         for i, node in enumerate(job.topology):
             w = self.workers.get(node['worker_id'])
             if not w:

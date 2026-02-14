@@ -36,8 +36,14 @@ P2P_PORT = 8003
 P2P_TIMEOUT = 300
 
 class JobContext:
-    def __init__(self, job_id):
+    def __init__(self, job_id, topology=None):
         self.job_id = job_id
+        # Topology for P2P mesh handshake
+        self.topology = topology or []  # List of peer P2P URLs
+        self.peers_ready = set()  # Track which peers have acknowledged
+        self.status = "PENDING"  # PENDING -> HANDSHAKING -> RUNNING -> COMPLETED
+        self.handshake_done = asyncio.Event()
+
         self.layer_input_queues: Dict[int, asyncio.Queue] = {}
         self.expert_input_queues: Dict[Tuple[int, int], asyncio.Queue] = {}
         self.pending_expert_requests: Dict[Tuple[int, int], asyncio.Future] = {}
@@ -57,6 +63,16 @@ class JobContext:
         if key not in self.expert_input_queues:
             self.expert_input_queues[key] = asyncio.Queue()
         return self.expert_input_queues[key]
+
+    def mark_peer_ready(self, peer_url: str):
+        """Mark a peer as having completed handshake"""
+        self.peers_ready.add(peer_url)
+
+    def all_peers_ready(self) -> bool:
+        """Check if all peers in topology have completed handshake"""
+        if not self.topology:
+            return True  # No peers to wait for
+        return len(self.peers_ready) >= len(self.topology)
 
 class MoEWorker:
     def __init__(self):
@@ -147,12 +163,145 @@ class MoEWorker:
         self.p2p_app.router.add_post('/tensor_in', self.handle_tensor_ingress)
         # NEW: Handle token loopback
         self.p2p_app.router.add_post('/token_in', self.handle_token_ingress)
+        # NEW: Job start handshake endpoints
+        self.p2p_app.router.add_post('/control/job_start', self.handle_job_start)
+        self.p2p_app.router.add_get('/p2p/ping', self.handle_ping)
+        self.p2p_app.router.add_post('/control/peer_ready', self.handle_peer_ready)
         runner = web.AppRunner(self.p2p_app)
         await runner.setup()
         site = web.TCPSite(runner, '0.0.0.0', P2P_PORT)
         await site.start()
         print(f"👂 [P2P] Server listening on :{P2P_PORT} (Binary/High-Perf)")
         sys.stdout.flush()
+
+    # --- P2P HANDSHAKE HANDLERS ---
+    async def handle_job_start(self, request):
+        """Receive job topology and initiate mesh handshake with all peers"""
+        try:
+            data = await request.json()
+            job_id = data.get("job_id")
+            topology = data.get("topology", [])  # List of peer P2P URLs
+            my_p2p_url = self.get_p2p_url().rstrip("/")
+
+            print(f"🔗 [Job {job_id[:8]}] Received job_start with {len(topology)} peers")
+
+            # Create job context with topology
+            ctx = await self._get_context(job_id, create=True)
+            ctx.topology = topology
+            ctx.status = "HANDSHAKING"
+
+            # Remove self from topology (don't ping yourself)
+            peer_urls = [url.rstrip("/") for url in topology if url.rstrip("/") != my_p2p_url]
+
+            if peer_urls:
+                print(f"🔗 [Job {job_id[:8]}] Starting mesh handshake with {len(peer_urls)} peers...")
+                # Start handshake in background
+                asyncio.create_task(self._perform_mesh_handshake(job_id, peer_urls))
+            else:
+                # No peers to wait for, mark as ready immediately
+                ctx.status = "RUNNING"
+                ctx.handshake_done.set()
+                print(f"🔗 [Job {job_id[:8]}] No peers to handshake, running immediately")
+
+            return web.Response(text="OK")
+        except Exception as e:
+            print(f"❌ [P2P] Error in handle_job_start: {e}")
+            return web.Response(status=500, text=str(e))
+
+    async def handle_ping(self, request):
+        """Health check - verify job context exists"""
+        job_id = request.query.get("job_id")
+        if not job_id:
+            return web.Response(status=400, text="Missing job_id")
+
+        ctx = await self._get_context(job_id, create=False)
+        if ctx is None:
+            return web.Response(status=404, text="Job context not found")
+
+        # Return status info
+        return web.json_response({
+            "status": ctx.status,
+            "job_id": job_id
+        })
+
+    async def handle_peer_ready(self, request):
+        """Peer notifies us that they're ready for this job"""
+        try:
+            data = await request.json()
+            job_id = data.get("job_id")
+            peer_url = data.get("peer_url")
+
+            ctx = await self._get_context(job_id, create=False)
+            if ctx:
+                ctx.mark_peer_ready(peer_url.rstrip("/"))
+                print(f"🔗 [Job {job_id[:8]}] Peer {peer_url} ready ({len(ctx.peers_ready)}/{len(ctx.topology)})")
+
+                # Check if all peers are ready
+                if ctx.all_peers_ready():
+                    ctx.status = "RUNNING"
+                    ctx.handshake_done.set()
+                    print(f"🔗 [Job {job_id[:8]}] ALL PEERS READY - Starting execution!")
+
+            return web.Response(text="OK")
+        except Exception as e:
+            print(f"❌ [P2P] Error in handle_peer_ready: {e}")
+            return web.Response(status=500, text=str(e))
+
+    async def _perform_mesh_handshake(self, job_id: str, peer_urls: List[str]):
+        """Ping all peers to verify connectivity before tensor transfer"""
+        ctx = await self._get_context(job_id, create=False)
+        if not ctx:
+            print(f"❌ [Job {job_id[:8]}] Context disappeared during handshake!")
+            return
+
+        my_url = self.get_p2p_url().rstrip("/")
+        session = await self._get_p2p_session()
+
+        # Ping each peer with retry
+        for peer_url in peer_urls:
+            peer_url_clean = peer_url.rstrip("/")
+            ping_url = f"{peer_url_clean}/p2p/ping?job_id={job_id}"
+
+            for attempt in range(5):  # 5 retries
+                try:
+                    async with session.get(ping_url, timeout=aiohttp.ClientTimeout(total=2)) as resp:
+                        if resp.status == 200:
+                            ctx.mark_peer_ready(peer_url_clean)
+                            print(f"🔗 [Job {job_id[:8]}] ✓ Peer {peer_url_clean} reachable")
+                            break
+                        else:
+                            await asyncio.sleep(0.5 * (attempt + 1))
+                except Exception as e:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+            else:
+                print(f"⚠️ [Job {job_id[:8]}] ✗ Peer {peer_url_clean} unreachable after 5 attempts")
+
+            # Also notify peer that we're ready
+            try:
+                await session.post(
+                    f"{peer_url_clean}/control/peer_ready",
+                    json={"job_id": job_id, "peer_url": my_url},
+                    timeout=aiohttp.ClientTimeout(total=2)
+                )
+            except Exception as e:
+                print(f"⚠️ [Job {job_id[:8]}] Failed to notify {peer_url_clean}: {e}")
+
+        # Check if all peers are ready (including those that reached out to us)
+        if ctx.all_peers_ready():
+            ctx.status = "RUNNING"
+            ctx.handshake_done.set()
+            print(f"🔗 [Job {job_id[:8]}] ALL PEERS READY - Starting execution!")
+        else:
+            # Wait a bit more for peers to notify us
+            print(f"🔗 [Job {job_id[:8]}] Waiting for peers to complete handshake...")
+            # Give extra time for peers to notify us
+            await asyncio.sleep(2)
+            if ctx.all_peers_ready():
+                ctx.status = "RUNNING"
+                ctx.handshake_done.set()
+                print(f"🔗 [Job {job_id[:8]}] ALL PEERS READY (delayed) - Starting execution!")
+            else:
+                print(f"⚠️ [Job {job_id[:8]}] Handshake incomplete ({len(ctx.peers_ready)}/{len(ctx.topology)}), proceeding anyway")
 
     async def _get_p2p_session(self):
         """Lazy-load a shared session for P2P traffic to prevent socket exhaustion."""
@@ -210,8 +359,15 @@ class MoEWorker:
 
             tensor = torch.from_numpy(arr).to(self.device).to(self.dtype)
 
-            # 4. Route
+            # 4. Route - Get or create context
             ctx = await self._get_context(job_id, create=True)
+
+            # 4b. WAIT for handshake to complete before processing tensors
+            # This ensures job context is fully initialized on all peers
+            if ctx.topology and ctx.status == "HANDSHAKING":
+                print(f"⏳ [Job {job_id[:8]}] Waiting for mesh handshake before processing tensor...")
+                await ctx.handshake_done.wait()
+                print(f"✅ [Job {job_id[:8]}] Handshake complete, processing tensor")
 
             if msg_type == 'input':
                 # Parse optional routing headers
@@ -904,7 +1060,37 @@ class MoEWorker:
                         msg_type = msg['type']
                         job_id = msg.get('job_id', 'unknown')[:8]
 
-                        if msg_type == 'EXECUTE_DENSE':
+                        if msg_type == 'JOB_START':
+                            # NEW: Trigger P2P mesh handshake via HTTP endpoint
+                            # This ensures all workers can communicate before tensor transfer
+                            job_id_full = msg.get('job_id')
+                            topology = msg.get('topology', [])
+                            model_id = msg.get('model_id')
+
+                            print(f"🔗 [Job {job_id}] Received JOB_START, initiating mesh handshake...")
+
+                            # Make HTTP request to ourselves to trigger handshake
+                            # The P2P server handles the actual handshake logic
+                            my_p2p_url = self.get_p2p_url().rstrip("/")
+                            try:
+                                session = await self._get_p2p_session()
+                                async with session.post(
+                                    f"{my_p2p_url}/control/job_start",
+                                    json={
+                                        "job_id": job_id_full,
+                                        "model_id": model_id,
+                                        "topology": topology
+                                    },
+                                    timeout=aiohttp.ClientTimeout(total=30)
+                                ) as resp:
+                                    if resp.status == 200:
+                                        print(f"🔗 [Job {job_id}] Mesh handshake initiated successfully")
+                                    else:
+                                        print(f"⚠️ [Job {job_id}] Mesh handshake initiation failed: {resp.status}")
+                            except Exception as e:
+                                print(f"⚠️ [Job {job_id}] Failed to trigger mesh handshake: {e}")
+
+                        elif msg_type == 'EXECUTE_DENSE':
                             asyncio.create_task(self._safe_task_wrapper(
                                 self.process_dense(msg, ws), f"EXECUTE_DENSE-{job_id}"))
                         elif msg_type == 'EXECUTE_ROUTER':

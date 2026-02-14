@@ -968,15 +968,28 @@ class MoEWorker:
         ctx = await self._get_context(job_id, create=True)
         self._print_vram_stats(f"Expert Start {layer_idx}:{expert_idx}", ctx)
 
+        # Track how many tokens this expert has processed
+        tokens_processed = 0
+
         while not ctx.done:
             try:
                 queue = ctx.get_expert_queue(layer_idx, expert_idx)
                 try:
                     hidden_states = await asyncio.wait_for(queue.get(), timeout=P2P_TIMEOUT)
                 except asyncio.TimeoutError:
-                    if ctx.done: break
-                    print(f"⏭️ [Job {job_id[:8]}] Expert {expert_idx} not used (timeout)")
-                    break
+                    # Expert timed out waiting for input
+                    # DON'T BREAK - expert should stay alive until job is complete
+                    # The router may send more tokens later, or job may be done
+                    if ctx.done:
+                        # Job is complete - exit gracefully
+                        print(f"✅ [Job {job_id[:8]}] Expert {expert_idx} (Layer {layer_idx}) finished - job done, processed {tokens_processed} tokens")
+                        break
+                    # Job not done but no input - continue waiting
+                    # This handles the gap between tokens during sequential processing
+                    print(f"⏳ [Job {job_id[:8]}] Expert {expert_idx} (Layer {layer_idx}) timeout, continuing to wait...")
+                    continue
+
+                tokens_processed += 1
 
                 # --- FIX: Precision Guard ---
                 hidden_states = hidden_states.to(self.dtype)
@@ -1002,7 +1015,11 @@ class MoEWorker:
 
             except Exception as e:
                  print(f"❌ Error in expert loop: {e}")
+                 traceback.print_exc()
                  break
+
+        # Cleanup when exiting
+        print(f"👋 [Job {job_id[:8]}] Expert {expert_idx} (Layer {layer_idx}) exiting, processed {tokens_processed} total tokens")
 
     async def _safe_task_wrapper(self, coro, task_name):
         try:

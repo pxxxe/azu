@@ -71,7 +71,7 @@ class MoEScheduler:
         # 2. Weight Safety Factor: Safetensors are packed FP16. PyTorch runtime
         # needs extra for fragmentation, alignments, and gradients (even if disabled).
         # Log analysis shows Real Usage ~= 1.6 * Disk Size.
-        WEIGHT_SAFETY_FACTOR = 1.5
+        WEIGHT_SAFETY_FACTOR = 1
 
         valid = []
 

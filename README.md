@@ -1,10 +1,12 @@
 # azu
 
-> **Beta** — Decentralised inference network. Consumer GPU hardware, pooled.
+> **"Go forth and multiply."**
+
+**Beta** — Decentralised inference network. Consumer GPU hardware, pooled.
 
 Azu splits large language models across a network of independent workers and runs inference as a distributed pipeline. A user submits a prompt, the core routes it through sharded layers held by different machines, and the result comes back — no single node needs to hold the full model.
 
-Payments flow over Solana. Workers earn SOL for compute they contribute. The platform takes a 20% cut; the rest goes straight to the worker.
+Payments will flow over Hyperliquid. Workers earn HYPE for compute they contribute. The platform takes a 20% cut; the rest goes straight to the worker.
 
 ---
 
@@ -17,6 +19,8 @@ A job moves through three stages:
 **2. Planning** — The Scheduler knows what's connected. When a job arrives it pulls the model's `structure.json` from the Registry, then walks through every layer and assigns it to a worker based on available VRAM, whether that worker already has the layer cached, and pipeline locality (keeping consecutive layers on the same machine where possible). For MoE layers each expert is placed independently — experts can land on different workers than the router. The output is a topology: an ordered list of nodes with routing instructions.
 
 **3. Execution** — The topology is dispatched. The first worker in the chain tokenises the prompt and runs it through the embedding layer, then forwards the hidden-state tensor to the next worker via a direct HTTP P2P link (not back through the core). Each worker runs its assigned layer(s) and passes the tensor along. MoE router workers fan out tensor slices to the relevant expert workers, collect results, apply routing weights, and forward the merged output. The last worker runs the LM head and decodes the output token.
+
+The pipeline supports full autoregressive generation — not single-token decoding. Workers iteratively process tokens through the complete layer stack, with the final layer's output fed back as input for the next generation step until the specified token limit is reached or an end-of-sequence token is generated.
 
 ### Sharding strategies
 
@@ -32,34 +36,34 @@ Both types coexist in the same model. Mixtral, for example, is fully MoE. Qwen2-
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                      Core                           │
-│                                                     │
-│   ┌──────────┐   ┌───────────┐   ┌──────────────┐  │
-│   │   API    │   │ Scheduler │   │   Registry   │  │
-│   │  :8000   │   │  :8001    │   │    :8002     │  │
-│   └────┬─────┘   └─────┬─────┘   └──────┬───────┘  │
-│        │               │                │           │
-│        │  job_queue    │  WebSocket     │  HTTP     │
-│        │  (Redis)      │  (register,   │  (layers/ │
-│        └───────────────┤   dispatch,   │   info,   │
-│                        │   results)    │   shard)  │
-│                        │               │           │
-│                   Redis :6379          │           │
-└────────────────────────┼───────────────┼───────────┘
+┌─────────────────────────────────────────────────────────┐
+│                      Core                               │
+│                                                         │
+│   ┌──────────┐   ┌───────────┐   ┌──────────────┐     │
+│   │   API    │   │ Scheduler │   │   Registry   │     │
+│   │  :8000   │   │  :8001    │   │    :8002     │     │
+│   └────┬─────┘   └─────┬─────┘   └──────┬───────┘     │
+│        │               │                │              │
+│        │  job_queue    │  WebSocket     │  HTTP        │
+│        │  (Redis)      │  (register,   │  (layers/   │
+│        └───────────────┤   dispatch,   │   info,     │
+│                        │   results)    │   shard)    │
+│                        │               │              │
+│                   Redis :6379          │              │
+└────────────────────────┼───────────────┼──────────────┘
                          │               │
           ┌──────────────┼───────────────┼──────┐
           │              ▼               ▼      │
-          │   ┌────────────────┐  ┌───────────┐ │
-          │   │   Worker 0     |  │  Worker 1 │ │
-          │   │   :8003 (P2P)  |──│  :8003    │ │  ← direct tensor transfer
-          │   └────────────────┘  └───────────┘ │
+          │   ┌────────────────┐  ┌───────────┐  │
+          │   │   Worker 0      |  │  Worker 1 │  │
+          │   │   :8003 (P2P)  |──│  :8003    │  │  ← direct tensor transfer
+          │   └────────────────┘  └───────────┘  │
           │           …                          │
-          └───────────────────────────────────── ┘
+          └──────────────────────────────────────┘
                     Worker Network
 ```
 
-**API** — Entry point for users. Accepts deposits (verified on-chain via Solana RPC) and inference job submissions. Writes jobs to a Redis queue. Serves results once they arrive.
+**API** — Entry point for users. Accepts deposits (verified on-chain via Hyperliquid) and inference job submissions. Writes jobs to a Redis queue. Serves results once they arrive.
 
 **Scheduler** — Maintains persistent WebSocket connections to every worker. Consumes the job queue, plans layer placement, dispatches execution instructions, and writes completed results back to Redis.
 
@@ -79,7 +83,7 @@ azu/
 ├── scheduler/              # Job planner & dispatcher (FastAPI + WebSocket)
 │   ├── main.py
 │   └── requirements.txt
-├── registry/               # Model store & sharding engine (FastAPI)
+├── registry/              # Model store & sharding engine (FastAPI)
 │   ├── main.py
 │   ├── layer_storage.py
 │   └── requirements.txt
@@ -91,9 +95,9 @@ azu/
 │   └── user/               # CLI for interacting with the network
 │       ├── main.py
 │       └── requirements.txt
-├── shared/                 # Shared config, Solana helpers, economics
+├── shared/                 # Shared config, Hyperliquid helpers, economics
 │   ├── config.py
-│   ├── solana_lib.py
+│   ├── hyperliquid_lib.py
 │   └── economics.py
 ├── Dockerfile.core         # Builds the core (API + Scheduler + Registry + Redis)
 ├── Dockerfile.worker       # Builds a worker node (CUDA)
@@ -109,8 +113,8 @@ Both the core and workers read from a `.env` file (or system environment). Creat
 
 | Variable | Required by | Description |
 |---|---|---|
-| `SOLANA_RPC_URL` | Core | Solana RPC endpoint (devnet or mainnet) |
-| `PLATFORM_WALLET_PUBKEY` | Core | Public key of the wallet that receives user deposits |
+| `HYPERLIQUID_RPC_URL` | Core | Hyperliquid RPC endpoint (mainnet or testnet) |
+| `HYPERLIQUID_ADDRESS` | Core | Address of the wallet that receives user deposits |
 | `SCHEDULER_PRIVATE_KEY` | Core | JSON array of bytes — the keypair used to sign worker payouts |
 | `REDIS_HOST` | Core | Redis hostname (`localhost` inside the core container) |
 | `REDIS_PORT` | Core | Redis port (`6379`) |
@@ -123,8 +127,8 @@ Both the core and workers read from a `.env` file (or system environment). Creat
 Minimal `.env` for local testing:
 
 ```env
-SOLANA_RPC_URL=https://api.devnet.solana.com
-PLATFORM_WALLET_PUBKEY=<your_platform_pubkey>
+HYPERLIQUID_RPC_URL=https://api.hyperliquid.xyz
+HYPERLIQUID_ADDRESS=<your_platform_address>
 SCHEDULER_PRIVATE_KEY=[<byte,array>]
 REDIS_HOST=localhost
 REDIS_PORT=6379
@@ -135,7 +139,7 @@ HF_TOKEN=hf_your_token_here
 
 ## Setup & Local Testing
 
-Prerequisites: Docker, Docker Compose (or equivalent), and a funded Solana devnet wallet.
+Prerequisites: Docker, Docker Compose (or equivalent), and a funded Hyperliquid wallet.
 
 ### 1. Build the images
 
@@ -201,13 +205,13 @@ curl "http://localhost:8002/models/status?model_id=Qwen/Qwen2.5-0.5B"
 
 ### 5. Fund an account & submit a job
 
-Using the user CLI (requires a Solana wallet at `~/.config/solana/id.json`):
+Using the user CLI (requires a Hyperliquid wallet):
 
 ```bash
 cd client/user
 pip install -r requirements.txt
 
-# Deposit 0.01 SOL
+# Deposit HYPE (you need a real on-chain transaction signature)
 python main.py deposit 0.01
 
 # Run inference
@@ -220,12 +224,12 @@ Or directly via curl:
 # 1. Deposit (you need a real on-chain transaction signature)
 curl -X POST http://localhost:8000/deposit \
   -H "Content-Type: application/json" \
-  -d '{"tx_sig": "<solana_tx_signature>", "user_pubkey": "<your_pubkey>"}'
+  -d '{"tx_sig": "<hyperliquid_tx_signature>", "user_address": "<your_address>"}'
 
 # 2. Submit
 curl -X POST http://localhost:8000/submit \
   -H "Content-Type: application/json" \
-  -d '{"user_pubkey": "<your_pubkey>", "model_id": "Qwen/Qwen2.5-0.5B", "prompt": "What is the capital of France?", "est_tokens": 50}'
+  -d '{"user_address": "<your_address>", "model_id": "Qwen/Qwen2.5-0.5B", "prompt": "What is the capital of France?", "est_tokens": 50}'
 
 # 3. Poll for result (use the job_id from step 2)
 curl http://localhost:8000/results/<job_id>
@@ -242,9 +246,9 @@ To run it you need the following environment variables set:
 ```bash
 export RUNPOD_API_KEY=<your_key>
 export HF_TOKEN=<your_hf_token>
-export SOLANA_RPC=<rpc_url>               # devnet recommended
-export FUNDED_ACCOUNT_KEY=<base58_or_json> # a wallet with enough SOL to cover test transfers
-export VOLUME_ID=<runpod_volume_id>        # persistent volume for HF model cache
+export HYPERLIQUID_RPC=<rpc_url>               # testnet recommended
+export FUNDED_ACCOUNT_KEY=<base58_or_json>      # a wallet with enough HYPE to cover test transfers
+export VOLUME_ID=<runpod_volume_id>              # persistent volume for HF model cache
 ```
 
 Then:
@@ -267,7 +271,7 @@ Pricing is based on **token-layers** — one token passing through one layer.
 | 1 token-layer | 2 Lamports |
 | 70B model (80 layers), 100 tokens | 16,000 Lamports (~$0.002) |
 
-Revenue split: **80% to the worker**, 20% to the platform. Workers accumulate earnings and are paid out once their balance crosses 0.1 SOL.
+Revenue split: **80% to the worker**, 20% to the platform. Workers accumulate earnings and are paid out once their balance crosses a threshold (to be determined based on Hyperliquid gas costs).
 
 ---
 
@@ -279,10 +283,77 @@ Llama, Mistral, Mixtral, Qwen2, Qwen2-MoE, GPT-2, GPT-Neo, GPT-J, OPT, BLOOM, Fa
 
 ---
 
+## Core Scheduler Components — Implementation Status
+
+The following components of the core Scheduler have been implemented and are functional:
+
+- **Worker Registry**: Maintains a list of connected workers with their GPU capabilities, VRAM availability, and P2P endpoints.
+- **Layer Planning**: Calculates optimal layer placement based on worker VRAM, cache state, and pipeline locality.
+- **Job Queue Consumption**: Reads jobs from Redis and dispatches them to workers.
+- **Topology Generation**: Creates execution plans mapping each layer to specific workers.
+- **Result Aggregation**: Collects outputs from workers and assembles the final response.
+
+The following components require implementation or completion:
+
+### 1. Payment Processing (Hyperliquid Integration)
+
+**Status: NOT IMPLEMENTED**
+
+The economics module exists and the cost calculation is correct, but the actual HYPE transfer to workers on job completion is not triggered automatically. This is the highest-priority gap for production readiness.
+
+Required work:
+
+- Implement Hyperliquid wallet connection and signature verification
+- Build deposit confirmation flow (verify on-chain transactions)
+- Create worker payout mechanism (batch payments when balance threshold is reached)
+- Wire up payment triggers on successful job completion
+
+### 2. Fault Tolerance — Worker Disconnection Handling
+
+**Status: NOT IMPLEMENTED**
+
+If a worker drops mid-job the job fails. There is no checkpoint or retry at the layer level.
+
+Required work:
+
+- **Heartbeat Monitoring**: Implement periodic health checks between Scheduler and workers. Detect worker disconnection within a configurable timeout window (recommended: 5-10 seconds).
+- **Failure Detection**: When a worker fails to acknowledge a tensor transfer or heartbeat, mark that worker as unavailable.
+- **Layer Redistribution**: When a worker disconnects mid-pipeline:
+  - Identify which layers were assigned to the failed worker
+  - Find replacement workers with sufficient VRAM and the required layers cached (prefer workers with already-cached layers to minimise load time)
+  - If no cached layer exists, dispatch the failed worker to retrieve the layer from the Registry
+  - Rebuild the pipeline topology with the new worker(s)
+  - Resume execution from the last successfully processed layer (requires workers to store intermediate hidden states or implement rollback)
+- **Job Retry Logic**: For jobs that cannot be recovered (e.g., too many worker failures), implement automatic re-queue with appropriate backoff.
+
+### 3. VRAM Accounting (Live GPU Memory Queries)
+
+**Status: ESTIMATED ONLY**
+
+The Scheduler tracks used VRAM based on layer file sizes, not live GPU memory queries. Workers can OOM under heavy load.
+
+Required work:
+
+- Implement periodic VRAM reporting from workers (query actual GPU memory usage via `torch.cuda.memory_allocated()`)
+- Update Scheduler's worker state with real-time VRAM availability
+- Add OOM prediction and preemption before job assignment
+
+### 4. P2P Tensor Transfer Encryption
+
+**Status: NOT IMPLEMENTED**
+
+Tensors move over plain HTTP between workers. Not suitable for sensitive workloads yet.
+
+Required work:
+
+- Implement TLS for P2P connections between workers
+- Add tensor integrity verification (hash checksums)
+
+---
+
 ## Known Limitations (Beta)
 
-- **Single-token generation only.** The current pipeline runs one forward pass and decodes a single next token. Autoregressive multi-token generation is not yet implemented.
+- **Payment layer is not wired into job completion.** The economics module exists and the cost calculation is correct, but the actual HYPE transfer to workers on job completion is not triggered automatically in this build.
 - **No fault tolerance.** If a worker drops mid-job the job fails. There is no checkpoint or retry at the layer level.
 - **VRAM accounting is estimated.** The Scheduler tracks used VRAM based on layer file sizes, not live GPU memory queries. Workers can OOM under heavy load.
 - **P2P tensor transfer is unencrypted.** Tensors move over plain HTTP between workers. Not suitable for sensitive workloads yet.
-- **Payout logic is not yet wired into the job completion path.** The economics module exists and the cost calculation is correct, but the actual SOL transfer to workers on job completion is not triggered automatically in this build.

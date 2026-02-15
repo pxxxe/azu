@@ -16,15 +16,15 @@ import aiohttp
 import websockets
 from transformers import DynamicCache
 
-from client.worker.config import (
+from config import (
     SCHEDULER_URL,
     P2P_PORT,
     DEFAULT_CPU_VRAM_MB,
 )
-from client.worker.layer_loader import LayerLoader
-from client.worker.model_manager import ModelManager
-from client.worker.job_context import JobContext
-from client.worker.p2p_server import P2PServer
+from layer_loader import LayerLoader
+from model_manager import ModelManager
+from job_context import JobContext
+from p2p_server import P2PServer
 
 
 class MoEWorker:
@@ -71,7 +71,7 @@ class MoEWorker:
 
     def get_p2p_url(self) -> str:
         """Get this worker's P2P URL."""
-        from client.worker.config import P2P_PUBLIC_URL, P2P_URL_TEMPLATE
+        from config import P2P_PUBLIC_URL, P2P_URL_TEMPLATE
 
         if P2P_PUBLIC_URL:
             return P2P_PUBLIC_URL.strip("/")
@@ -136,7 +136,7 @@ class MoEWorker:
 
     async def _process_dense(self, msg: Dict, ws):
         """Process dense layer job."""
-        from client.worker.layer_processor import DenseLayerProcessor
+        from layer_processor import DenseLayerProcessor
 
         job_id = msg['job_id']
         model_id = msg['model_id']

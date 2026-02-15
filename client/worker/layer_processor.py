@@ -10,10 +10,10 @@ from typing import Dict, Any, Optional
 
 import torch
 
-from client.worker.config import P2P_TIMEOUT
-from client.worker.job_context import JobContext
-from client.worker.model_manager import ModelManager
-from client.worker.layer_loader import LayerLoader
+from config import P2P_TIMEOUT
+from job_context import JobContext
+from model_manager import ModelManager
+from layer_loader import LayerLoader
 
 
 class DenseLayerProcessor:
@@ -181,7 +181,7 @@ class DenseLayerProcessor:
                     else:
                         # Send token back for loopback
                         if first_node_endpoint:
-                            from client.worker.p2p_server import P2PServer
+                            from p2p_server import P2PServer
                             # Access p2p_server through the parent - this will be set later
                             pass
 

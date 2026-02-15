@@ -13,15 +13,15 @@ from typing import Dict, Optional, List, Callable, Any
 import aiohttp
 from aiohttp import web, ClientSession, TCPConnector, ClientTimeout
 
-from client.worker.config import (
+from config import (
     P2P_PORT,
     P2P_MAX_SIZE,
     P2P_CONNECTION_RETRIES,
     P2P_HANDSHAKE_RETRIES,
     P2P_HANDSHAKE_TIMEOUT
 )
-from client.worker.p2p_protocol import P2PProtocol
-from client.worker.job_context import JobContext
+from p2p_protocol import P2PProtocol
+from job_context import JobContext
 
 
 class P2PServer:

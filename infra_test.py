@@ -83,7 +83,7 @@ GPU_VRAM_MAP = {
     "NVIDIA RTX 2000 Ada Generation": 16,
 }
 
-TARGET_TOTAL_VRAM = 180  # GB needed for Mixtral test
+TARGET_TOTAL_VRAM = 120  # GB needed for Mixtral test
 
 runpod.api_key = RUNPOD_API_KEY
 

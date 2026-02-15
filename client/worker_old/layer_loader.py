@@ -1,45 +1,23 @@
-"""
-Layer loader module for downloading and caching model layers from registry.
-Handles loading of dense layers, MoE components, embeddings, and LM head.
-"""
-
+import torch
+import aiohttp
 import os
 import sys
+import json
 import asyncio
 import concurrent.futures
 from pathlib import Path
-from typing import Optional
-
-import torch
-import aiohttp
 from transformers import AutoConfig
 from safetensors.torch import load_file as load_safetensors
 
-from .config import LAYER_CACHE_DIR, MAX_DOWNLOAD_WORKERS, MAX_DOWNLOAD_SEMAPHORE
-
-
 class LayerLoader:
-    """
-    Handles downloading and caching of model layers from the registry.
-    Supports dense layers, MoE routers, MoE experts, embeddings, and LM head.
-    """
-
-    def __init__(self, registry_url: str, cache_dir: Optional[str] = None):
-        """
-        Initialize the layer loader.
-
-        Args:
-            registry_url: Base URL of the registry service
-            cache_dir: Optional custom cache directory
-        """
+    def __init__(self, registry_url, cache_dir=None):
         self.registry_url = registry_url
         if cache_dir is None:
-            cache_dir = LAYER_CACHE_DIR
-
+          cache_dir = os.getenv("LAYER_CACHE_DIR", "/app/layer_cache")
         print(f"Using cache directory: {cache_dir}")
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True, parents=True)
-        self.loaded_cache = {}  # RAM cache for loaded layers
+        self.loaded_cache = {}  # RAM cache
 
         # --- PRECISION & DEVICE SETTINGS ---
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -53,32 +31,22 @@ class LayerLoader:
             print(f"⚠️ Warning: BFloat16 not supported, falling back to Float16 (High risk of NaN)")
 
         # --- CONCURRENCY CONTROL ---
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS)
-        self.sem = asyncio.Semaphore(MAX_DOWNLOAD_SEMAPHORE)
-        self.session: Optional[aiohttp.ClientSession] = None
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+        self.sem = asyncio.Semaphore(10)
+        self.session = None
         self.download_locks: dict[str, asyncio.Lock] = {}
 
-    async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create HTTP session for downloading layers."""
+    async def _get_session(self):
         if self.session is None:
             connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
             timeout = aiohttp.ClientTimeout(total=600, connect=60)
             self.session = aiohttp.ClientSession(connector=connector, timeout=timeout)
         return self.session
 
-    async def _load_weights_safe(self, path: Path) -> dict:
-        """
-        Load weights from a safetensors file safely.
-
-        Args:
-            path: Path to the safetensors file
-
-        Returns:
-            State dict
-        """
+    async def _load_weights_safe(self, path):
         loop = asyncio.get_running_loop()
 
-        # Aggressive defrag before loading
+        # --- FIX: Aggressive defrag before loading ---
         if self.device == "cuda":
             torch.cuda.empty_cache()
 
@@ -88,15 +56,8 @@ class LayerLoader:
             lambda: load_safetensors(path, device="cpu")
         )
 
-    async def _download(self, url: str, path: Path, quiet: bool = False) -> None:
-        """
-        Download a file from Registry to Worker Disk.
-
-        Args:
-            url: URL to download from
-            path: Local path to save the file
-            quiet: If True, suppress output
-        """
+    async def _download(self, url: str, path: Path, quiet: bool = False):
+        """Helper to download a file from Registry to Worker Disk"""
         path.parent.mkdir(parents=True, exist_ok=True)
 
         lock_key = str(path)
@@ -141,16 +102,7 @@ class LayerLoader:
                         os.remove(temp)
                     raise e
 
-    def _get_layer_class(self, config: AutoConfig):
-        """
-        Get the transformer layer class from config architecture.
-
-        Args:
-            config: Model configuration
-
-        Returns:
-            Decoder layer class
-        """
+    def _get_layer_class(self, config):
         arch = config.architectures[0]
         try:
             if arch.endswith("ForCausalLM"):
@@ -173,17 +125,7 @@ class LayerLoader:
         except Exception as e:
             raise ValueError(f"Could not load layer class for {arch}: {e}")
 
-    def _get_paths(self, model_id: str, filename: str):
-        """
-        Get local path and URL for a model file.
-
-        Args:
-            model_id: HuggingFace model ID
-            filename: Name of the file
-
-        Returns:
-            Tuple of (local_path, url)
-        """
+    def _get_paths(self, model_id, filename):
         sanitized = model_id.replace("/", "_")
         path = self.cache_dir / sanitized / filename
         url = f"{self.registry_url}/layers/{sanitized}/{filename}"
@@ -193,16 +135,6 @@ class LayerLoader:
     # Load Shared Components (Attention + Norms) for MoE Layers
     # =========================================================================
     async def load_moe_shared(self, model_id: str, layer_idx: int):
-        """
-        Load shared attention and normalization components for MoE layer.
-
-        Args:
-            model_id: HuggingFace model ID
-            layer_idx: Layer index
-
-        Returns:
-            Loaded layer with experts removed (lobotomized)
-        """
         cache_key = f"{model_id}:shared:{layer_idx}"
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
@@ -217,11 +149,13 @@ class LayerLoader:
 
         LayerClass = self._get_layer_class(config)
 
-        # VRAM LEAK FIX: INSTANTIATE ON CPU FIRST
-        # Create layer on CPU to perform surgery before moving to GPU
+        # --- VRAM LEAK FIX: INSTANTIATE ON CPU FIRST ---
+        # We must create the layer on CPU to perform surgery before moving to GPU.
+        # Otherwise, 'MixtralDecoderLayer' initializes 8 full experts in VRAM (3GB+)
+        # even though we only need the Attention/Norms (200MB).
         layer = LayerClass(config, layer_idx=layer_idx)
 
-        # LOBOTOMY: Remove Experts from the container
+        # --- LOBOTOMY: Remove Experts from the container ---
         if hasattr(layer, "block_sparse_moe"):
             del layer.block_sparse_moe
             layer.block_sparse_moe = None
@@ -229,12 +163,12 @@ class LayerLoader:
             del layer.mlp
             layer.mlp = None
 
-        # Move slimmed-down layer to GPU
+        # Now move the slimmed-down layer to GPU
         layer = layer.to(self.device).to(self.dtype)
 
         state_dict = await self._load_weights_safe(path)
 
-        # strict=False because experts/router weights are missing
+        # strict=False is REQUIRED because we are missing experts/router weights here.
         layer.load_state_dict(state_dict, strict=False)
         layer.eval()
 
@@ -242,16 +176,6 @@ class LayerLoader:
         return layer
 
     async def load_dense_layer(self, model_id: str, layer_idx: int):
-        """
-        Load a dense transformer layer.
-
-        Args:
-            model_id: HuggingFace model ID
-            layer_idx: Layer index
-
-        Returns:
-            Loaded dense layer
-        """
         cache_key = f"{model_id}:dense:{layer_idx}"
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
@@ -276,16 +200,6 @@ class LayerLoader:
         return layer
 
     async def load_moe_router(self, model_id: str, layer_idx: int):
-        """
-        Load an MoE router (gate) network.
-
-        Args:
-            model_id: HuggingFace model ID
-            layer_idx: Layer index
-
-        Returns:
-            Loaded router linear layer
-        """
         cache_key = f"{model_id}:router:{layer_idx}"
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
@@ -310,17 +224,6 @@ class LayerLoader:
         return router
 
     async def load_moe_expert(self, model_id: str, layer_idx: int, expert_idx: int):
-        """
-        Load an MoE expert FFN.
-
-        Args:
-            model_id: HuggingFace model ID
-            layer_idx: Layer index
-            expert_idx: Expert index
-
-        Returns:
-            Loaded expert FFN
-        """
         cache_key = f"{model_id}:expert:{layer_idx}:{expert_idx}"
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
@@ -334,8 +237,7 @@ class LayerLoader:
         await self._download(url, path)
 
         class ExpertFFN(torch.nn.Module):
-            """Expert FFN with SwiGLU activation."""
-            def __init__(self, hidden_size: int, intermediate_size: int):
+            def __init__(self, hidden_size, intermediate_size):
                 super().__init__()
                 self.w1 = torch.nn.Linear(hidden_size, intermediate_size, bias=False)
                 self.w2 = torch.nn.Linear(intermediate_size, hidden_size, bias=False)
@@ -356,15 +258,6 @@ class LayerLoader:
         return expert
 
     async def load_embeddings(self, model_id: str):
-        """
-        Load token embeddings.
-
-        Args:
-            model_id: HuggingFace model ID
-
-        Returns:
-            Loaded embedding layer
-        """
         cache_key = f"{model_id}:embeddings"
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
@@ -386,15 +279,6 @@ class LayerLoader:
         return emb
 
     async def load_lm_head(self, model_id: str):
-        """
-        Load language model head.
-
-        Args:
-            model_id: HuggingFace model ID
-
-        Returns:
-            Loaded LM head
-        """
         cache_key = f"{model_id}:lm_head"
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]
@@ -416,16 +300,7 @@ class LayerLoader:
         self.loaded_cache[cache_key] = head
         return head
 
-    def _get_norm_class(self, config: AutoConfig):
-        """
-        Get the normalization class from config.
-
-        Args:
-            config: Model configuration
-
-        Returns:
-            Normalization class (RMSNorm or LayerNorm)
-        """
+    def _get_norm_class(self, config):
         arch = config.architectures[0]
         try:
             if arch.endswith("ForCausalLM"):
@@ -439,7 +314,7 @@ class LayerLoader:
             class_name = f"{base}RMSNorm"
 
             if "GPT" in arch or "Bloom" in arch:
-                return torch.nn.LayerNorm
+                  return torch.nn.LayerNorm
 
             import importlib
             full_module = f"transformers.models.{module_name}.modeling_{module_name}"
@@ -452,15 +327,6 @@ class LayerLoader:
                 raise ValueError(f"Could not load Norm class: {e}")
 
     async def load_final_norm(self, model_id: str):
-        """
-        Load final layer normalization.
-
-        Args:
-            model_id: HuggingFace model ID
-
-        Returns:
-            Loaded norm layer or None if not available
-        """
         cache_key = f"{model_id}:final_norm"
         if cache_key in self.loaded_cache:
             return self.loaded_cache[cache_key]

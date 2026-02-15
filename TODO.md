@@ -1,13 +1,11 @@
 # TODO LIST
 
 - [ ] Implement BYOA user authentication
-- [ ] Implement payment processing
-- [ ] Let multiple parties run scheduler (Federated system)
+- [ ] Implement Hyperliquid payment layer
 - [ ] Unsafe torch.load Allows Arbitrary Code Execution - Fix
-- [ ] Remove HF interfaces from worker
-- [ ] Raw binary for tensor transfer
-- [ ] Disallow untrusted code
 - [ ] Implement secure communication channels
 - [ ] Implement BYO Scheduling strategy
 - [ ] OpenAI adapter compatibility
-- [ ] Self Attention and Layer Normalization
+- [ ] Instantiate worker as object (azu lib)
+- [ ] Client wrapper for worker object
+- [ ] License

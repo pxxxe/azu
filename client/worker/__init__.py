@@ -3,7 +3,7 @@ Worker package for decentralized inference network.
 Contains modules for P2P communication, model management, and layer processing.
 """
 
-from .config import (
+from client.worker.config import (
     HF_TOKEN,
     SCHEDULER_URL,
     REGISTRY_URL,
@@ -21,16 +21,16 @@ from .config import (
     DEFAULT_CPU_VRAM_MB,
 )
 
-from .job_context import JobContext
-from .p2p_protocol import P2PProtocol
-from .p2p_server import P2PServer
-from .model_manager import ModelManager
-from .layer_processor import (
+from client.worker.job_context import JobContext
+from client.worker.p2p_protocol import P2PProtocol
+from client.worker.p2p_server import P2PServer
+from client.worker.model_manager import ModelManager
+from client.worker.layer_processor import (
     DenseLayerProcessor,
     MoERouterProcessor,
     MoEExpertProcessor,
 )
-from .layer_loader import LayerLoader
+from client.worker.layer_loader import LayerLoader
 
 __all__ = [
     # Config

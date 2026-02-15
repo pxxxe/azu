@@ -121,7 +121,7 @@ class MoEScheduler:
             # Was 5. Reduced to 2 to prevent "Clumping" (filling one worker to 99% before moving).
             # We want to spread the load across the 8 workers to reduce OOM risk.
             if previous_worker_id and w.pubkey == previous_worker_id:
-                s += 2
+                s += 5
 
             return s
 

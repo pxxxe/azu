@@ -8,4 +8,6 @@
 - [ ] OpenAI adapter compatibility
 - [ ] Instantiate worker as object (azu lib)
 - [ ] Client wrapper for worker object
+- [ ] Make compatible with serverless architecture
 - [ ] License
+- [ ] Protect registry model sharding (only authorized users can call registry to shard models)

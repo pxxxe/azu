@@ -12,8 +12,8 @@ from typing import Dict, Optional, Any
 import torch
 from transformers import AutoTokenizer, AutoConfig
 
-from .layer_loader import LayerLoader
-from .config import LAYER_CACHE_DIR
+from client.worker.layer_loader import LayerLoader
+from client.worker.config import LAYER_CACHE_DIR
 
 
 # Try to import Rotary Embeddings for v5 Compatibility

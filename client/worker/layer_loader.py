@@ -15,7 +15,7 @@ import aiohttp
 from transformers import AutoConfig
 from safetensors.torch import load_file as load_safetensors
 
-from .config import LAYER_CACHE_DIR, MAX_DOWNLOAD_WORKERS, MAX_DOWNLOAD_SEMAPHORE
+from client.worker.config import LAYER_CACHE_DIR, MAX_DOWNLOAD_WORKERS, MAX_DOWNLOAD_SEMAPHORE
 
 
 class LayerLoader:

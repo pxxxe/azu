@@ -14,6 +14,8 @@ from config import P2P_TIMEOUT
 from job_context import JobContext
 from model_manager import ModelManager
 from layer_loader import LayerLoader
+from transformers import DynamicCache
+
 
 
 class DenseLayerProcessor:
@@ -468,7 +470,3 @@ class MoEExpertProcessor:
                 break
 
         print(f"👋 [Job {job_id[:8]}] Expert {expert_idx} (Layer {layer_idx}) exiting, processed {tokens_processed} total tokens")
-
-
-# Import at module level for DynamicCache
-from transformers import DynamicCache

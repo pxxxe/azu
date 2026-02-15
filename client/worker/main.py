@@ -18,6 +18,7 @@ from transformers import DynamicCache
 
 from config import (
     SCHEDULER_URL,
+    REGISTRY_URL,
     P2P_PORT,
     DEFAULT_CPU_VRAM_MB,
 )
@@ -35,7 +36,7 @@ class MoEWorker:
 
     def __init__(self):
         # Initialize components
-        self.loader = LayerLoader(SCHEDULER_URL.replace("ws://", "http://").replace("/ws/worker", ""))
+        self.loader = LayerLoader(REGISTRY_URL)
         self.model_manager = ModelManager(self.loader)
         self.device = self.loader.device
         self.dtype = self.loader.dtype

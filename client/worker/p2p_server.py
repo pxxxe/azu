@@ -9,6 +9,7 @@ import sys
 import traceback
 import urllib.request
 from typing import Dict, Optional, List, Callable, Any
+import torch
 
 import aiohttp
 from aiohttp import web, ClientSession, TCPConnector, ClientTimeout
@@ -377,7 +378,3 @@ class P2PServer:
                 await asyncio.sleep(0.2)
 
         print(f"❌ Failed to send to {url}")
-
-
-# Import torch at module level for type hints
-import torch

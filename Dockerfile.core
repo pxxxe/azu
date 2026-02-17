@@ -7,16 +7,19 @@ WORKDIR /app
 
 ENV PYTHONUNBUFFERED=1
 
+# Copy all requirements files including shared (payment dependencies)
 COPY registry/requirements.txt reqs_reg.txt
 COPY scheduler/requirements.txt reqs_sched.txt
 COPY api/requirements.txt reqs_api.txt
+COPY shared/requirements.txt reqs_shared.txt
 
 # --- FIX IS HERE ---
 # 1. Install CPU-only Torch first (avoids downloading 4GB of CUDA libs)
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
 # 2. Then install the rest (pip will see torch is already installed and skip the huge download)
-RUN pip install --no-cache-dir -r reqs_reg.txt -r reqs_sched.txt -r reqs_api.txt
+#    Includes shared requirements for payment layer (web3, eth-account, solders)
+RUN pip install --no-cache-dir -r reqs_reg.txt -r reqs_sched.txt -r reqs_api.txt -r reqs_shared.txt
 
 COPY . .
 

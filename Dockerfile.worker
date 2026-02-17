@@ -13,13 +13,13 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements
+# Copy requirements (includes payment deps: web3, eth-account)
 COPY client/worker/requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
-# Copy shared library
+# Copy shared library (payment abstraction layer)
 COPY shared/ ./shared/
 
 # Copy worker code

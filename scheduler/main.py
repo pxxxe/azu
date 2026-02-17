@@ -7,9 +7,11 @@ import aiohttp
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 from fastapi import FastAPI, WebSocket
-from shared.config import settings
+from shared import get_config
 
-r = redis.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, decode_responses=True)
+# Initialize config
+config = get_config()
+r = redis.Redis(host=config.redis.host, port=config.redis.port, decode_responses=True)
 app = FastAPI()
 
 @dataclass
@@ -23,6 +25,8 @@ class WorkerState:
     vram_used_mb: int = 0
     last_heartbeat: float = field(default_factory=time.time)
     cached_layers: Set[str] = field(default_factory=set)
+    # Payment address for receiving earnings - ADDED FOR PAYMENTS
+    payment_address: Optional[str] = None
 
 @dataclass
 class JobState:
@@ -43,8 +47,9 @@ class MoEScheduler:
         wid = specs['pubkey']
         vram = specs.get('vram_mb', 24000)
         # Init actual_free to total until first heartbeat
-        self.workers[wid] = WorkerState(pubkey=wid, ws=ws, specs=specs, vram_total_mb=vram, actual_free_mb=vram)
-        print(f"✅ Registered: {wid} | VRAM: {vram}MB")
+        payment_addr = specs.get('payment_address')  # EXTRACT PAYMENT ADDRESS
+        self.workers[wid] = WorkerState(pubkey=wid, ws=ws, specs=specs, vram_total_mb=vram, actual_free_mb=vram, payment_address=payment_addr)
+        print(f"✅ Registered: {wid} | VRAM: {vram}MB | Payment: {payment_addr[:20] if payment_addr else 'None'}...")
         return wid
 
     async def unregister_worker(self, wid: str):
@@ -449,10 +454,84 @@ class MoEScheduler:
         job_id = data.get('job_id')
         if data.get('status') == 'completed':
             print(f"🎉 Job {job_id} Finished")
+
+            # =====================================================
+            # PAYMENT PROCESSING - Credit workers for completed work
+            # =====================================================
+            await self._process_worker_payment(job_id)
+
             await r.setex(f"result:{job_id}", 3600, json.dumps(data))
             if job_id in self.active_jobs: del self.active_jobs[job_id]
 
-scheduler = MoEScheduler(settings.REGISTRY_URL if hasattr(settings, 'REGISTRY_URL') else "http://localhost:8002")
+    async def _process_worker_payment(self, job_id: str):
+        """
+        Credit workers for completed work.
+
+        This is where workers get paid! The scheduler credits the worker's
+        internal ledger balance based on the work they completed.
+        """
+        try:
+            # Import payment modules
+            from shared.payments import get_payment_provider
+            from shared.ledger import get_ledger
+            from shared.economics import calculate_worker_payments, WORKER_SHARE
+            from shared import TransactionType
+
+            # Get job details
+            job = self.active_jobs.get(job_id)
+            if not job:
+                return
+
+            # Get topology and calculate payments
+            topology = job.topology
+
+            # Group workers by payment address
+            worker_layers: Dict[str, List[int]] = {}
+            for node in topology:
+                wid = node['worker_id']
+                w = self.workers.get(wid)
+                if w and w.payment_address:
+                    if w.payment_address not in worker_layers:
+                        worker_layers[w.payment_address] = []
+                    worker_layers[w.payment_address].append(node['layer_idx'])
+
+            if not worker_layers:
+                print(f"⚠️ No workers with payment addresses for job {job_id}")
+                return
+
+            # Calculate payments per worker
+            est_tokens = job.max_tokens * 2  # Rough estimate
+            worker_payments = calculate_worker_payments(
+                worker_layers=worker_layers,
+                num_tokens=est_tokens,
+                is_moe=False,
+                num_experts=1
+            )
+
+            # Credit each worker
+            ledger = await get_ledger(r)
+            for payment in worker_payments:
+                try:
+                    await ledger.credit(
+                        address=payment.worker_address,
+                        amount=payment.amount,
+                        transaction_type=TransactionType.WORKER_CREDIT,
+                        job_id=job_id,
+                        metadata={
+                            "layers": worker_layers.get(payment.worker_address, []),
+                            "tokens": est_tokens
+                        }
+                    )
+                    print(f"💰 Credited worker {payment.worker_address[:20]}... with {payment.amount:.8f}")
+                except Exception as e:
+                    print(f"❌ Failed to credit worker: {e}")
+
+            print(f"✅ Worker payments processed for job {job_id}")
+
+        except Exception as e:
+            print(f"⚠️ Worker payment processing failed: {e}")
+
+scheduler = MoEScheduler(f"http://{config.registry.host}:{config.registry.port}")
 
 @app.on_event("startup")
 async def startup_event():

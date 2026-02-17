@@ -21,11 +21,19 @@ from config import (
     REGISTRY_URL,
     P2P_PORT,
     DEFAULT_CPU_VRAM_MB,
+    PAYMENT_PROVIDER,
 )
 from layer_loader import LayerLoader
 from model_manager import ModelManager
 from job_context import JobContext
 from p2p_server import P2PServer
+
+# Import wallet module for payments
+try:
+    from wallet import get_worker_wallet
+    HAS_WALLET = True
+except ImportError:
+    HAS_WALLET = False
 
 
 class MoEWorker:
@@ -35,6 +43,17 @@ class MoEWorker:
     """
 
     def __init__(self):
+        # Initialize wallet for payments FIRST
+        self.wallet = None
+        self.payment_address = None
+        if HAS_WALLET:
+            try:
+                self.wallet = get_worker_wallet(provider_type=PAYMENT_PROVIDER)
+                self.payment_address = self.wallet.address
+                print(f"💰 Worker payment address: {self.payment_address}")
+            except Exception as e:
+                print(f"⚠️ Failed to initialize wallet: {e}")
+
         # Initialize components
         self.loader = LayerLoader(REGISTRY_URL)
         self.model_manager = ModelManager(self.loader)
@@ -525,7 +544,9 @@ class MoEWorker:
                             "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
                             "vram_mb": self.vram_total_mb,
                             "p2p_url": p2p_url,
-                            "capabilities": ["dense", "moe_router", "moe_expert"]
+                            "capabilities": ["dense", "moe_router", "moe_expert"],
+                            # Payment address for receiving earnings
+                            "payment_address": self.payment_address
                         }
                     }))
                     print(f"✅ Connected & Registered")

@@ -9,14 +9,15 @@ import asyncio
 import sys
 import shutil
 from pathlib import Path
-from shared.config import settings
-from .layer_storage import LayerStore
+from shared import get_config
 
 # Setup logging flush
 sys.stdout.reconfigure(line_buffering=True)
 
+config = get_config()
+
 app = FastAPI()
-r = redis.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, decode_responses=True)
+r = redis.Redis(host=config.redis.host, port=config.redis.port, decode_responses=True)
 
 # Initialize Store safely
 try:
@@ -61,7 +62,7 @@ async def shard_model(req: ShardRequest, background_tasks: BackgroundTasks):
     await r.set(f"shard_status:{req.model_id}", "processing")
 
     # Offload to background task so API doesn't time out
-    background_tasks.add_task(background_shard_task, req.model_id, settings.HF_TOKEN)
+    background_tasks.add_task(background_shard_task, req.model_id, config.huggingface.token)
 
     return {"status": "processing", "job_id": req.model_id}
 
@@ -139,3 +140,7 @@ async def health():
         "storage_path": str(store.storage_path),
         "storage_exists": store.storage_path.exists()
     }
+
+
+# Import LayerStore at the end to avoid circular imports
+from .layer_storage import LayerStore

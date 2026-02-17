@@ -1,6 +1,6 @@
 # azu
 
-> **"Go forth and multiply."**
+**"Go forth and multiply."**
 
 **Beta** — Decentralised inference network. Consumer GPU hardware, pooled.
 

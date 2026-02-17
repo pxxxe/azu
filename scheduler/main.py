@@ -528,8 +528,70 @@ class MoEScheduler:
 
             print(f"✅ Worker payments processed for job {job_id}")
 
+            # =====================================================
+            # ON-CHAIN PAYOUT - Transfer real tokens to workers
+            # =====================================================
+            await self._process_worker_payouts(worker_payments)
+
         except Exception as e:
             print(f"⚠️ Worker payment processing failed: {e}")
+
+    async def _process_worker_payouts(self, worker_payments: List):
+        """
+        Process on-chain payouts to workers when threshold is exceeded.
+
+        This is where real tokens get sent from the platform wallet
+        to the worker's external address on-chain.
+        """
+        try:
+            from shared.payments import get_payment_provider
+            from shared.ledger import get_ledger
+
+            # Get payment provider
+            provider = get_payment_provider()
+            ledger = await get_ledger(r)
+
+            # Check each worker's balance
+            for payment in worker_payments:
+                worker_address = payment.worker_address
+                balance = await ledger.get_balance(worker_address)
+
+                # Check if balance exceeds payout threshold
+                payout_threshold = config.payment.payout_threshold
+
+                if balance.available >= payout_threshold:
+                    try:
+                        print(f"💸 Initiating on-chain payout to {worker_address[:20]}... ({balance.available:.6f} tokens)")
+
+                        # Execute on-chain transfer
+                        payout_info = await provider.payout(
+                            recipient_address=worker_address,
+                            amount=balance.available,
+                            memo=f"Payout for work completed"
+                        )
+
+                        if payout_info.status == "confirmed":
+                            # Deduct from internal ledger after successful on-chain transfer
+                            await ledger.debit(
+                                address=worker_address,
+                                amount=balance.available,
+                                transaction_type=TransactionType.PAYOUT,
+                                metadata={
+                                    "tx_hash": payout_info.tx_hash,
+                                    "status": payout_info.status
+                                }
+                            )
+                            print(f"✅ Payout confirmed: {payout_info.tx_hash[:20]}...")
+                        else:
+                            print(f"⚠️ Payout pending: {payout_info.tx_hash[:20]}...")
+
+                    except Exception as e:
+                        print(f"❌ Payout failed for {worker_address[:20]}...: {e}")
+                else:
+                    print(f"💰 Worker {worker_address[:20]}... balance ({balance.available:.6f}) below threshold ({payout_threshold})")
+
+        except Exception as e:
+            print(f"⚠️ Payout processing failed: {e}")
 
 scheduler = MoEScheduler(f"http://{config.registry.host}:{config.registry.port}")
 

@@ -40,7 +40,7 @@ class PaymentConfig:
     # Payout settings
     payout_threshold: float = 0.001
     # Hyperliquid specific
-    hyperliquid_rpc_url: str = "https://api.hyperliquid.xyz"
+    hyperliquid_rpc_url: str = "https://rpc.hyperliquid.xyz/evm"
     hyperliquid_address: Optional[str] = None
     # Solana specific
     solana_rpc_url: str = "https://api.mainnet-beta.solana.com"

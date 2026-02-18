@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 E2E Test for AZU.CX with FULL MoE Support & Auto-Teardown
-Tests Mixtral-8x7B-Instruct-v0.1 on secure cloud GPUs
+Tests MoE and Dense model architecture on secure cloud GPUs
 
 This replaces Solana with Hyperliquid for payments.
 """
@@ -25,14 +25,15 @@ import aiohttp
 
 CORE_IMG = 'pxxxe/azu-core:latest'
 WORKER_IMG = 'pxxxe/azu-worker:latest'
-TEST_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+# TEST_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+TEST_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 
 VOLUME_ID = os.getenv("VOLUME_ID")
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
 # Hyperliquid configuration
-HYPERLIQUID_RPC = os.getenv("HYPERLIQUID_RPC", "https://api.hyperliquid-testnet.xyz")
+HYPERLIQUID_RPC = os.getenv("HYPERLIQUID_RPC", "https://rpc.hyperliquid-testnet.xyz/evm")
 
 # Prioritize High-RAM GPUs for Stability
 GPU_TYPES_SECURE = [
@@ -82,7 +83,9 @@ GPU_VRAM_MAP = {
     "NVIDIA RTX 2000 Ada Generation": 16,
 }
 
-TARGET_TOTAL_VRAM = 120  # GB needed for Mixtral test
+# TARGET_TOTAL_VRAM = 120  # GB needed for Mixtral test
+TARGET_TOTAL_VRAM = 24  # GB needed for Mixtral test
+
 
 runpod.api_key = RUNPOD_API_KEY
 

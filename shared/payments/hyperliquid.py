@@ -53,7 +53,10 @@ class HyperliquidProvider(PaymentProvider):
             max_retries: Maximum retry attempts for failed requests
             retry_delay: Delay between retries in seconds
         """
-        self.rpc_url = rpc_url
+        # FIX: Hyperliquid EVM JSON-RPC lives at /evm, not root
+        base = rpc_url.rstrip("/")
+        self.rpc_url = base if base.endswith("/evm") else f"{base}/evm"
+
         self.confirmations_required = confirmations_required
         self.max_retries = max_retries
         self.retry_delay = retry_delay
@@ -80,7 +83,7 @@ class HyperliquidProvider(PaymentProvider):
         self._address = address.lower() if address else self.account.address.lower()
 
         # Initialize Web3 connection
-        self.w3 = Web3(Web3.HTTPProvider(rpc_url))
+        self.w3 = Web3(Web3.HTTPProvider(self.rpc_url))
 
     @property
     def provider_type(self) -> PaymentProviderType:
@@ -89,6 +92,13 @@ class HyperliquidProvider(PaymentProvider):
     @property
     def chain_symbol(self) -> str:
         return "HYPE"
+
+    def should_payout(self, amount: float) -> bool:
+        """
+        Hyperliquid has no gas fees — always pay out immediately.
+        No threshold batching needed unlike Solana/EVM chains.
+        """
+        return True
 
     def get_deposit_address(self) -> str:
         """Returns the Hyperliquid deposit address."""
@@ -289,29 +299,31 @@ class HyperliquidProvider(PaymentProvider):
             chain_id = await self._make_request("eth_chainId")
             chain_id_int = int(chain_id, 16)
 
-            # Get gas price
-            gas_price = await self._make_request("eth_gasPrice")
-            gas_price_int = int(gas_price, 16)
-
-            # Build transaction
+            # FIX: Hyperliquid has no gas fees — removed eth_gasPrice fetch
             tx = {
                 "nonce": nonce_int,
-                "gasPrice": gas_price_int,
-                "gas": 21000,  # Standard gas for native transfer
-                "to": recipient,
+                "gasPrice": 0,      # No gas fees on Hyperliquid
+                "gas": 21000,       # Standard gas for native transfer
+                "to": Web3.to_checksum_address(recipient),
                 "value": amount_wei,
                 "chainId": chain_id_int,
+                "data": b"",
             }
 
             # Sign transaction
             signed_tx = self.account.sign_transaction(tx)
 
+            # FIX: web3.py v6 renamed rawTransaction -> raw_transaction
+            # FIX: must include 0x prefix or eth_sendRawTransaction rejects it
+            raw_hex = "0x" + signed_tx.raw_transaction.hex()
+
             # Send transaction
-            tx_hash = await self._make_request("eth_sendRawTransaction", [signed_tx.rawTransaction.hex()])
+            tx_hash = await self._make_request("eth_sendRawTransaction", [raw_hex])
 
             # Wait for confirmation
+            # Hyperliquid finalises in ~1s so 15s is plenty
             confirmed = False
-            for _ in range(30):  # Wait up to 30 seconds
+            for _ in range(15):
                 await asyncio.sleep(1)
                 receipt = await self._make_request("eth_getTransactionReceipt", [tx_hash])
                 if receipt:
@@ -398,7 +410,7 @@ class HyperliquidTestnetProvider(HyperliquidProvider):
 
     def __init__(
         self,
-        rpc_url: str = "https://api.hyperliquid-testnet.xyz",
+        rpc_url: str = "https://rpc.hyperliquid-testnet.xyz/evm",
         address: str = None,
         private_key: str = None,
         confirmations_required: int = 1

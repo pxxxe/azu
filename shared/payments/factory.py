@@ -102,7 +102,7 @@ def _create_hyperliquid_provider(
     # Get configuration from environment or overrides
     rpc_url = config.get(
         "rpc_url",
-        os.environ.get("HYPERLIQUID_RPC_URL", "https://api.hyperliquid.xyz")
+        os.environ.get("HYPERLIQUID_RPC_URL", "https://rpc.hyperliquid.xyz/evm")
     )
     address = config.get(
         "address",

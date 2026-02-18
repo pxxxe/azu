@@ -114,10 +114,10 @@ class InternalLedger:
 
         return AccountBalance(
             address=address,
-            available=float(data.get(b"available", 0)),
-            locked=float(data.get(b"locked", 0)),
-            total=float(data.get(b"total", 0)),
-            last_updated=int(data.get(b"last_updated", 0))
+            available=float(data.get("available", 0)),
+            locked=float(data.get("locked", 0)),
+            total=float(data.get("total", 0)),
+            last_updated=int(data.get("last_updated", 0))
         )
 
     async def credit(

@@ -593,7 +593,7 @@ class MoEScheduler:
         except Exception as e:
             print(f"⚠️ Payout processing failed: {e}")
 
-scheduler = MoEScheduler(f"http://{config.registry.host}:{config.registry.port}")
+scheduler = MoEScheduler(f"http://localhost:{config.registry.port}")
 
 @app.on_event("startup")
 async def startup_event():

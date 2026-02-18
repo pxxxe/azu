@@ -315,7 +315,7 @@ class HyperliquidProvider(PaymentProvider):
 
             # FIX: web3.py v6 renamed rawTransaction -> raw_transaction
             # FIX: must include 0x prefix or eth_sendRawTransaction rejects it
-            raw_hex = "0x" + signed_tx.raw_transaction.hex()
+            raw_hex = signed_tx.raw_transaction.to_0x_hex()
 
             # Send transaction
             tx_hash = await self._make_request("eth_sendRawTransaction", [raw_hex])

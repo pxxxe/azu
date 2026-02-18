@@ -117,7 +117,7 @@ class DenseLayerProcessor:
 
                     # Prepare positional args
                     pos_emb, attn_mask, pos_ids = self.model_manager.prepare_inputs(
-                        hidden_states, job_context.kv_cache
+                        hidden_states, job_context.kv_cache, layer_idx
                     )
 
                     with torch.no_grad():
@@ -257,7 +257,7 @@ class MoERouterProcessor:
 
                 # Prepare positional args
                 pos_emb, attn_mask, pos_ids = self.model_manager.prepare_inputs(
-                    hidden_states, job_context.kv_cache
+                    hidden_states, job_context.kv_cache, layer_idx
                 )
 
                 # A. Input Residual & Norm

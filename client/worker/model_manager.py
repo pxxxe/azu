@@ -211,27 +211,48 @@ class ModelManager:
 
         return self.tokenizer
 
-    def prepare_inputs(self, hidden_states: torch.Tensor, past_kv: Any) -> tuple:
+    def _get_past_len(self, past_kv: Any, layer_idx: int) -> int:
+        """
+        Get the number of tokens already cached for a specific layer.
+        Uses layer_idx to query per-layer cache length, avoiding cross-layer
+        contamination when DynamicCache is shared across concurrent layer tasks.
+        """
+        if past_kv is None:
+            return 0
+
+        # DynamicCache (transformers >= 4.38): query per-layer length
+        if hasattr(past_kv, 'get_seq_length'):
+            try:
+                return past_kv.get_seq_length(layer_idx)
+            except (TypeError, IndexError):
+                # Older DynamicCache doesn't accept layer_idx — return 0 rather
+                # than calling with no args, which returns wrong aggregate value
+                return 0
+
+        # Legacy tuple KV: ((k0, v0), (k1, v1), ...)
+        if isinstance(past_kv, tuple) and len(past_kv) > layer_idx:
+            layer_kv = past_kv[layer_idx]
+            if isinstance(layer_kv, tuple) and len(layer_kv) >= 1:
+                key_tensor = layer_kv[0]
+                if torch.is_tensor(key_tensor) and key_tensor.dim() >= 3:
+                    return key_tensor.shape[2]
+
+        return 0
+
+    def prepare_inputs(self, hidden_states: torch.Tensor, past_kv: Any, layer_idx: int = 0) -> tuple:
         """
         Prepare inputs for transformer layer: position embeddings, attention mask, position IDs.
 
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden]
             past_kv: Past key/value cache
+            layer_idx: Index of the layer being processed, used to get correct per-layer past length
 
         Returns:
             Tuple of (position_embeddings, attention_mask, position_ids)
         """
         seq_len = hidden_states.shape[1]
-        past_len = 0
-
-        if past_kv is not None:
-            # Handle standard tuple kv
-            if isinstance(past_kv, tuple) and len(past_kv) > 0:
-                past_len = past_kv[0].shape[2]
-            # Handle HuggingFace Cache object (best effort)
-            elif hasattr(past_kv, 'get_seq_length'):
-                past_len = past_kv.get_seq_length()
+        past_len = self._get_past_len(past_kv, layer_idx)
 
         position_ids = torch.arange(
             past_len, past_len + seq_len, dtype=torch.long, device=self.device

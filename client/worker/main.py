@@ -231,7 +231,7 @@ class MoEWorker:
                         self.model_manager._print_vram_stats(f"Loaded Dense {layer_idx}", ctx)
 
                     pos_emb, attn_mask, pos_ids = self.model_manager.prepare_inputs(
-                        hidden_states, ctx.kv_cache
+                        hidden_states, ctx.kv_cache, layer_idx
                     )
 
                     with torch.no_grad():
@@ -355,7 +355,7 @@ class MoEWorker:
                 self.model_manager._print_vram_stats(f"Loaded Shared {layer_idx}", ctx)
 
                 pos_emb, attn_mask, pos_ids = self.model_manager.prepare_inputs(
-                    hidden_states, ctx.kv_cache
+                    hidden_states, ctx.kv_cache, layer_idx
                 )
 
                 residual = hidden_states

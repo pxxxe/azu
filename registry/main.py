@@ -10,6 +10,7 @@ import sys
 import shutil
 from pathlib import Path
 from shared import get_config
+from layer_storage import LayerStore
 
 # Setup logging flush
 sys.stdout.reconfigure(line_buffering=True)
@@ -62,7 +63,7 @@ async def shard_model(req: ShardRequest, background_tasks: BackgroundTasks):
     await r.set(f"shard_status:{req.model_id}", "processing")
 
     # Offload to background task so API doesn't time out
-    background_tasks.add_task(background_shard_task, req.model_id, config.huggingface.token)
+    background_tasks.add_task(background_shard_task, req.model_id, config.registry.hf_token)
 
     return {"status": "processing", "job_id": req.model_id}
 
@@ -143,4 +144,3 @@ async def health():
 
 
 # Import LayerStore at the end to avoid circular imports
-from .layer_storage import LayerStore

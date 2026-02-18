@@ -245,12 +245,12 @@ async def transfer_hyperliquid(from_account, to_address, amount_eth, rpc_url):
         'gas': 21000,  # Standard gas for native transfer
         'to': to_address,
         'value': int(amount_eth * 1e18),  # Convert ETH to wei
-        'chainId': 996,  # Hyperliquid chain ID
+        'chainId': 998,  # Hyperliquid chain ID
     }
 
     # Sign and send
     signed_tx = from_account.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+    tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
 
     print(f"      📤 Transfer sent: {tx_hash.hex()}")
 
@@ -298,12 +298,10 @@ def main():
         # Generate new wallets for the test
         platform = Account.create()
         scheduler = Account.create()
-        user = Account.create()
 
         print(f"   👤 Funder: {funder.address}")
         print(f"   💵 Platform: {platform.address}")
         print(f"   📋 Scheduler: {scheduler.address}")
-        print(f"   👤 User: {user.address}")
 
         # Check funder balance (async)
         async def check_funder_balance():
@@ -445,11 +443,10 @@ def main():
         log_section("🧪 4. Running Inference")
 
         # Deposit (using Hyperliquid transfer)
+        # funder IS the user — they send the tx and submit jobs under the same address
         async def do_deposit():
             print("   💳 Sending Deposit (Hyperliquid)...")
 
-            # For Hyperliquid testnet, we simulate deposit by sending native token
-            # In production, this would be a real Hyperliquid transfer
             amount = 0.01  # Small amount for testing
 
             try:
@@ -463,20 +460,19 @@ def main():
                 # Wait for confirmation
                 await asyncio.sleep(10)
 
-                # Notify API
+                # Notify API — sender and user are both funder
                 requests.post(f"{api_url}/deposit", json={
                     "tx_sig": tx_hash,
-                    "user_pubkey": user.address
+                    "user_pubkey": funder.address  # FIX: was user.address, but funder sent the tx
                 })
                 print("   ✅ Deposit Registered")
 
             except Exception as e:
                 print(f"   ⚠️ Deposit failed: {e}")
                 print(f"   ℹ️ Simulating deposit for testing...")
-                # For testing without real funds, simulate the deposit
                 requests.post(f"{api_url}/deposit", json={
                     "tx_sig": "0x" + "00" * 32,
-                    "user_pubkey": user.address
+                    "user_pubkey": funder.address
                 })
                 print("   ✅ Simulated Deposit Registered")
 
@@ -485,24 +481,14 @@ def main():
         # Submit Job
         print(f"   🧠 Submitting Prompt...")
         sub_res = requests.post(f"{api_url}/submit", json={
-            "user_pubkey": user.address,
+            "user_pubkey": funder.address,  # FIX: was user.address, must match deposit
             "model_id": TEST_MODEL,
             "prompt": "What is the capital of France?",
             "est_tokens": 50
         })
 
         if sub_res.status_code != 200:
-            # If submit fails, might need more balance - try with user wallet
-            print(f"   ⚠️ Submit failed, trying with funded account...")
-            sub_res = requests.post(f"{api_url}/submit", json={
-                "user_pubkey": funder.address,
-                "model_id": TEST_MODEL,
-                "prompt": "What is the capital of France?",
-                "est_tokens": 50
-            })
-
-            if sub_res.status_code != 200:
-                raise Exception(f"Submit failed: {sub_res.text}")
+            raise Exception(f"Submit failed: {sub_res.text}")
 
         job_id = sub_res.json()['job_id']
         print(f"   ✅ Job ID: {job_id}")

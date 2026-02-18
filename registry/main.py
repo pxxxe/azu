@@ -10,7 +10,7 @@ import sys
 import shutil
 from pathlib import Path
 from shared import get_config
-from layer_storage import LayerStore
+from .layer_storage import LayerStore
 
 # Setup logging flush
 sys.stdout.reconfigure(line_buffering=True)

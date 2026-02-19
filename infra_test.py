@@ -438,7 +438,7 @@ def main():
         time.sleep(10)
 
         # ==========================================
-        # 4 & 5. Deposit & Inference
+        # 4. Deposit & Inference (raw HTTP — baseline)
         # ==========================================
         log_section("🧪 4. Running Inference")
 
@@ -507,6 +507,61 @@ def main():
                 if i%5==0: print(f"      Status: {status}...")
             except: pass
             time.sleep(5)
+
+        # ==========================================
+        # 5. OpenAI Compat Test (ai_sdk)
+        # ==========================================
+        log_section("🤖 5. OpenAI Compat Test (ai_sdk)")
+
+        try:
+            from ai_sdk import openai as azu_openai, generate_text, stream_text
+
+            # ai_sdk's openai() reads OPENAI_BASE_URL and OPENAI_API_KEY from
+            # the environment via the underlying openai Python client.
+            # The wallet address doubles as the API key.
+            os.environ["OPENAI_BASE_URL"] = f"{api_url}/v1"
+            os.environ["OPENAI_API_KEY"] = funder.address
+
+            azu_model = azu_openai(TEST_MODEL)
+
+            # --- Non-streaming ---
+            print("   🧠 generate_text (non-streaming)...")
+            res = generate_text(
+                model=azu_model,
+                prompt="What is the capital of France? Answer in one word.",
+                max_tokens=32,
+            )
+            print(f"   ✅ Response : {res.text}")
+            print(f"   📊 Usage   : {res.usage}")
+
+            assert res.text, "generate_text returned empty response"
+
+            # --- Streaming ---
+            # stream_text.text_stream is an async iterator
+            # print("\n   🌊 stream_text (streaming)...")
+
+            # async def _run_stream():
+            #     stream_res = stream_text(
+            #         model=azu_model,
+            #         prompt="Count from 1 to 5, one number per line.",
+            #         max_tokens=64,
+            #     )
+            #     chunks = []
+            #     async for chunk in stream_res.text_stream:
+            #         chunks.append(chunk)
+            #         print(chunk, end="", flush=True)
+            #     print()
+            #     return chunks
+
+            # chunks = asyncio.run(_run_stream())
+            # assert chunks, "stream_text yielded no chunks"
+            # print("   ✅ Streaming OK")
+
+        except ImportError:
+            print("   ⚠️  ai_sdk not installed — skipping (uv add ai-sdk-python)")
+        except Exception as e:
+            print(f"   ❌ ai_sdk test failed: {e}")
+            traceback.print_exc()
 
     except KeyboardInterrupt:
         print("\n\n🛑 INTERRUPTED BY USER")

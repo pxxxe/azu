@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from shared.config import get_config
 from shared.payments import get_payment_provider
 from shared.ledger import get_ledger, TransactionType
+from .openai_adapter import mount_openai_adapter
 
 # ============================================================================
 # Pydantic Models
@@ -214,6 +215,13 @@ async def root():
 async def health():
     """Health check endpoint."""
     return {"status": "healthy"}
+
+
+# ============================================================================
+# OpenAI Compatibility Layer
+# ============================================================================
+
+mount_openai_adapter(app)
 
 
 # ============================================================================

@@ -325,6 +325,7 @@ def mount_openai_adapter(app: FastAPI) -> None:
         "/v1/chat/completions",
         chat_completions,
         methods=["POST"],
+        response_model=None,
         tags=["OpenAI Compatibility"],
         summary="OpenAI-compatible chat completions",
     )

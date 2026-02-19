@@ -3,6 +3,7 @@ P2P protocol module for tensor serialization and deserialization.
 Handles binary tensor transfer between workers.
 """
 
+import base64
 import json
 import numpy as np
 import torch
@@ -163,3 +164,73 @@ class P2PProtocol:
             meta["target_layer_idx"] = target_layer_idx
 
         return meta
+
+    # -------------------------------------------------------------------------
+    # CUDA IPC — zero-copy same-machine transfer
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def tensor_to_ipc_handle(tensor: torch.Tensor) -> dict:
+        """
+        Export a CUDA IPC handle for zero-copy same-machine process transfer.
+
+        The returned dict is JSON-serializable (~200–500 bytes). The receiver
+        calls ipc_handle_to_tensor() to reconstruct the tensor directly in its
+        own CUDA context — no GPU→CPU copy, no dtype conversion, no network body.
+
+        Only valid when torch.cuda.is_available() and tensor is on CUDA.
+        Caller should fall back to tensor_to_bytes() if this raises.
+        """
+        tensor = tensor.detach().contiguous()
+        storage = tensor.untyped_storage()
+        raw = storage._share_cuda_()
+
+        # _share_cuda_() returns a tuple that may contain bytes objects.
+        # Encode bytes as base64 for JSON transport.
+        serialized = []
+        for item in raw:
+            if isinstance(item, (bytes, bytearray)):
+                serialized.append({"t": "b", "v": base64.b64encode(item).decode()})
+            else:
+                serialized.append({"t": "i", "v": item})
+
+        return {
+            "h": serialized,
+            "shape": list(tensor.shape),
+            "stride": list(tensor.stride()),
+            "dtype": str(tensor.dtype).replace("torch.", ""),
+        }
+
+    @staticmethod
+    def ipc_handle_to_tensor(handle_data: dict, target_dtype: torch.dtype) -> torch.Tensor:
+        """
+        Reconstruct a tensor from a CUDA IPC handle dict.
+
+        The resulting tensor shares CUDA memory with the sender — zero copy.
+        CUDA ref-counts the underlying allocation, so the sender's Python object
+        can be released safely once this returns.
+        """
+        raw = []
+        for item in handle_data["h"]:
+            if item["t"] == "b":
+                raw.append(base64.b64decode(item["v"]))
+            else:
+                raw.append(item["v"])
+
+        storage = torch.UntypedStorage._new_shared_cuda(*raw)
+
+        dtype_map = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+        }
+        src_dtype = dtype_map.get(handle_data["dtype"], torch.float16)
+        shape = handle_data["shape"]
+        stride = handle_data["stride"]
+
+        # Reconstruct tensor view over shared CUDA storage — zero copy.
+        # device is encoded in the storage (comes from the IPC handle).
+        out = torch.empty(shape, dtype=src_dtype, device=storage.device)
+        out.set_(storage, 0, shape, stride)
+
+        return out.to(target_dtype) if out.dtype != target_dtype else out

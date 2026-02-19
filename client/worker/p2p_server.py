@@ -5,10 +5,13 @@ Handles tensor ingress/egress, mesh handshake, and peer discovery.
 
 import asyncio
 import json
+import socket
 import sys
 import traceback
 import urllib.request
 from typing import Dict, Optional, List, Callable, Any
+from urllib.parse import urlparse
+
 import torch
 
 import aiohttp
@@ -59,6 +62,9 @@ class P2PServer:
         self.p2p_app: Optional[web.Application] = None
         self.p2p_session: Optional[ClientSession] = None
 
+        # Cache of peer URL → is_same_machine to avoid repeated DNS lookups
+        self._same_machine_cache: Dict[str, bool] = {}
+
     async def start(self) -> None:
         """Start the P2P HTTP server."""
         # MAX SIZE 1GB IS CRITICAL FOR MoE TENSORS
@@ -66,6 +72,7 @@ class P2PServer:
 
         # Register routes
         self.p2p_app.router.add_post('/tensor_in', self.handle_tensor_ingress)
+        self.p2p_app.router.add_post('/tensor_in_ipc', self.handle_tensor_ipc_ingress)
         self.p2p_app.router.add_post('/token_in', self.handle_token_ingress)
         self.p2p_app.router.add_post('/control/job_start', self.handle_job_start)
         self.p2p_app.router.add_get('/p2p/ping', self.handle_ping)
@@ -232,6 +239,57 @@ class P2PServer:
             traceback.print_exc()
             return web.Response(status=500, text=str(e))
 
+    async def handle_tensor_ipc_ingress(self, request: web.Request) -> web.Response:
+        """
+        Handle incoming CUDA IPC handle from a same-machine peer.
+        Reconstructs the tensor directly in GPU memory — zero copy.
+        """
+        try:
+            headers = request.headers
+            job_id = headers.get("x-job-id")
+            if not job_id:
+                return web.Response(status=400, text="Missing job_id")
+
+            parsed = self.protocol.parse_headers(headers)
+            msg_type = parsed["msg_type"]
+
+            # Body is a small JSON IPC handle, not tensor bytes
+            handle_data = await request.json()
+
+            # Reconstruct tensor directly in CUDA — no copy
+            tensor = self.protocol.ipc_handle_to_tensor(handle_data, self.dtype)
+
+            ctx = await self._get_context(job_id, create=True)
+
+            if ctx.topology and ctx.status == "HANDSHAKING":
+                await ctx.handshake_done.wait()
+
+            # Routing logic is identical to handle_tensor_ingress
+            if msg_type == 'input':
+                expert_idx = parsed.get("expert_idx")
+                layer_idx = parsed.get("layer_idx")
+                target_layer_idx = parsed.get("target_layer_idx")
+
+                if expert_idx is not None and layer_idx is not None:
+                    await ctx.get_expert_queue(layer_idx, expert_idx).put(tensor)
+                elif target_layer_idx is not None:
+                    await ctx.get_layer_input_queue(target_layer_idx).put(tensor)
+
+            elif msg_type == 'expert_result':
+                expert_idx = parsed.get("expert_idx")
+                layer_idx = parsed.get("layer_idx")
+                key = (layer_idx, expert_idx)
+                if key in ctx.pending_expert_requests:
+                    future = ctx.pending_expert_requests[key]
+                    if not future.done():
+                        future.set_result(tensor)
+
+            return web.Response(text="OK")
+        except Exception as e:
+            print(f"❌ [P2P] Error handling IPC ingress: {e}")
+            traceback.print_exc()
+            return web.Response(status=500, text=str(e))
+
     # -------------------------------------------------------------------------
     # Mesh Handshake
     # -------------------------------------------------------------------------
@@ -297,6 +355,44 @@ class P2PServer:
     # Send Methods
     # -------------------------------------------------------------------------
 
+    def _is_same_machine(self, peer_base_url: str) -> bool:
+        """
+        Return True if peer_base_url resolves to this machine and CUDA is available.
+
+        Used to decide whether to use CUDA IPC (zero-copy) instead of HTTP
+        tensor transfer. Results are cached to avoid repeated DNS lookups.
+
+        Won't trigger for proxy URLs (e.g. RunPod *.proxy.runpod.net) since
+        those don't resolve to the machine's own IPs — correct, because CUDA IPC
+        requires both processes to share the same physical CUDA device.
+        """
+        if not torch.cuda.is_available():
+            return False
+
+        if peer_base_url in self._same_machine_cache:
+            return self._same_machine_cache[peer_base_url]
+
+        result = False
+        try:
+            parsed = urlparse(peer_base_url)
+            peer_ip = socket.gethostbyname(parsed.hostname)
+
+            if peer_ip.startswith("127."):
+                result = True
+            else:
+                own_ips: set = set()
+                try:
+                    for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                        own_ips.add(info[4][0])
+                except Exception:
+                    pass
+                result = peer_ip in own_ips
+        except Exception:
+            result = False
+
+        self._same_machine_cache[peer_base_url] = result
+        return result
+
     async def send_tensor(
         self,
         url: str,
@@ -305,32 +401,19 @@ class P2PServer:
     ) -> None:
         """
         Send tensor as raw binary body with metadata in headers.
-        Includes loopback optimization.
+
+        Priority order — checked before any serialization:
+          1. Loopback (same process / same P2P URL) → direct queue put, zero overhead
+          2. Same machine (different process, same physical GPU host) → CUDA IPC,
+             zero-copy GPU-to-GPU via shared CUDA memory handle (~200 byte payload)
+          3. Cross-machine → existing binary HTTP transfer (unchanged)
         """
-        # 1. Loopback Check
         my_p2p = self.get_p2p_url().rstrip("/")
         target_base = url.replace("/tensor_in", "").rstrip("/")
 
-        # Convert tensor to bytes
-        data_bytes, dtype_str, shape_json = self.protocol.tensor_to_bytes(tensor)
-
-        # Prepare headers
-        headers = {
-            "x-job-id": payload_meta["job_id"],
-            "x-msg-type": payload_meta.get("type", "input"),
-            "x-dtype": dtype_str,
-            "x-shape": shape_json
-        }
-
-        # Add routing fields
-        if "expert_idx" in payload_meta:
-            headers["x-expert-idx"] = str(payload_meta["expert_idx"])
-        if "layer_idx" in payload_meta:
-            headers["x-layer-idx"] = str(payload_meta["layer_idx"])
-        if "target_layer_idx" in payload_meta and payload_meta["target_layer_idx"] is not None:
-            headers["x-target-layer-idx"] = str(payload_meta["target_layer_idx"])
-
-        # Loopback optimization - skip HTTP
+        # ------------------------------------------------------------------
+        # 1. Loopback — direct queue injection, no serialization at all
+        # ------------------------------------------------------------------
         if my_p2p == target_base:
             try:
                 ctx = await self._get_context(payload_meta['job_id'], create=True)
@@ -362,7 +445,62 @@ class P2PServer:
                 print(f"❌ Local P2P Error: {e}")
                 return
 
-        # Network Transfer (Binary)
+        # ------------------------------------------------------------------
+        # 2. Same-machine IPC — CUDA shared memory, zero GPU→CPU copy
+        # ------------------------------------------------------------------
+        if self._is_same_machine(target_base):
+            try:
+                handle_data = self.protocol.tensor_to_ipc_handle(tensor)
+
+                headers = {
+                    "x-job-id": payload_meta["job_id"],
+                    "x-msg-type": payload_meta.get("type", "input"),
+                    # dtype/shape are encoded inside handle_data — headers kept
+                    # for routing parity with handle_tensor_ipc_ingress
+                    "x-dtype": handle_data["dtype"],
+                    "x-shape": json.dumps(handle_data["shape"]),
+                }
+                if "expert_idx" in payload_meta:
+                    headers["x-expert-idx"] = str(payload_meta["expert_idx"])
+                if "layer_idx" in payload_meta:
+                    headers["x-layer-idx"] = str(payload_meta["layer_idx"])
+                if "target_layer_idx" in payload_meta and payload_meta["target_layer_idx"] is not None:
+                    headers["x-target-layer-idx"] = str(payload_meta["target_layer_idx"])
+
+                ipc_url = f"{target_base}/tensor_in_ipc"
+                session = await self._get_p2p_session()
+
+                async with session.post(
+                    ipc_url,
+                    json=handle_data,
+                    headers=headers,
+                ) as resp:
+                    if resp.status == 200:
+                        return
+                    print(f"   ⚠️ IPC send rejected {resp.status}, falling through to binary transfer")
+            except Exception as e:
+                print(f"   ⚠️ IPC send failed ({e}), falling through to binary transfer")
+            # Fall through to network transfer if IPC failed
+
+        # ------------------------------------------------------------------
+        # 3. Cross-machine — existing binary HTTP transfer (unchanged)
+        # ------------------------------------------------------------------
+        data_bytes, dtype_str, shape_json = self.protocol.tensor_to_bytes(tensor)
+
+        headers = {
+            "x-job-id": payload_meta["job_id"],
+            "x-msg-type": payload_meta.get("type", "input"),
+            "x-dtype": dtype_str,
+            "x-shape": shape_json
+        }
+
+        if "expert_idx" in payload_meta:
+            headers["x-expert-idx"] = str(payload_meta["expert_idx"])
+        if "layer_idx" in payload_meta:
+            headers["x-layer-idx"] = str(payload_meta["layer_idx"])
+        if "target_layer_idx" in payload_meta and payload_meta["target_layer_idx"] is not None:
+            headers["x-target-layer-idx"] = str(payload_meta["target_layer_idx"])
+
         session = await self._get_p2p_session()
 
         for attempt in range(P2P_CONNECTION_RETRIES):

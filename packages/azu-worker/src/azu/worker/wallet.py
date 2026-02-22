@@ -122,7 +122,7 @@ class WorkerWalletManager:
         Returns:
             Dict with available, locked, and total balance
         """
-        from shared.payments import get_payment_provider
+        from azu.shared.payments import get_payment_provider
 
         try:
             provider = get_payment_provider(
@@ -159,7 +159,7 @@ class WorkerWalletManager:
         Returns:
             Dict with tx_hash and status
         """
-        from shared.payments import get_payment_provider
+        from azu.shared.payments import get_payment_provider
 
         provider = get_payment_provider(
             provider_type=self.provider_type,
@@ -189,7 +189,7 @@ class WorkerWalletManager:
             Dict with internal balance
         """
         import redis.asyncio as redis
-        from shared.config import get_config
+        from azu.shared.config import get_config
 
         config = get_config()
 

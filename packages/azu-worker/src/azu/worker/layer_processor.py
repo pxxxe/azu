@@ -10,10 +10,10 @@ from typing import Dict, Any, Optional
 
 import torch
 
-from config import P2P_TIMEOUT
-from job_context import JobContext
-from model_manager import ModelManager
-from layer_loader import LayerLoader
+from azu.worker.config import P2P_TIMEOUT
+from azu.worker.job_context import JobContext
+from azu.worker.model_manager import ModelManager
+from azu.worker.layer_loader import LayerLoader
 from transformers import DynamicCache
 
 
@@ -183,7 +183,7 @@ class DenseLayerProcessor:
                     else:
                         # Send token back for loopback
                         if first_node_endpoint:
-                            from p2p_server import P2PServer
+                            from azu.worker.p2p_server import P2PServer
                             # Access p2p_server through the parent - this will be set later
                             pass
 

@@ -17,16 +17,16 @@ import torch
 import aiohttp
 from aiohttp import web, ClientSession, TCPConnector, ClientTimeout
 
-from config import (
+from azu.worker.config import (
     P2P_PORT,
     P2P_MAX_SIZE,
     P2P_CONNECTION_RETRIES,
     P2P_HANDSHAKE_RETRIES,
     P2P_HANDSHAKE_TIMEOUT
 )
-from p2p_protocol import P2PProtocol
-from job_context import JobContext
-from shared.auth import get_auth_provider, is_auth_enabled
+from azu.worker.p2p_protocol import P2PProtocol
+from azu.worker.job_context import JobContext
+from azu.shared.auth import get_auth_provider, is_auth_enabled
 
 # Instantiate auth provider once at module load (worker verification path —
 # no secret key needed; verify_token does constant-time comparison only).

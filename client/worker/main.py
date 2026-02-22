@@ -300,10 +300,11 @@ class MoEWorker:
                             session = await self._get_p2p_session()
                             try:
                                 target = f"{first_node_endpoint}/token_in"
+                                _loopback_headers = {"x-auth-token": ctx.auth_token} if ctx.auth_token else {}
                                 async with session.post(target, json={
                                     "job_id": job_id,
                                     "token_id": token_id
-                                }) as resp:
+                                }, headers=_loopback_headers) as resp:
                                     if resp.status != 200:
                                         print(f"   ⚠️ Loopback failed: {resp.status}")
                             except Exception as e:
@@ -563,6 +564,7 @@ class MoEWorker:
                             job_id_full = msg.get('job_id')
                             topology = msg.get('topology', [])
                             model_id = msg.get('model_id')
+                            auth_token = msg.get('auth_token')
 
                             print(f"🔗 [Job {job_id}] Received JOB_START, initiating mesh handshake...")
 
@@ -574,7 +576,8 @@ class MoEWorker:
                                     json={
                                         "job_id": job_id_full,
                                         "model_id": model_id,
-                                        "topology": topology
+                                        "topology": topology,
+                                        "auth_token": auth_token,
                                     },
                                     timeout=aiohttp.ClientTimeout(total=30)
                                 ) as resp:

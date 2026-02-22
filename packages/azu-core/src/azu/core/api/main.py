@@ -19,9 +19,9 @@ from pydantic import BaseModel
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from shared.config import get_config
-from shared.payments import get_payment_provider
-from shared.ledger import get_ledger, TransactionType
+from azu.shared.config import get_config
+from azu.shared.payments import get_payment_provider
+from azu.shared.ledger import get_ledger, TransactionType
 from .openai_adapter import mount_openai_adapter
 
 # ============================================================================
@@ -143,7 +143,7 @@ async def submit(req: JobReq):
         raise HTTPException(402, f"Insufficient funds. Balance: {balance.available or 0}")
 
     # 2. Estimate job cost and lock funds
-    from shared.economics import calculate_cost_breakdown
+    from azu.shared.economics import calculate_cost_breakdown
 
     # Get layer count from model_id or use default
     est_layers = 40  # Default for small models

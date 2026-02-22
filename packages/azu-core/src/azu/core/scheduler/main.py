@@ -7,8 +7,8 @@ import aiohttp
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 from fastapi import FastAPI, WebSocket
-from shared import get_config
-from shared.auth import get_auth_provider, is_auth_enabled
+from azu.shared import get_config
+from azu.shared.auth import get_auth_provider, is_auth_enabled
 
 # Initialize config
 config = get_config()
@@ -481,10 +481,10 @@ class MoEScheduler:
         """
         try:
             # Import payment modules
-            from shared.payments import get_payment_provider
-            from shared.ledger import get_ledger
-            from shared.economics import calculate_worker_payments, WORKER_SHARE
-            from shared import TransactionType
+            from azu.shared.payments import get_payment_provider
+            from azu.shared.ledger import get_ledger
+            from azu.shared.economics import calculate_worker_payments, WORKER_SHARE
+            from azu.shared import TransactionType
 
             # Get job details
             job = self.active_jobs.get(job_id)
@@ -553,8 +553,8 @@ class MoEScheduler:
         to the worker's external address on-chain.
         """
         try:
-            from shared.payments import get_payment_provider
-            from shared.ledger import get_ledger
+            from azu.shared.payments import get_payment_provider
+            from azu.shared.ledger import get_ledger
 
             # Get payment provider
             provider = get_payment_provider()

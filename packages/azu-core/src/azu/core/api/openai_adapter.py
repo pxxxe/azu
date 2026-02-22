@@ -27,9 +27,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from shared.config import get_config
-from shared.ledger import TransactionType, get_ledger
-from shared.economics import calculate_cost_breakdown
+from azu.shared.config import get_config
+from azu.shared.ledger import TransactionType, get_ledger
+from azu.shared.economics import calculate_cost_breakdown
 
 config = get_config()
 

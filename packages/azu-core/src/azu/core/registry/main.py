@@ -9,7 +9,7 @@ import asyncio
 import sys
 import shutil
 from pathlib import Path
-from shared import get_config
+from azu.shared import get_config
 from .layer_storage import LayerStore
 
 # Setup logging flush

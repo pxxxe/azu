@@ -14,6 +14,7 @@ import sys
 import os
 import asyncio
 import traceback
+import secrets
 
 # === HYPERLIQUID IMPORTS ===
 from eth_account import Account
@@ -303,6 +304,10 @@ def main():
         print(f"   💵 Platform: {platform.address}")
         print(f"   📋 Scheduler: {scheduler.address}")
 
+        # Generate shared secret for interworker auth
+        interworker_secret = secrets.token_hex(32)
+        print(f"   🔑 Auth secret: {interworker_secret[:8]}...")
+
         # Check funder balance (async)
         async def check_funder_balance():
             async with aiohttp.ClientSession() as session:
@@ -337,7 +342,9 @@ def main():
             # Legacy/fallback
             'PLATFORM_WALLET_PUBKEY': platform.address,
             'PUBLIC_KEY': 'null',
-            'HF_HOME': '/data/hf_cache'
+            'HF_HOME': '/data/hf_cache',
+            # Interworker auth
+            'AUTH_SECRET_KEY': interworker_secret,
         }
 
         core_pod_id, _ = deploy_with_fallback("azu-core-moe", CORE_IMG, core_env)
@@ -412,7 +419,9 @@ def main():
             'PAYMENT_PROVIDER': 'hyperliquid',
             # DECOUPLED: We pass the RunPod-specific URL template here via environment
             'P2P_URL_TEMPLATE': 'https://{RUNPOD_POD_ID}-8003.proxy.runpod.net',
-            'LAYER_CACHE_DIR': '/data/layers'
+            'LAYER_CACHE_DIR': '/data/layers',
+            # Interworker auth
+            'AUTH_SECRET_KEY': interworker_secret,
         }
 
         total_vram = 0

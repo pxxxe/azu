@@ -4,7 +4,7 @@ Manages state for each inference job including queues, KV cache, and peer tracki
 """
 
 import asyncio
-from typing import Dict, Tuple, List, Set
+from typing import Dict, Tuple, List, Optional, Set
 from dataclasses import dataclass, field
 from transformers import DynamicCache
 
@@ -51,6 +51,10 @@ class JobContext:
         # Flag to signal job completion
         self.done: bool = False
 
+        # Auth token issued by the scheduler for this job.
+        # Stored here for the P2P server to verify incoming x-auth-token headers.
+        self.auth_token: Optional[str] = None
+
     def get_layer_input_queue(self, layer_idx: int) -> asyncio.Queue:
         """Get or create a queue for receiving layer inputs."""
         if layer_idx not in self.layer_input_queues:
@@ -85,3 +89,4 @@ class JobContext:
         self.kv_cache = DynamicCache()
         self.generated_ids.clear()
         self.done = False
+        self.auth_token = None

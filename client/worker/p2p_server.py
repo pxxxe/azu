@@ -26,6 +26,11 @@ from config import (
 )
 from p2p_protocol import P2PProtocol
 from job_context import JobContext
+from shared.auth import get_auth_provider, is_auth_enabled
+
+# Instantiate auth provider once at module load (worker verification path —
+# no secret key needed; verify_token does constant-time comparison only).
+_auth_provider = get_auth_provider() if is_auth_enabled() else None
 
 
 class P2PServer:
@@ -64,6 +69,37 @@ class P2PServer:
 
         # Cache of peer URL → is_same_machine to avoid repeated DNS lookups
         self._same_machine_cache: Dict[str, bool] = {}
+
+    # -------------------------------------------------------------------------
+    # Auth Helpers
+    # -------------------------------------------------------------------------
+
+    def _verify_auth(self, request: web.Request, ctx: Optional[JobContext]) -> bool:
+        """
+        Verify the x-auth-token header on an incoming P2P request.
+
+        Returns True when:
+          - Auth is globally disabled (AUTH_SECRET_KEY not set)
+          - Context is missing or has no token yet (race: tensor arrived before
+            JOB_START; mesh handshake ordering prevents this in practice)
+          - The received token matches the stored token (constant-time compare)
+        """
+        if not is_auth_enabled():
+            return True
+        if ctx is None or not ctx.auth_token:
+            return True
+        received = request.headers.get("x-auth-token", "")
+        return _auth_provider.verify_token(received, ctx.auth_token)
+
+    def _build_auth_headers(self, ctx: Optional[JobContext]) -> Dict[str, str]:
+        """
+        Build the x-auth-token header dict for an outgoing P2P request.
+
+        Returns an empty dict when auth is disabled or the context has no token.
+        """
+        if not is_auth_enabled() or ctx is None or not ctx.auth_token:
+            return {}
+        return {"x-auth-token": ctx.auth_token}
 
     async def start(self) -> None:
         """Start the P2P HTTP server."""
@@ -108,6 +144,11 @@ class P2PServer:
             ctx.topology = topology
             ctx.status = "HANDSHAKING"
 
+            # Store the auth token issued by the scheduler for this job.
+            auth_token = data.get("auth_token")
+            if auth_token:
+                ctx.auth_token = auth_token
+
             # Remove self from topology (don't ping yourself)
             peer_urls = [url.rstrip("/") for url in topology if url.rstrip("/") != my_p2p_url]
 
@@ -149,6 +190,9 @@ class P2PServer:
             peer_url = data.get("peer_url")
 
             ctx = await self._get_context(job_id, create=False)
+            if not self._verify_auth(request, ctx):
+                return web.Response(status=401, text="Unauthorized")
+
             if ctx:
                 ctx.mark_peer_ready(peer_url)
                 print(f"🔗 [Job {job_id[:8]}] Peer {peer_url} ready ({len(ctx.peers_ready)}/{len(ctx.topology)})")
@@ -172,6 +216,9 @@ class P2PServer:
             token_id = data.get("token_id")
 
             ctx = await self._get_context(job_id, create=False)
+            if not self._verify_auth(request, ctx):
+                return web.Response(status=401, text="Unauthorized")
+
             if ctx:
                 await ctx.token_queue.put(token_id)
                 return web.Response(text="OK")
@@ -204,6 +251,9 @@ class P2PServer:
 
             # 4. Route - Get or create context
             ctx = await self._get_context(job_id, create=True)
+
+            if not self._verify_auth(request, ctx):
+                return web.Response(status=401, text="Unauthorized")
 
             # 4b. WAIT for handshake to complete before processing tensors
             if ctx.topology and ctx.status == "HANDSHAKING":
@@ -260,6 +310,9 @@ class P2PServer:
             tensor = self.protocol.ipc_handle_to_tensor(handle_data, self.dtype)
 
             ctx = await self._get_context(job_id, create=True)
+
+            if not self._verify_auth(request, ctx):
+                return web.Response(status=401, text="Unauthorized")
 
             if ctx.topology and ctx.status == "HANDSHAKING":
                 await ctx.handshake_done.wait()
@@ -330,6 +383,7 @@ class P2PServer:
                 await session.post(
                     f"{peer_url_clean}/control/peer_ready",
                     json={"job_id": job_id, "peer_url": my_url},
+                    headers=self._build_auth_headers(ctx),
                     timeout=aiohttp.ClientTimeout(total=P2P_HANDSHAKE_TIMEOUT)
                 )
             except Exception as e:
@@ -445,6 +499,10 @@ class P2PServer:
                 print(f"❌ Local P2P Error: {e}")
                 return
 
+        # Fetch context for auth headers (IPC and binary paths).
+        _send_ctx = await self._get_context(payload_meta['job_id'], create=False)
+        _auth_hdrs = self._build_auth_headers(_send_ctx)
+
         # ------------------------------------------------------------------
         # 2. Same-machine IPC — CUDA shared memory, zero GPU→CPU copy
         # ------------------------------------------------------------------
@@ -459,6 +517,7 @@ class P2PServer:
                     # for routing parity with handle_tensor_ipc_ingress
                     "x-dtype": handle_data["dtype"],
                     "x-shape": json.dumps(handle_data["shape"]),
+                    **_auth_hdrs,
                 }
                 if "expert_idx" in payload_meta:
                     headers["x-expert-idx"] = str(payload_meta["expert_idx"])
@@ -491,7 +550,8 @@ class P2PServer:
             "x-job-id": payload_meta["job_id"],
             "x-msg-type": payload_meta.get("type", "input"),
             "x-dtype": dtype_str,
-            "x-shape": shape_json
+            "x-shape": shape_json,
+            **_auth_hdrs,
         }
 
         if "expert_idx" in payload_meta:

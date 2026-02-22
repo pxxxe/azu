@@ -59,3 +59,17 @@ AUTO_WITHDRAWAL_THRESHOLD = float(os.getenv("AUTO_WITHDRAWAL_THRESHOLD", "0.0"))
 # Withdrawal destination address (for auto-withdrawal)
 # If not set, auto-withdrawal is disabled
 WITHDRAWAL_ADDRESS = os.getenv("WITHDRAWAL_ADDRESS")
+
+# ============================================================================
+# Auth Configuration (tensor transfer security)
+# ============================================================================
+
+# Auth provider type. Selects the BYOA token scheme used to authenticate
+# inter-worker tensor transfers. Supported: 'hmac' (default)
+AUTH_PROVIDER = os.getenv("AUTH_PROVIDER", "hmac")
+
+# Shared secret used by the scheduler to generate per-job HMAC tokens.
+# Workers do NOT need this — they verify by comparing the token received
+# in JOB_START against the x-auth-token header on incoming P2P requests.
+# When unset, authentication is disabled (dev / local mode).
+AUTH_SECRET_KEY = os.getenv("AUTH_SECRET_KEY")

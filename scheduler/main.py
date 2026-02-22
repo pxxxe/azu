@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 from fastapi import FastAPI, WebSocket
 from shared import get_config
+from shared.auth import get_auth_provider, is_auth_enabled
 
 # Initialize config
 config = get_config()
@@ -36,6 +37,7 @@ class JobState:
     owner: str
     topology: List[dict]
     max_tokens: int = 50
+    auth_token: Optional[str] = None
 
 class MoEScheduler:
     def __init__(self, registry_url: str):
@@ -364,6 +366,12 @@ class MoEScheduler:
 
         first_node_endpoint = job.topology[0]['endpoint']
 
+        # Generate auth token for this job (HMAC or configured provider).
+        auth_token = None
+        if is_auth_enabled():
+            auth_token = get_auth_provider().generate_token(job.id)
+            job.auth_token = auth_token
+
         # === PHASE 1: Send JOB_START to ALL workers with topology ===
         # This triggers the P2P mesh handshake on each worker
         all_peer_urls = list(set(node['endpoint'] for node in job.topology))
@@ -380,7 +388,8 @@ class MoEScheduler:
                 "type": "JOB_START",
                 "job_id": job.id,
                 "model_id": job.model_id,
-                "topology": all_peer_urls  # All peer P2P URLs for handshake
+                "topology": all_peer_urls,  # All peer P2P URLs for handshake
+                "auth_token": auth_token,
             }
             job_start_tasks.append(w.ws.send_json(job_start_payload))
 

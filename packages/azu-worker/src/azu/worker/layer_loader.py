@@ -406,6 +406,40 @@ class LayerLoader:
         self.loaded_cache[cache_key] = layer
         return layer
 
+    async def load_dense_layer(self, model_id: str, layer_idx: int):
+        """
+        Load a dense transformer layer.
+
+        Args:
+            model_id: HuggingFace model ID
+            layer_idx: Layer index
+
+        Returns:
+            Loaded dense layer
+        """
+        cache_key = f"{model_id}:dense:{layer_idx}"
+        if cache_key in self.loaded_cache:
+            return self.loaded_cache[cache_key]
+
+        config_path, config_url = self._get_paths(model_id, "config.json")
+        await self._download(config_url, config_path)
+        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+
+        filename = f"layer_{layer_idx}_dense.safetensors"
+        path, url = self._get_paths(model_id, filename)
+        await self._download(url, path, model_id=model_id)
+
+        LayerClass = self._get_layer_class(config)
+        # FORCE DTYPE
+        layer = LayerClass(config, layer_idx=layer_idx).to(self.device).to(self.dtype)
+
+        state_dict = await self._load_weights_safe(path)
+        layer.load_state_dict(state_dict, strict=False)
+        layer.eval()
+
+        self.loaded_cache[cache_key] = layer
+        return layer
+
     async def load_moe_router(self, model_id: str, layer_idx: int):
         """
         Load an MoE router (gate) network.

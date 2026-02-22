@@ -1,36 +1,26 @@
 FROM python:3.10-slim
 
-# Install Redis & System deps
 RUN apt-get update && apt-get install -y redis-server git curl
 
 WORKDIR /app
 
 ENV PYTHONUNBUFFERED=1
 
-# Copy all requirements files including shared (payment dependencies)
-COPY registry/requirements.txt reqs_reg.txt
-COPY scheduler/requirements.txt reqs_sched.txt
-COPY api/requirements.txt reqs_api.txt
-COPY shared/requirements.txt reqs_shared.txt
-
-# --- FIX IS HERE ---
-# 1. Install CPU-only Torch first (avoids downloading 4GB of CUDA libs)
+# Install CPU-only torch first to avoid 4GB CUDA download
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
-# 2. Then install the rest (pip will see torch is already installed and skip the huge download)
-#    Includes shared requirements for payment layer (web3, eth-account, solders)
-RUN pip install --no-cache-dir -r reqs_reg.txt -r reqs_sched.txt -r reqs_api.txt -r reqs_shared.txt
+# Copy and install packages
+COPY packages/azu-shared ./packages/azu-shared
+COPY packages/azu-core   ./packages/azu-core
 
-COPY . .
+RUN pip install --no-cache-dir \
+    ./packages/azu-shared \
+    ./packages/azu-core
 
-# Startup Script
+# Startup script
 RUN echo "#!/bin/bash\n\
 redis-server --daemonize yes\n\
-uvicorn registry.main:app --host 0.0.0.0 --port 8002 &\n\
-uvicorn scheduler.main:app --host 0.0.0.0 --port 8001 &\n\
-uvicorn api.main:app --host 0.0.0.0 --port 8000\n\
+azu-core\n\
 " > start.sh && chmod +x start.sh
 
 CMD ["./start.sh"]
-
-# :)

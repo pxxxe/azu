@@ -1,31 +1,20 @@
-# CHANGE FROM 2.1.0 TO 2.2.0
 FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime
 
 WORKDIR /app
 
 ENV PYTHONUNBUFFERED=1
-
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    git \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y git curl && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements (includes payment deps: web3, eth-account)
-COPY client/worker/requirements.txt .
+# Copy and install packages
+COPY packages/azu-shared ./packages/azu-shared
+COPY packages/azu-worker ./packages/azu-worker
 
-# Install Python dependencies
-RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
+RUN pip install --no-cache-dir --break-system-packages \
+    ./packages/azu-shared \
+    ./packages/azu-worker
 
-# Copy shared library (payment abstraction layer)
-COPY shared/ ./shared/
-
-# Copy worker code
-COPY client/worker/ ./
-
-# Create cache directory
 RUN mkdir -p /app/layer_cache
 
-CMD ["python", "main.py"]
+CMD ["azu-worker"]

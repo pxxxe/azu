@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "azu-worker"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "azu-shared",
+    "torch>=2.2.0",
+    "transformers>=5.0.0",
+    "accelerate>=0.25.0",
+    "safetensors",
+    "aiohttp>=3.8.0",
+    "websockets>=12.0",
+    "numpy",
+    "huggingface-hub>=0.19.0",
+    "web3>=6.11.0",
+    "eth-account>=0.9.0",
+]
+
+[project.scripts]
+azu-worker = "azu.worker.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/azu"]

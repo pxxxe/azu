@@ -23,6 +23,7 @@ from azu.shared.config import get_config
 from azu.shared.payments import get_payment_provider
 from azu.shared.ledger import get_ledger, TransactionType
 from .openai_adapter import mount_openai_adapter
+from .user_auth_router import user_auth_router
 
 # ============================================================================
 # Pydantic Models
@@ -222,6 +223,13 @@ async def health():
 # ============================================================================
 
 mount_openai_adapter(app)
+
+
+# ============================================================================
+# User Auth Management
+# ============================================================================
+
+app.include_router(user_auth_router)
 
 
 # ============================================================================

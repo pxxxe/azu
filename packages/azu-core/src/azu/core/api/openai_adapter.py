@@ -7,8 +7,11 @@ Mounts /v1/chat/completions onto the existing FastAPI app.
 Works with the Vercel AI SDK, OpenAI clients, and anything else
 that speaks the OpenAI chat completions wire format.
 
-Auth: pass the user's wallet address (pubkey) as a Bearer token.
-  Authorization: Bearer <wallet_pubkey>
+Auth: controlled by USER_AUTH_PROVIDER (default: wallet address as Bearer token).
+  Authorization: Bearer <credential>
+
+  wallet  (default) — credential is the wallet address directly
+  api_key            — credential is an opaque API key resolved to a wallet
 
 Usage — add one line to api/main.py:
 
@@ -28,8 +31,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from azu.shared.config import get_config
-from azu.shared.ledger import TransactionType, get_ledger
 from azu.shared.economics import calculate_cost_breakdown
+from azu.shared.ledger import TransactionType, get_ledger
+from azu.shared.user_auth import get_user_auth_provider
 
 config = get_config()
 
@@ -63,20 +67,6 @@ async def _get_redis() -> redis.Redis:
         db=config.redis.db,
         decode_responses=True,
     )
-
-
-def _extract_pubkey(request: Request) -> str:
-    """Pull wallet pubkey from Authorization: Bearer <pubkey>."""
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail="Authorization header required: Bearer <wallet_pubkey>",
-        )
-    pubkey = auth.removeprefix("Bearer ").strip()
-    if not pubkey:
-        raise HTTPException(status_code=401, detail="Empty Bearer token.")
-    return pubkey
 
 
 def _messages_to_prompt(messages: list[ChatMessage]) -> str:
@@ -255,7 +245,7 @@ async def _stream_completion(
 # ---------------------------------------------------------------------------
 
 async def chat_completions(request: Request) -> StreamingResponse | JSONResponse:
-    user_pubkey = _extract_pubkey(request)
+    user_pubkey = await get_user_auth_provider().authenticate(request)
 
     body = await request.json()
     req = ChatCompletionRequest(**body)

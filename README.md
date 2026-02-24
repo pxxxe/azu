@@ -1,8 +1,8 @@
 # azu
 
-**"Go forth and multiply."**
+**Go forth and multiply.**
 
-Decentralized inference network. Consumer GPU hardware, pooled.
+Decentralized inference network.
 
 Azu splits large language models across a network of independent workers and runs inference as a distributed pipeline. A user submits a prompt, the core routes it through sharded layers held by different machines, and the result comes back — no single node needs to hold the full model.
 

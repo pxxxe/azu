@@ -135,7 +135,7 @@ class P2PServer:
             data = await request.json()
             job_id = data.get("job_id")
             topology = data.get("topology", [])
-            my_p2p_url = self.get_p2p_url().rstrip("/")
+            my_p2p_url = (self.get_p2p_url() or "").rstrip("/")
 
             print(f"🔗 [Job {job_id[:8]}] Received job_start with {len(topology)} peers")
 
@@ -356,7 +356,7 @@ class P2PServer:
             print(f"❌ [Job {job_id[:8]}] Context disappeared during handshake!")
             return
 
-        my_url = self.get_p2p_url().rstrip("/")
+        my_url = (self.get_p2p_url() or "").rstrip("/")
         session = await self._get_p2p_session()
 
         # Ping each peer with retry
@@ -462,13 +462,13 @@ class P2PServer:
              zero-copy GPU-to-GPU via shared CUDA memory handle (~200 byte payload)
           3. Cross-machine → existing binary HTTP transfer (unchanged)
         """
-        my_p2p = self.get_p2p_url().rstrip("/")
+        my_p2p = (self.get_p2p_url() or "").rstrip("/")
         target_base = url.replace("/tensor_in", "").rstrip("/")
 
         # ------------------------------------------------------------------
         # 1. Loopback — direct queue injection, no serialization at all
         # ------------------------------------------------------------------
-        if my_p2p == target_base:
+        if my_p2p and my_p2p == target_base:
             try:
                 ctx = await self._get_context(payload_meta['job_id'], create=True)
                 msg_type = payload_meta.get('type', 'input')

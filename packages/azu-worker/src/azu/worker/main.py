@@ -89,7 +89,7 @@ class MoEWorker:
 
         sys.stdout.flush()
 
-    def get_p2p_url(self) -> str:
+    def get_p2p_url(self) -> Optional[str]:
         """Get this worker's P2P URL."""
         from azu.worker.config import P2P_PUBLIC_URL, P2P_URL_TEMPLATE
 
@@ -98,16 +98,18 @@ class MoEWorker:
 
         if P2P_URL_TEMPLATE:
             try:
-                pod_id = os.getenv("RUNPOD_POD_ID", "unknown")
-                return P2P_URL_TEMPLATE.replace("{RUNPOD_POD_ID}", pod_id).strip("/")
+                return P2P_URL_TEMPLATE.format_map(os.environ).strip("/")
+            except KeyError as e:
+                print(f"⚠️ P2P_URL_TEMPLATE references missing env var: {e}. Falling back.")
+
+        if os.environ.get("P2P_EXPOSE_PORT", "").lower() in ("1", "true", "yes"):
+            try:
+                ip = urllib.request.urlopen('https://api.ipify.org', timeout=3).read().decode('utf8')
+                return f"http://{ip}:{P2P_PORT}"
             except:
                 pass
 
-        try:
-            ip = urllib.request.urlopen('https://api.ipify.org').read().decode('utf8')
-            return f"http://{ip}:{P2P_PORT}"
-        except:
-            return f"http://127.0.0.1:{P2P_PORT}"
+        return None
 
     async def _get_p2p_session(self) -> aiohttp.ClientSession:
         """Get or create P2P session."""
@@ -538,6 +540,13 @@ class MoEWorker:
                 print(f"🔌 Connecting to {SCHEDULER_URL}...")
                 async with websockets.connect(SCHEDULER_URL) as ws:
                     p2p_url = self.get_p2p_url()
+                    relay_mode = p2p_url is None
+
+                    if relay_mode:
+                        print("📡 No public P2P URL — operating in relay mode (tensors via Scheduler WebSocket)")
+                    else:
+                        print(f"🌐 P2P URL: {p2p_url}")
+
                     await ws.send(json.dumps({
                         "type": "REGISTER",
                         "specs": {
@@ -545,6 +554,7 @@ class MoEWorker:
                             "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
                             "vram_mb": self.vram_total_mb,
                             "p2p_url": p2p_url,
+                            "relay_mode": relay_mode,
                             "capabilities": ["dense", "moe_router", "moe_expert"],
                             # Payment address for receiving earnings
                             "payment_address": self.payment_address
@@ -568,25 +578,27 @@ class MoEWorker:
 
                             print(f"🔗 [Job {job_id}] Received JOB_START, initiating mesh handshake...")
 
-                            my_p2p_url = self.get_p2p_url().rstrip("/")
-                            try:
-                                session = await self._get_p2p_session()
-                                async with session.post(
-                                    f"{my_p2p_url}/control/job_start",
-                                    json={
-                                        "job_id": job_id_full,
-                                        "model_id": model_id,
-                                        "topology": topology,
-                                        "auth_token": auth_token,
-                                    },
-                                    timeout=aiohttp.ClientTimeout(total=30)
-                                ) as resp:
-                                    if resp.status == 200:
-                                        print(f"🔗 [Job {job_id}] Mesh handshake initiated successfully")
-                                    else:
-                                        print(f"⚠️ [Job {job_id}] Mesh handshake initiation failed: {resp.status}")
-                            except Exception as e:
-                                print(f"⚠️ [Job {job_id}] Failed to trigger mesh handshake: {e}")
+                            my_p2p_url = self.get_p2p_url()
+                            if my_p2p_url:
+                                my_p2p_url = my_p2p_url.rstrip("/")
+                                try:
+                                    session = await self._get_p2p_session()
+                                    async with session.post(
+                                        f"{my_p2p_url}/control/job_start",
+                                        json={
+                                            "job_id": job_id_full,
+                                            "model_id": model_id,
+                                            "topology": topology,
+                                            "auth_token": auth_token,
+                                        },
+                                        timeout=aiohttp.ClientTimeout(total=30)
+                                    ) as resp:
+                                        if resp.status == 200:
+                                            print(f"🔗 [Job {job_id}] Mesh handshake initiated successfully")
+                                        else:
+                                            print(f"⚠️ [Job {job_id}] Mesh handshake initiation failed: {resp.status}")
+                                except Exception as e:
+                                    print(f"⚠️ [Job {job_id}] Failed to trigger mesh handshake: {e}")
 
                         elif msg_type == 'EXECUTE_DENSE':
                             asyncio.create_task(self._safe_task_wrapper(

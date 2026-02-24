@@ -68,7 +68,9 @@ class MoEScheduler:
 
     def _find_best_worker(self, size_mb: int, current_job_allocations: Dict[str, int],
                           previous_worker_id: str = None, cache_key: str = None) -> Optional[WorkerState]:
-        candidates = list(self.workers.values())
+        # Only consider workers with a routable P2P URL — relay-mode workers cannot
+        # participate in tensor routing and must be excluded from placement.
+        candidates = [w for w in self.workers.values() if w.specs.get('p2p_url')]
         if not candidates: return None
 
         # --- SAFETY PARAMETERS ---
@@ -374,7 +376,7 @@ class MoEScheduler:
 
         # === PHASE 1: Send JOB_START to ALL workers with topology ===
         # This triggers the P2P mesh handshake on each worker
-        all_peer_urls = list(set(node['endpoint'] for node in job.topology))
+        all_peer_urls = list(set(node['endpoint'] for node in job.topology if node['endpoint']))
         print(f"🔗 [Job {job.id[:8]}] Sending job_start to {len(all_peer_urls)} workers for mesh handshake...")
 
         job_start_tasks = []

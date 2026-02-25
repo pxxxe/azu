@@ -468,7 +468,7 @@ class MoEWorker:
             await asyncio.sleep(3600)
 
     # =========================================================================
-    # Job processors — unchanged from original
+    # Job processors
     # =========================================================================
 
     async def _process_dense(self, msg: Dict, ws):
@@ -484,6 +484,11 @@ class MoEWorker:
         is_last = msg.get('is_last', False)
         max_tokens = msg.get('max_tokens', 50)
         first_node_endpoint = msg.get('first_node_endpoint')
+
+        # Capture prompt into local scope immediately — before any await.
+        # Multiple EXECUTE_DENSE tasks for the same job share the same msg dict;
+        # reading msg['input'] after an await risks it already being cleared.
+        initial_prompt = msg.get('input') if is_first else None
 
         print(f"🔵 [DENSE] Processing job {job_id[:8]}, layer_idx={layer_idx}")
 
@@ -503,11 +508,32 @@ class MoEWorker:
 
                     input_tensor = None
 
-                    if not ctx.generated_ids and msg.get('input'):
+                    # ------------------------------------------------------------------
+                    # RACE-CONDITION FIX
+                    #
+                    # Old code: if not ctx.generated_ids and msg.get('input'):
+                    # Multiple EXECUTE_DENSE tasks all pass this guard simultaneously
+                    # because there is no `await` between the check and the mutation,
+                    # so asyncio never yields between them — all N tasks encode the
+                    # prompt N times, producing the log spam seen in production.
+                    #
+                    # Fix: atomic check-and-set under _context_lock.  Only the first
+                    # coroutine to acquire the lock sets prompt_encoded=True and wins
+                    # the encode path.  All others fall through to the token-queue path
+                    # and exit cleanly once ctx.done is set.
+                    # ------------------------------------------------------------------
+                    should_encode = False
+                    if initial_prompt and not ctx.generated_ids:
+                        async with self._context_lock:
+                            if not getattr(ctx, 'prompt_encoded', False):
+                                ctx.prompt_encoded = True
+                                should_encode = True
+
+                    if should_encode:
                         print(f"   📝 Encoding Prompt...")
                         ctx.kv_cache = DynamicCache()
                         input_tensor = self.model_manager.tokenizer.encode(
-                            msg['input'], return_tensors='pt'
+                            initial_prompt, return_tensors='pt'
                         ).to(self.device)
 
                         ctx.prompt_token_count = input_tensor.shape[1]
@@ -527,8 +553,9 @@ class MoEWorker:
                             print(f"❌ [Job {job_id[:8]}] Token queue timeout")
                             break
                     else:
-                        await asyncio.sleep(0.01)
-                        continue
+                        # Duplicate task lost the encode race and has no tokens to process.
+                        # Nothing to do — exit cleanly.
+                        break
 
                     with torch.no_grad():
                         hidden_states = self.model_manager.embeddings(input_tensor)
@@ -593,9 +620,9 @@ class MoEWorker:
 
                         if WORKER_MODE == "serverless":
                             await self._send_result_http(
-                                job_id     = job_id,
-                                status     = "completed",
-                                output     = output_text,
+                                job_id           = job_id,
+                                status           = "completed",
+                                output           = output_text,
                                 tokens_generated = len(ctx.generated_ids),
                             )
                         else:

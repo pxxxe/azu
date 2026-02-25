@@ -6,9 +6,14 @@ import sys
 import aiohttp
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, HTTPException
+from pydantic import BaseModel
 from azu.shared import get_config
 from azu.shared.auth import get_auth_provider, is_auth_enabled
+
+# ── registry / driver imports (new) ──────────────────────────────────────────
+from azu.core.scheduler.worker_registry import WorkerEndpoint, WorkerRegistry, WorkerType
+from azu.core.scheduler.worker_driver import get_driver_for_worker
 
 # Initialize config
 config = get_config()
@@ -18,7 +23,7 @@ app = FastAPI()
 @dataclass
 class WorkerState:
     pubkey: str
-    ws: WebSocket
+    ws: Optional[WebSocket]          # None for serverless workers (no persistent connection)
     specs: dict
     vram_total_mb: int
     actual_free_mb: int
@@ -45,6 +50,29 @@ class MoEScheduler:
         self.workers: Dict[str, WorkerState] = {}
         self.active_jobs: Dict[str, JobState] = {}
 
+        # ── registry (new) ────────────────────────────────────────────────────
+        # Shared Redis client — same instance as the module-level `r`
+        self.worker_registry = WorkerRegistry(r)
+
+        # Per-job readiness events for serverless workers.
+        # Structure: { job_id: { worker_id: asyncio.Event } }
+        # The event is set when the worker calls POST /worker/ready.
+        self._job_readiness: Dict[str, Dict[str, asyncio.Event]] = {}
+
+    # ── transport helper (new) ────────────────────────────────────────────────
+
+    async def _dispatch_control(self, w: WorkerState, payload: dict) -> None:
+        """
+        Send a control-plane message to a worker using the correct transport.
+
+        Selects PersistentDriver (WebSocket) or ServerlessDriver (HTTP POST)
+        based on the worker's registered type.  Tensor data never passes here.
+        """
+        driver = get_driver_for_worker(w)
+        await driver.send_control(w, payload)
+
+    # ── registry integration: worker lifecycle ────────────────────────────────
+
     async def register_worker(self, ws: WebSocket, specs: dict) -> str:
         wid = specs['pubkey']
         vram = specs.get('vram_mb', 24000)
@@ -52,12 +80,76 @@ class MoEScheduler:
         payment_addr = specs.get('payment_address')  # EXTRACT PAYMENT ADDRESS
         self.workers[wid] = WorkerState(pubkey=wid, ws=ws, specs=specs, vram_total_mb=vram, actual_free_mb=vram, payment_address=payment_addr)
         print(f"✅ Registered: {wid} | VRAM: {vram}MB | Payment: {payment_addr[:20] if payment_addr else 'None'}...")
+
+        # ── persist to registry (new) ─────────────────────────────────────────
+        # Upsert so reconnecting persistent workers refresh their record
+        # without losing any p2p_url or payment_address already stored.
+        try:
+            await self.worker_registry.register(WorkerEndpoint(
+                worker_id       = wid,
+                worker_type     = WorkerType.PERSISTENT,
+                endpoint_url    = specs.get('scheduler_url', ''),   # informational; ws:// origin
+                vram_mb         = vram,
+                capabilities    = specs.get('capabilities', ['dense', 'moe_router', 'moe_expert']),
+                platform        = specs.get('platform', 'self_hosted'),
+                payment_address = payment_addr,
+                p2p_url         = specs.get('p2p_url'),
+            ))
+        except Exception as exc:
+            # Registry write failure must not block the WS handshake
+            print(f"⚠️ [Registry] Failed to persist worker {wid[:16]}: {exc}")
+
         return wid
 
     async def unregister_worker(self, wid: str):
         if wid in self.workers:
             del self.workers[wid]
             print(f"❌ Worker {wid} disconnected")
+        # NOTE: we do NOT deregister from the persistent registry here.
+        # The registry record survives disconnects so the scheduler can
+        # restore the worker's session slot when it reconnects.
+
+    async def load_registry_workers(self) -> None:
+        """
+        Populate self.workers from durable registry records on startup.
+
+        Persistent workers whose WebSocket hasn't arrived yet get a stub
+        WorkerState with ws=None; they become fully operational once they
+        reconnect and call register_worker().
+
+        Serverless workers get a permanent stub — they never hold a socket.
+        """
+        try:
+            endpoints = await self.worker_registry.list_all()
+            loaded = 0
+            for ep in endpoints:
+                if ep.worker_id in self.workers:
+                    continue  # already live (shouldn't happen on cold start, but be safe)
+
+                specs = {
+                    "pubkey":          ep.worker_id,
+                    "vram_mb":         ep.vram_mb,
+                    "capabilities":    ep.capabilities,
+                    "platform":        ep.platform,
+                    "p2p_url":         ep.p2p_url,
+                    "endpoint_url":    ep.endpoint_url,
+                    "worker_type":     ep.worker_type.value,
+                }
+
+                self.workers[ep.worker_id] = WorkerState(
+                    pubkey         = ep.worker_id,
+                    ws             = None,
+                    specs          = specs,
+                    vram_total_mb  = ep.vram_mb,
+                    actual_free_mb = ep.vram_mb,
+                    payment_address = ep.payment_address,
+                )
+                loaded += 1
+
+            if loaded:
+                print(f"📋 [Registry] Loaded {loaded} worker(s) from durable registry")
+        except Exception as exc:
+            print(f"⚠️ [Registry] Failed to load workers on startup: {exc}")
 
     async def handle_heartbeat(self, wid: str, data: dict):
         if wid in self.workers:
@@ -68,9 +160,13 @@ class MoEScheduler:
 
     def _find_best_worker(self, size_mb: int, current_job_allocations: Dict[str, int],
                           previous_worker_id: str = None, cache_key: str = None) -> Optional[WorkerState]:
-        # Only consider workers with a routable P2P URL — relay-mode workers cannot
-        # participate in tensor routing and must be excluded from placement.
-        candidates = [w for w in self.workers.values() if w.specs.get('p2p_url')]
+        # Consider workers with a routable P2P URL (persistent) OR serverless
+        # workers (their P2P URL is unknown until invoked; planner still needs
+        # to reserve VRAM for them — the URL is resolved during dispatch).
+        candidates = [
+            w for w in self.workers.values()
+            if w.specs.get('p2p_url') or w.specs.get('worker_type') == 'serverless'
+        ]
         if not candidates: return None
 
         # --- SAFETY PARAMETERS ---
@@ -374,8 +470,25 @@ class MoEScheduler:
             auth_token = get_auth_provider().generate_token(job.id)
             job.auth_token = auth_token
 
+        # ── identify serverless workers involved in this job (new) ────────────
+        serverless_worker_ids = {
+            node['worker_id']
+            for node in job.topology
+            if self.workers.get(node['worker_id']) and
+               self.workers[node['worker_id']].specs.get('worker_type') == 'serverless'
+        }
+        has_serverless = bool(serverless_worker_ids)
+
+        # Register per-job readiness events for serverless workers so Phase 2
+        # can wait until each has cold-started and reported its P2P URL.
+        if has_serverless:
+            self._job_readiness[job.id] = {
+                wid: asyncio.Event() for wid in serverless_worker_ids
+            }
+
         # === PHASE 1: Send JOB_START to ALL workers with topology ===
-        # This triggers the P2P mesh handshake on each worker
+        # This triggers the P2P mesh handshake on each worker.
+        # Uses _dispatch_control so persistent and serverless workers both receive it.
         all_peer_urls = list(set(node['endpoint'] for node in job.topology if node['endpoint']))
         print(f"🔗 [Job {job.id[:8]}] Sending job_start to {len(all_peer_urls)} workers for mesh handshake...")
 
@@ -393,14 +506,46 @@ class MoEScheduler:
                 "topology": all_peer_urls,  # All peer P2P URLs for handshake
                 "auth_token": auth_token,
             }
-            job_start_tasks.append(w.ws.send_json(job_start_payload))
+            job_start_tasks.append(self._dispatch_control(w, job_start_payload))
 
         # Wait for all workers to receive job_start
         if job_start_tasks:
             await asyncio.gather(*job_start_tasks)
             print(f"🔗 [Job {job.id[:8]}] All workers received job_start, waiting for handshake...")
-            # Give workers time to complete mesh handshake
-            await asyncio.sleep(2)  # Workers will proceed when ready, this is just safety
+
+        # ── wait strategy: event-driven for serverless, fixed delay for persistent (new) ──
+        if has_serverless:
+            # Wait up to 60 s for every serverless worker to call POST /worker/ready.
+            # Once they do, their P2P URL is patched into the topology below.
+            _SERVERLESS_READY_TIMEOUT = 60
+            events = list(self._job_readiness[job.id].values())
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*[e.wait() for e in events]),
+                    timeout=_SERVERLESS_READY_TIMEOUT,
+                )
+                print(f"🟢 [Job {job.id[:8]}] All serverless workers ready")
+            except asyncio.TimeoutError:
+                print(f"❌ [Job {job.id[:8]}] Timed out waiting for serverless workers — aborting job")
+                self._job_readiness.pop(job.id, None)
+                self.active_jobs.pop(job.id, None)
+                return
+
+            # Patch topology with the P2P URLs that serverless workers just reported.
+            # (POST /worker/ready stores them on the WorkerState.specs in-place.)
+            for node in job.topology:
+                wid = node['worker_id']
+                if wid in serverless_worker_ids:
+                    w = self.workers.get(wid)
+                    if w and w.specs.get('p2p_url'):
+                        node['endpoint'] = w.specs['p2p_url']
+
+            # Rebuild first_node_endpoint after topology patch
+            first_node_endpoint = job.topology[0]['endpoint']
+            self._job_readiness.pop(job.id, None)
+        else:
+            # Give workers time to complete mesh handshake (original behaviour)
+            await asyncio.sleep(2)
 
         # === PHASE 2: Send EXECUTE messages (original logic) ===
         for i, node in enumerate(job.topology):
@@ -433,14 +578,14 @@ class MoEScheduler:
                     "max_tokens": job.max_tokens,
                     "first_node_endpoint": first_node_endpoint if role == 'decode' else None
                 })
-                await w.ws.send_json(payload)
+                await self._dispatch_control(w, payload)
 
             elif node['type'] == 'moe':
                 payload.update({
                     "type": "EXECUTE_ROUTER",
                     "expert_map": node['expert_map']
                 })
-                await w.ws.send_json(payload)
+                await self._dispatch_control(w, payload)
 
                 tasks = {}
                 for exp_idx, url in node['expert_map'].items():
@@ -452,7 +597,7 @@ class MoEScheduler:
                 for wid, indices in tasks.items():
                     t_w = self.workers.get(wid)
                     for idx in indices:
-                        await t_w.ws.send_json({
+                        await self._dispatch_control(t_w, {
                             "type": "EXECUTE_EXPERT",
                             "job_id": job.id,
                             "model_id": job.model_id,
@@ -609,6 +754,10 @@ scheduler = MoEScheduler(f"http://localhost:{config.registry.port}")
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(scheduler.process_queue())
+    # Restore durable worker records from the registry so the scheduler
+    # can plan jobs immediately (serverless workers) or as soon as
+    # persistent workers reconnect (ws=None stubs get upgraded on REGISTER).
+    asyncio.create_task(scheduler.load_registry_workers())
 
 @app.websocket("/ws/worker")
 async def ws_endpoint(ws: WebSocket):
@@ -626,3 +775,232 @@ async def ws_endpoint(ws: WebSocket):
                     await scheduler.handle_heartbeat(wid, data)
     except:
         if wid: await scheduler.unregister_worker(wid)
+
+
+# =============================================================================
+# Worker Registry HTTP API  (new)
+# =============================================================================
+# These routes are the "mapper" layer for managing which workers are available,
+# including serverless workers that never hold a WebSocket connection.
+#
+# Persistent workers self-register via the WebSocket handshake above.
+# Serverless workers are registered out-of-band by the operator or CI at
+# deploy time, before any jobs are submitted.
+# =============================================================================
+
+class RegisterWorkerReq(BaseModel):
+    worker_id:       str
+    worker_type:     str                  # "persistent" | "serverless"
+    endpoint_url:    str                  # ws:// for persistent, https:// invoke for serverless
+    vram_mb:         int
+    capabilities:    Optional[List[str]]  = None
+    platform:        Optional[str]        = "self_hosted"
+    payment_address: Optional[str]        = None
+    p2p_url:         Optional[str]        = None
+
+
+class WorkerReadyReq(BaseModel):
+    job_id:    str
+    worker_id: str
+    p2p_url:   str
+
+
+class WorkerResultReq(BaseModel):
+    job_id:    str
+    worker_id: str
+    status:    str
+    output:    Optional[str] = None
+    tokens_generated: Optional[int] = None
+
+
+@app.post("/workers", status_code=201, summary="Register a worker endpoint")
+async def register_worker_http(req: RegisterWorkerReq):
+    """
+    Register or update a worker endpoint record in the durable registry.
+
+    Persistent workers self-register via the WebSocket handshake; this
+    endpoint exists primarily for serverless workers registered at deploy
+    time by operators or CI pipelines.
+
+    Calling this for an existing worker_id is an idempotent upsert.
+    """
+    try:
+        wtype = WorkerType(req.worker_type)
+    except ValueError:
+        raise HTTPException(400, f"Invalid worker_type '{req.worker_type}'. Must be 'persistent' or 'serverless'.")
+
+    endpoint = WorkerEndpoint(
+        worker_id       = req.worker_id,
+        worker_type     = wtype,
+        endpoint_url    = req.endpoint_url,
+        vram_mb         = req.vram_mb,
+        capabilities    = req.capabilities or ["dense", "moe_router", "moe_expert"],
+        platform        = req.platform or "self_hosted",
+        payment_address = req.payment_address,
+        p2p_url         = req.p2p_url,
+    )
+
+    await scheduler.worker_registry.register(endpoint)
+
+    # If a serverless worker is being registered, materialise it in the
+    # in-memory pool immediately so the planner can use it right away.
+    if wtype == WorkerType.SERVERLESS and req.worker_id not in scheduler.workers:
+        specs = {
+            "pubkey":       req.worker_id,
+            "vram_mb":      req.vram_mb,
+            "capabilities": endpoint.capabilities,
+            "platform":     endpoint.platform,
+            "p2p_url":      req.p2p_url,
+            "endpoint_url": req.endpoint_url,
+            "worker_type":  "serverless",
+        }
+        scheduler.workers[req.worker_id] = WorkerState(
+            pubkey          = req.worker_id,
+            ws              = None,
+            specs           = specs,
+            vram_total_mb   = req.vram_mb,
+            actual_free_mb  = req.vram_mb,
+            payment_address = req.payment_address,
+        )
+
+    return {
+        "status":    "registered",
+        "worker_id": req.worker_id,
+        "type":      wtype.value,
+    }
+
+
+@app.delete("/workers/{worker_id}", summary="Deregister a worker endpoint")
+async def deregister_worker_http(worker_id: str):
+    """
+    Permanently remove a worker from the registry and the in-memory pool.
+
+    For persistent workers still holding a WebSocket: the socket will remain
+    open until the worker disconnects naturally; it simply won't be selected
+    for new jobs once removed from the registry.
+    """
+    existed_in_registry = await scheduler.worker_registry.deregister(worker_id)
+
+    removed_from_pool = False
+    if worker_id in scheduler.workers:
+        del scheduler.workers[worker_id]
+        removed_from_pool = True
+
+    if not existed_in_registry and not removed_from_pool:
+        raise HTTPException(404, f"Worker '{worker_id}' not found in registry or active pool.")
+
+    return {
+        "status":              "deregistered",
+        "worker_id":           worker_id,
+        "removed_from_pool":   removed_from_pool,
+        "removed_from_registry": existed_in_registry,
+    }
+
+
+@app.get("/workers", summary="List all registered workers")
+async def list_workers_http():
+    """
+    Return the full worker map: durable registry records merged with live
+    session state from the in-memory pool.
+
+    Each entry indicates whether the worker is currently active (has a live
+    WebSocket or was recently invoked) and its last known VRAM pressure.
+    """
+    registry_entries = await scheduler.worker_registry.list_all()
+    registry_map = {ep.worker_id: ep for ep in registry_entries}
+
+    # Merge in any live workers not yet in the registry (shouldn't happen,
+    # but be defensive).
+    all_ids = set(registry_map) | set(scheduler.workers)
+
+    result = []
+    for wid in sorted(all_ids):
+        ep  = registry_map.get(wid)
+        ws  = scheduler.workers.get(wid)
+
+        entry = {
+            "worker_id":      wid,
+            "type":           ep.worker_type.value if ep else "unknown",
+            "platform":       ep.platform          if ep else "unknown",
+            "vram_mb":        ep.vram_mb            if ep else (ws.vram_total_mb if ws else 0),
+            "capabilities":   ep.capabilities       if ep else [],
+            "endpoint_url":   ep.endpoint_url       if ep else None,
+            "p2p_url":        ep.p2p_url            if ep else (ws.specs.get('p2p_url') if ws else None),
+            "payment_address": ep.payment_address   if ep else (ws.payment_address if ws else None),
+            "registered_at":  ep.registered_at      if ep else None,
+            # live session state
+            "session_active": ws is not None and (ws.ws is not None or ws.specs.get('worker_type') == 'serverless'),
+            "vram_used_mb":   ws.vram_used_mb        if ws else None,
+            "last_heartbeat": ws.last_heartbeat      if ws else None,
+        }
+        result.append(entry)
+
+    return {"workers": result, "total": len(result)}
+
+
+@app.post("/worker/ready", summary="Serverless worker readiness callback")
+async def worker_ready_http(req: WorkerReadyReq):
+    """
+    Called by a serverless worker once it has cold-started and its P2P
+    server is reachable at the reported p2p_url.
+
+    The scheduler patches the job topology with the real P2P URL and signals
+    the readiness gate so Phase 2 dispatch (EXECUTE_*) can proceed.
+    """
+    # 1. Update the in-memory WorkerState so the planner can use the URL
+    #    for future job topology patches within the same session.
+    w = scheduler.workers.get(req.worker_id)
+    if w is not None:
+        w.specs['p2p_url'] = req.p2p_url
+
+    # 2. Persist the p2p_url to the registry so it survives across scheduler
+    #    restarts within the same serverless pod lifetime.
+    await scheduler.worker_registry.update_p2p_url(req.worker_id, req.p2p_url)
+
+    # 3. Set the readiness event so _dispatch's wait gate can unblock.
+    readiness = scheduler._job_readiness.get(req.job_id, {})
+    event = readiness.get(req.worker_id)
+    if event is not None:
+        event.set()
+        print(f"🟢 [Ready] Worker {req.worker_id[:16]} ready for job {req.job_id[:8]} at {req.p2p_url}")
+    else:
+        # Worker reported ready but no gate exists — job may have timed out
+        # or the worker_id doesn't match what was planned.  Log and ignore.
+        print(f"⚠️ [Ready] No readiness gate for worker {req.worker_id[:16]} / job {req.job_id[:8]}")
+
+    return {"status": "acknowledged"}
+
+
+@app.post("/worker/result", summary="Serverless worker result callback")
+async def worker_result_http(req: WorkerResultReq):
+    """
+    Called by a serverless worker to deliver a completed job result.
+
+    Serverless workers cannot push results over a WebSocket, so they POST
+    here instead.  The payload mirrors the RESULT message in the WS protocol.
+    """
+    data = {
+        "job_id":          req.job_id,
+        "status":          req.status,
+        "output":          req.output,
+        "tokens_generated": req.tokens_generated,
+    }
+    await scheduler.handle_result(req.worker_id, data)
+    return {"status": "received"}
+
+
+class WorkerHeartbeatReq(BaseModel):
+    worker_id:    str
+    vram_free_mb: Optional[int] = None
+
+
+@app.post("/worker/heartbeat", summary="Serverless worker heartbeat")
+async def worker_heartbeat_http(req: WorkerHeartbeatReq):
+    """
+    Periodic heartbeat from a serverless worker.
+
+    Updates the in-memory WorkerState so the planner has a fresh VRAM reading.
+    Identical semantics to the HEARTBEAT message in the WebSocket protocol.
+    """
+    await scheduler.handle_heartbeat(req.worker_id, {"vram_free_mb": req.vram_free_mb})
+    return {"status": "ok"}

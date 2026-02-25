@@ -11,6 +11,26 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 # Scheduler connection
 SCHEDULER_URL = os.getenv("SCHEDULER_URL", "ws://localhost:8001/ws/worker")
 
+# HTTP base URL of the scheduler — used by serverless workers to call
+# POST /worker/ready and POST /worker/result instead of the WebSocket.
+# Derived automatically from SCHEDULER_URL if not set explicitly.
+def _derive_scheduler_http_url() -> str:
+    explicit = os.getenv("SCHEDULER_HTTP_URL")
+    if explicit:
+        return explicit.rstrip("/")
+    ws = os.getenv("SCHEDULER_URL", "ws://localhost:8001/ws/worker")
+    base = ws.replace("wss://", "https://").replace("ws://", "http://")
+    if "/ws" in base:
+        base = base[:base.index("/ws")]
+    return base.rstrip("/")
+
+SCHEDULER_HTTP_URL = _derive_scheduler_http_url()
+
+# Worker mode: "persistent" (default) keeps a long-lived WebSocket to the
+# scheduler. "serverless" registers via HTTP, receives control messages on
+# POST /control, and reports results via POST /worker/result.
+WORKER_MODE = os.getenv("WORKER_MODE", "persistent").lower()
+
 # Registry URL for layer downloads
 REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:8002")
 

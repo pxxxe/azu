@@ -572,6 +572,119 @@ def main():
             print(f"   ❌ ai_sdk test failed: {e}")
             traceback.print_exc()
 
+        # ==========================================
+        # 6. Serverless Worker Test
+        # ==========================================
+        log_section("🤖 6. Serverless Worker Dispatch Test")
+
+        # Terminate persistent workers for isolation — if they're still alive
+        # the scheduler may plan the job on them and never exercise the
+        # serverless HTTP dispatch path.
+        print("   🔌 Terminating persistent workers for isolation...")
+        for wid in list(worker_ids):
+            try:
+                runpod.terminate_pod(wid)
+                print(f"   ✅ Persistent worker terminated ({wid})")
+                worker_ids.remove(wid)
+            except Exception as e:
+                print(f"   ⚠️ Failed to terminate {wid}: {e}")
+
+        # Give the scheduler time to detect the disconnects and drop sessions
+        print("   ⏳ Waiting for scheduler to drop persistent sessions (15s)...")
+        time.sleep(15)
+
+        # Deploy one serverless worker — same image, different mode
+        sl_worker_env = {
+            'WORKER_MODE':        'serverless',
+            'SCHEDULER_HTTP_URL': sched_url,   # HTTP, NOT the ws:// URL
+            'REGISTRY_URL':       reg_url,
+            'HF_TOKEN':           HF_TOKEN,
+            'PUBLIC_KEY':         'null',
+            'PAYMENT_PROVIDER':   'hyperliquid',
+            # Worker resolves its own public URL via this template
+            'P2P_URL_TEMPLATE':   'https://{RUNPOD_POD_ID}-8003.proxy.runpod.net',
+            'LAYER_CACHE_DIR':    '/data/layers',
+            'AUTH_SECRET_KEY':    interworker_secret,
+        }
+
+        print("   🚀 Deploying serverless worker...")
+        sl_pod_id, sl_gpu = deploy_with_fallback("azu-worker-sl", WORKER_IMG, sl_worker_env)
+        worker_ids.append(sl_pod_id)  # tracked so teardown always cleans it up
+        print(f"   ✅ Serverless worker pod: {sl_pod_id} ({sl_gpu})")
+
+        # Wait for the worker to boot, start its P2P server, and call
+        # POST /workers on the scheduler.  Poll GET /workers until we see
+        # a serverless entry with session_active=true.
+        print("   ⏳ Waiting for serverless worker to register with scheduler...")
+        sl_registered = False
+        sl_worker_id  = None
+        for i in range(48):  # 4 minutes max (image pull + boot + register)
+            try:
+                res = requests.get(f"{sched_url}/workers", timeout=5)
+                if res.status_code == 200:
+                    workers = res.json().get('workers', [])
+                    active_sl = [
+                        w for w in workers
+                        if w.get('type') == 'serverless' and w.get('session_active')
+                    ]
+                    if active_sl:
+                        sl_worker_id  = active_sl[0]['worker_id']
+                        sl_registered = True
+                        print(f"   ✅ Serverless worker registered: {sl_worker_id[:20]}")
+                        print(f"      p2p_url:  {active_sl[0].get('p2p_url')}")
+                        print(f"      vram_mb:  {active_sl[0].get('vram_mb')}")
+                        break
+            except Exception as e:
+                pass
+            if i % 4 == 0:
+                print(f"      [{i*5}s] Still waiting...")
+            time.sleep(5)
+
+        if not sl_registered:
+            print("   ❌ Serverless worker never registered — skipping serverless inference test")
+        else:
+            # Submit a job.  Only the serverless worker is in the pool so the
+            # scheduler MUST route through the HTTP dispatch path.
+            print(f"\n   🧠 Submitting job (serverless-only pool)...")
+            sub_res = requests.post(f"{api_url}/submit", json={
+                "user_pubkey": funder.address,
+                "model_id":    TEST_MODEL,
+                "prompt":      "Name one planet in the solar system.",
+                "est_tokens":  20
+            })
+
+            if sub_res.status_code != 200:
+                print(f"   ❌ Submit failed: {sub_res.text}")
+            else:
+                sl_job_id = sub_res.json()['job_id']
+                print(f"   ✅ Job submitted: {sl_job_id}")
+
+                # Longer poll timeout — serverless workers have cold-start
+                # overhead on first job (layer downloads from registry).
+                sl_passed = False
+                for i in range(240):  # 20 minutes
+                    try:
+                        res    = requests.get(f"{api_url}/results/{sl_job_id}", timeout=5).json()
+                        status = res.get('status')
+                        if status == 'completed':
+                            print(f"\n   🎉 [SERVERLESS] RESULT: {res.get('output', '')}\n")
+                            sl_passed = True
+                            break
+                        if status == 'failed':
+                            print(f"\n   ❌ [SERVERLESS] Job failed: {res.get('error')}\n")
+                            break
+                        if i % 10 == 0:
+                            print(f"      Status: {status}... ({i*5}s elapsed)")
+                    except Exception as e:
+                        pass
+                    time.sleep(5)
+                else:
+                    print("   ❌ [SERVERLESS] Timed out waiting for result")
+
+                if sl_passed:
+                    print("   ✅ Serverless dispatch path: PASSED")
+                else:
+                    print("   ❌ Serverless dispatch path: FAILED")
     except KeyboardInterrupt:
         print("\n\n🛑 INTERRUPTED BY USER")
     except Exception as e:

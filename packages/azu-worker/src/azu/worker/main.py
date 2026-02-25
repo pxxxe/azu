@@ -553,9 +553,10 @@ class MoEWorker:
                             print(f"❌ [Job {job_id[:8]}] Token queue timeout")
                             break
                     else:
-                        # Duplicate task lost the encode race and has no tokens to process.
-                        # Nothing to do — exit cleanly.
-                        break
+                        # Duplicate task: prompt not yet encoded by winner, no tokens yet.
+                        # Yield and retry — winner will set prompt_encoded imminently.
+                        await asyncio.sleep(0.01)
+                        continue
 
                     with torch.no_grad():
                         hidden_states = self.model_manager.embeddings(input_tensor)

@@ -103,10 +103,13 @@ class P2PServer:
 
     async def start(self) -> None:
         """Start the P2P HTTP server."""
-        # MAX SIZE 1GB IS CRITICAL FOR MoE TENSORS
-        self.p2p_app = web.Application(client_max_size=P2P_MAX_SIZE)
+        # If p2p_app was pre-built (e.g. by _mount_control_endpoint in serverless
+        # mode), reuse it so any routes already registered are preserved.
+        # Creating a new Application here would discard those routes (e.g. /control).
+        if self.p2p_app is None:
+            self.p2p_app = web.Application(client_max_size=P2P_MAX_SIZE)
 
-        # Register routes
+        # Register core P2P routes
         self.p2p_app.router.add_post('/tensor_in', self.handle_tensor_ingress)
         self.p2p_app.router.add_post('/tensor_in_ipc', self.handle_tensor_ipc_ingress)
         self.p2p_app.router.add_post('/token_in', self.handle_token_ingress)

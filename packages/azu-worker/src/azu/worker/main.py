@@ -207,6 +207,12 @@ class MoEWorker:
                 except Exception as e:
                     print(f"⚠️ [Job {job_id}] Failed to trigger mesh handshake: {e}")
 
+            # Serverless: report ready so the scheduler unblocks Phase 2 dispatch.
+            # The P2P server is already running (started before registration), so
+            # p2p_url is known immediately — no cold-start delay.
+            if WORKER_MODE == "serverless" and my_p2p_url:
+                asyncio.create_task(self._report_ready(job_id_full, my_p2p_url))
+
         elif msg_type == 'EXECUTE_DENSE':
             asyncio.create_task(self._safe_task_wrapper(
                 self._process_dense(msg, ws), f"EXECUTE_DENSE-{job_id}"))
@@ -437,13 +443,23 @@ class MoEWorker:
 
     async def _run_serverless(self):
         """
-        Serverless mode: no WebSocket.  Register once, then sit idle
-        waiting for the scheduler to POST control messages to /control.
+        Serverless mode: no WebSocket.
+
+        On startup:
+          1. Mounts POST /control on the P2P app (inbound channel for the scheduler)
+          2. Starts the combined P2P + control HTTP server on :8003
+          3. Registers with the scheduler (advertises worker_id + endpoint_url)
+          4. Sends periodic heartbeats
+          5. Idles — the scheduler drives execution by POSTing to /control
+
+        The scheduler pushes JOB_START / EXECUTE_* to /control directly.
+        No polling. No long-lived outbound connection.
         """
-        # Mount /control on the P2P app before start() initialises the runner
+        # Mount /control on the P2P app BEFORE start() so the route is
+        # registered on the same web.Application (not discarded by start()).
         self._mount_control_endpoint()
 
-        # Start the P2P+control HTTP server
+        # Start the P2P + control HTTP server
         await self.p2p_server.start()
 
         p2p_url = self.get_p2p_url()

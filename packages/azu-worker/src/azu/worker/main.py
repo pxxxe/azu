@@ -60,6 +60,26 @@ except ImportError:
     HAS_WALLET = False
 
 
+# ── Health check flag ──────────────────────────────────────────────────────
+# Set True once this worker has registered with the azu scheduler.
+# Used by the /ping endpoint for RunPod load-balancer health checks.
+_worker_ready: bool = False
+
+
+async def handle_ping(request):
+    """
+    GET /ping — load balancer health check.
+
+    Returns 200 when the worker is registered and ready to receive azu jobs.
+    Returns 204 while the worker is still starting up (RunPod treats 204 as
+    "starting" and will not route traffic yet, but will not kill the worker).
+
+    This endpoint is not RunPod-specific; any HTTP load balancer can use it.
+    """
+    status = 200 if _worker_ready else 204
+    return web.Response(status=status)
+
+
 class MoEWorker:
     """
     Main worker class that coordinates all worker operations.
@@ -328,6 +348,9 @@ class MoEWorker:
 
         self.p2p_server.p2p_app.router.add_post('/control', handle_control)
 
+        # Health check — must be on the same port as PORT_HEALTH env var (8003).
+        self.p2p_server.p2p_app.router.add_get('/ping', handle_ping)
+
     async def _register_with_scheduler(self, p2p_url: Optional[str]):
         """
         Call POST /workers on the scheduler to upsert this worker's endpoint.
@@ -336,6 +359,8 @@ class MoEWorker:
         worker's own P2P server, since that's where the scheduler will POST
         control messages.
         """
+        global _worker_ready
+
         endpoint_url = f"{p2p_url}/control" if p2p_url else ""
 
         payload = {
@@ -356,6 +381,8 @@ class MoEWorker:
                                     timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status in (200, 201):
                     print(f"✅ [Serverless] Registered with scheduler at {url}")
+                    _worker_ready = True
+                    print("✅ Worker registered with azu scheduler — health check now returns 200")
                 else:
                     body = await resp.text()
                     print(f"⚠️ [Serverless] Registration returned HTTP {resp.status}: {body[:200]}")

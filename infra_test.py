@@ -89,6 +89,7 @@ TARGET_TOTAL_VRAM = 24  # GB needed for Mixtral test
 
 
 runpod.api_key = RUNPOD_API_KEY
+RUNPOD_REST_URL = "https://rest.runpod.io/v1"
 
 # ==========================================
 # HELPER FUNCTIONS
@@ -222,6 +223,122 @@ def deploy_with_fallback(name, image, env_vars):
     raise Exception(f"❌ Could not deploy {name} on any GPU type")
 
 
+
+def runpod_rest(method: str, path: str, body: dict = None) -> dict:
+    """
+    Call the RunPod REST API.
+    Auth: Authorization: Bearer KEY (unlike GraphQL which uses ?api_key=).
+    Docs: https://docs.runpod.io/api-reference
+    """
+    resp = requests.request(
+        method,
+        f"{RUNPOD_REST_URL}{path}",
+        headers={
+            "Authorization": f"Bearer {RUNPOD_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=body,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json() if resp.content else {}
+
+
+def create_serverless_endpoint(name: str, image: str, env_vars: dict):
+    """
+    Create a RunPod *Load Balancing* Serverless endpoint for the azu-worker.
+
+    Why load balancing, not queue-based:
+      The azu-worker runs its own aiohttp HTTP server on port 8003.  It does
+      NOT implement the RunPod queue handler pattern (runpod.serverless.start).
+      Queue-based endpoints expect that pattern and will kill workers that
+      don't speak it.  Load balancing endpoints forward HTTP directly to the
+      worker's server — matching azu's architecture exactly.
+
+    How the azu scheduler finds the worker:
+      On startup the worker resolves P2P_URL_TEMPLATE using RUNPOD_POD_ID
+      (injected by RunPod into every container, including serverless workers),
+      then POSTs that URL to the azu scheduler's POST /workers endpoint.
+      The scheduler subsequently talks to the worker directly via the pod
+      proxy URL — it never goes through RunPod's endpoint URL.
+
+    Health check:
+      RunPod's load balancer polls GET /ping on PORT_HEALTH.  The azu-worker
+      must expose this route (returning 200 when ready, 204 while starting).
+      See packages/azu-worker/src/azu/worker/main.py.
+
+    Returns:
+        (endpoint_id, template_id, gpu_type_full_name)
+    """
+    # 1. Create a serverless template (SDK handles auth correctly).
+    print(f"   \U0001f4cb Creating serverless template for {name}...")
+    new_template = runpod.create_template(
+        name=name,
+        image_name=image,
+        is_serverless=True,
+        container_disk_in_gb=10,
+        env=env_vars,          # dict {key: value}  -- SDK requires dict
+    )
+    template_id = new_template["id"]
+    print(f"   \u2705 Template created: {template_id}")
+
+    # 2. Create a Load Balancing endpoint via the REST API.
+    #    REST API uses full GPU names in gpuTypeIds[] (not tier codes).
+    #    endpointType="LOAD_BALANCER" enables direct HTTP routing to worker.
+    print(f"   \U0001f50e Creating load balancing endpoint for {name}...")
+    for gpu_name in GPU_TYPES_SECURE:
+        try:
+            body = {
+                "name": name,
+                "templateId": template_id,
+                "gpuTypeIds": [gpu_name],
+                "gpuCount": 1,
+                "endpointType": "LOAD_BALANCER",   # direct HTTP to worker
+                "workersMin": 1,    # keep one warm so worker can register
+                "workersMax": 1,
+                "idleTimeout": 60,
+                **({"networkVolumeId": VOLUME_ID} if VOLUME_ID else {}),
+            }
+            result = runpod_rest("POST", "/endpoints", body)
+            endpoint_id = result["id"]
+            print(f"   \u2705 Endpoint created: {endpoint_id} ({gpu_name})")
+            return endpoint_id, template_id, gpu_name
+        except Exception as e:
+            print(f"   \u26a0\ufe0f  {gpu_name}: {e}")
+
+    raise Exception(f"\u274c Could not create load balancing endpoint {name} on any GPU")
+
+
+def delete_serverless_endpoint(endpoint_id: str, template_id: str, gpu_name: str):
+    """
+    Delete a RunPod Serverless endpoint and its backing template.
+
+    Scale to 0 first (RunPod requires workersMin=workersMax=0 before delete),
+    then delete the endpoint, then delete the template.
+    """
+    # Scale to zero first
+    try:
+        runpod_rest("PATCH", f"/endpoints/{endpoint_id}", {
+            "workersMin": 0,
+            "workersMax": 0,
+        })
+        print(f"   \u2705 Endpoint scaled to 0 workers")
+    except Exception as e:
+        print(f"   \u26a0\ufe0f Could not scale to 0 (continuing): {e}")
+
+    try:
+        runpod_rest("DELETE", f"/endpoints/{endpoint_id}")
+        print(f"   \u2705 Endpoint deleted ({endpoint_id})")
+    except Exception as e:
+        print(f"   \u26a0\ufe0f Failed to delete endpoint {endpoint_id}: {e}")
+
+    try:
+        runpod_rest("DELETE", f"/templates/{template_id}")
+        print(f"   \u2705 Template deleted ({template_id})")
+    except Exception as e:
+        print(f"   \u26a0\ufe0f Failed to delete template {template_id}: {e}")
+
+
 async def transfer_hyperliquid(from_account, to_address, amount_eth, rpc_url):
     """
     Transfer native token (ETH/HYPE) on Hyperliquid.
@@ -286,6 +403,9 @@ def main():
     core_pod_id = None
     worker_ids = []
     worker_gpus = []
+    sl_endpoint_id = None   # RunPod Serverless LB endpoint (section 6)
+    sl_template_id = None   # backing template
+    sl_gpu_name    = None   # GPU name used (needed for teardown)
 
     try:
         # ==========================================
@@ -605,12 +725,24 @@ def main():
             'P2P_URL_TEMPLATE':   'https://{RUNPOD_POD_ID}-8003.proxy.runpod.net',
             'LAYER_CACHE_DIR':    '/data/layers',
             'AUTH_SECRET_KEY':    interworker_secret,
+            # Load balancer health check — must match the aiohttp server port.
+            # The azu-worker exposes GET /ping on port 8003 (see worker main.py).
+            'PORT':              '8003',
+            'PORT_HEALTH':       '8003',
         }
 
-        print("   🚀 Deploying serverless worker...")
-        sl_pod_id, sl_gpu = deploy_with_fallback("azu-worker-sl", WORKER_IMG, sl_worker_env)
-        worker_ids.append(sl_pod_id)  # tracked so teardown always cleans it up
-        print(f"   ✅ Serverless worker pod: {sl_pod_id} ({sl_gpu})")
+        # Deploy as a RunPod Load Balancing endpoint — NOT a queue-based endpoint
+        # and NOT a pod.  The azu-worker runs its own aiohttp server on port 8003
+        # and does not implement RunPod's queue handler pattern.
+        # workersMin=1 keeps one worker alive so it can register with the azu
+        # scheduler on startup and stay ready to receive HTTP dispatch.
+        # RunPod injects RUNPOD_POD_ID into every serverless container, so
+        # P2P_URL_TEMPLATE resolves identically to a pod deployment.
+        print("   🚀 Creating RunPod Load Balancing endpoint for worker...")
+        sl_endpoint_id, sl_template_id, sl_gpu_name = create_serverless_endpoint(
+            "azu-worker-sl", WORKER_IMG, sl_worker_env
+        )
+        print(f"   ✅ Endpoint ready: {sl_endpoint_id} ({sl_gpu_name})")
 
         # Wait for the worker to boot, start its P2P server, and call
         # POST /workers on the scheduler.  Poll GET /workers until we see
@@ -708,6 +840,11 @@ def main():
                 runpod.terminate_pod(wid)
                 print(f"   ✅ Worker terminated ({wid})")
             except: print(f"   ⚠️ Failed to term worker ({wid})")
+
+        # Delete the serverless endpoint and template.
+        # Must scale to 0 first (RunPod requirement).
+        if sl_endpoint_id:
+            delete_serverless_endpoint(sl_endpoint_id, sl_template_id, sl_gpu_name)
 
         print("\n👋 Done.")
 

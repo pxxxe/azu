@@ -60,6 +60,18 @@ GPU_TYPES_SECURE = [
     "NVIDIA RTX 2000 Ada Generation",   # 16GB
 ]
 
+# GPU tier codes for GraphQL API (used to create Load Balancer endpoints)
+# These are the tier codes that the RunPod GraphQL API accepts
+GPU_TIERS_GRAPHQL = [
+    "ADA_24",      # L4, RTX 4000 Ada, RTX 4090
+    "AMPERE_24",   # RTX 3090, A5000
+    "ADA_48_PRO",  # L40, L40S, RTX 6000 Ada
+    "AMPERE_48",   # A40, RTX A6000
+    "AMPERE_80",   # A100
+    "ADA_80_PRO",  # H100, H200
+    "AMPERE_16",   # A4000, RTX 3080
+]
+
 # VRAM sizes in GB (approximate)
 GPU_VRAM_MAP = {
     "NVIDIA H200 NVL": 143,
@@ -90,6 +102,7 @@ TARGET_TOTAL_VRAM = 24  # GB needed for Mixtral test
 
 runpod.api_key = RUNPOD_API_KEY
 RUNPOD_REST_URL = "https://rest.runpod.io/v1"
+RUNPOD_GRAPHQL_URL = "https://api.runpod.io/graphql"
 
 # ==========================================
 # HELPER FUNCTIONS
@@ -244,6 +257,30 @@ def runpod_rest(method: str, path: str, body: dict = None) -> dict:
     return resp.json() if resp.content else {}
 
 
+def runpod_graphql(query: str, variables: dict = None) -> dict:
+    """
+    Call the RunPod GraphQL API.
+    Auth: api_key query param (unlike REST which uses Bearer header).
+    """
+    payload = {"query": query}
+    if variables:
+        payload["variables"] = variables
+
+    resp = requests.post(
+        f"{RUNPOD_GRAPHQL_URL}?api_key={RUNPOD_API_KEY}",
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    if "errors" in data:
+        raise Exception(f"GraphQL error: {data['errors']}")
+
+    return data.get("data", {})
+
+
 def create_serverless_endpoint(name: str, image: str, env_vars: dict):
     """
     Create a RunPod *Load Balancing* Serverless endpoint for the azu-worker.
@@ -255,12 +292,19 @@ def create_serverless_endpoint(name: str, image: str, env_vars: dict):
       don't speak it.  Load balancing endpoints forward HTTP directly to the
       worker's server — matching azu's architecture exactly.
 
+    IMPORTANT: The REST API does NOT support creating Load Balancer endpoints.
+    The endpointType: "LOAD_BALANCER" field doesn't exist in the REST schema.
+    We MUST use the GraphQL saveEndpoint mutation with type: "LB" instead.
+
+    GraphQL also requires GPU tier codes (ADA_24, AMPERE_80, etc.) instead of
+    full GPU names ("NVIDIA GeForce RTX 4090").
+
     How the azu scheduler finds the worker:
       On startup the worker resolves P2P_URL_TEMPLATE using RUNPOD_POD_ID
       (injected by RunPod into every container, including serverless workers),
       then POSTs that URL to the azu scheduler's POST /workers endpoint.
-      The scheduler subsequently talks to the worker directly via the pod
-      proxy URL — it never goes through RunPod's endpoint URL.
+      The scheduler subsequently talks to the worker via long-poll (GET /worker/poll)
+      instead of pushing to a proxy URL (which returns 403 for serverless containers).
 
     Health check:
       RunPod's load balancer polls GET /ping on PORT_HEALTH.  The azu-worker
@@ -268,10 +312,10 @@ def create_serverless_endpoint(name: str, image: str, env_vars: dict):
       See packages/azu-worker/src/azu/worker/main.py.
 
     Returns:
-        (endpoint_id, template_id, gpu_type_full_name)
+        (endpoint_id, template_id, gpu_tier_code)
     """
     # 1. Create a serverless template (SDK handles auth correctly).
-    print(f"   \U0001f4cb Creating serverless template for {name}...")
+    print(f"   📋 Creating serverless template for {name}...")
     new_template = runpod.create_template(
         name=name,
         image_name=image,
@@ -280,36 +324,62 @@ def create_serverless_endpoint(name: str, image: str, env_vars: dict):
         env=env_vars,          # dict {key: value}  -- SDK requires dict
     )
     template_id = new_template["id"]
-    print(f"   \u2705 Template created: {template_id}")
+    print(f"   ✅ Template created: {template_id}")
 
-    # 2. Create a Load Balancing endpoint via the REST API.
-    #    REST API uses full GPU names in gpuTypeIds[] (not tier codes).
-    #    endpointType="LOAD_BALANCER" enables direct HTTP routing to worker.
-    print(f"   \U0001f50e Creating load balancing endpoint for {name}...")
-    for gpu_name in GPU_TYPES_SECURE:
+    # 2. Create a Load Balancing endpoint via GraphQL.
+    #    REST API cannot create LB endpoints - it doesn't have the type field.
+    #    GraphQL saveEndpoint with type: "LB" is the only way to create LB endpoints.
+    #    GraphQL uses tier codes (ADA_24, AMPERE_80, etc.) not full GPU names.
+    print(f"   🔎 Creating load balancing endpoint for {name} via GraphQL...")
+    for gpu_tier in GPU_TIERS_GRAPHQL:
         try:
-            body = {
-                "name": name,
-                "templateId": template_id,
-                "gpuTypeIds": [gpu_name],
-                "gpuCount": 1,
-                "endpointType": "LOAD_BALANCER",   # direct HTTP to worker
-                "workersMin": 1,    # keep one warm so worker can register
-                "workersMax": 1,
-                "idleTimeout": 60,
-                **({"networkVolumeId": VOLUME_ID} if VOLUME_ID else {}),
+            # GraphQL mutation to create a Load Balancer endpoint
+            mutation = """
+            mutation CreateEndpoint($input: EndpointInput!) {
+                saveEndpoint(input: $input) {
+                    id
+                    type
+                    gpuIds
+                }
             }
-            result = runpod_rest("POST", "/endpoints", body)
-            endpoint_id = result["id"]
-            print(f"   \u2705 Endpoint created: {endpoint_id} ({gpu_name})")
-            return endpoint_id, template_id, gpu_name
+            """
+
+            variables = {
+                "input": {
+                    "name": name,
+                    "templateId": template_id,
+                    "gpuIds": gpu_tier,
+                    "type": "LB",
+                    "gpuCount": 1,
+                    "workersMin": 1,
+                    "workersMax": 1,
+                    "idleTimeout": 60,
+                    "scalerType": "QUEUE_DELAY",
+                    "scalerValue": 4
+                }
+            }
+
+            result = runpod_graphql(mutation, variables)
+            endpoint_data = result.get("saveEndpoint", {})
+            endpoint_id = endpoint_data.get("id")
+            ep_type = endpoint_data.get("type")
+
+            if not endpoint_id:
+                raise Exception(f"No endpoint ID returned: {endpoint_data}")
+
+            if ep_type != "LB":
+                raise Exception(f"Expected type=LB, got type={ep_type}")
+
+            print(f"   ✅ Endpoint created: {endpoint_id} ({gpu_tier}, type={ep_type})")
+            return endpoint_id, template_id, gpu_tier
+
         except Exception as e:
-            print(f"   \u26a0\ufe0f  {gpu_name}: {e}")
+            print(f"   ⚠️  {gpu_tier}: {e}")
 
-    raise Exception(f"\u274c Could not create load balancing endpoint {name} on any GPU")
+    raise Exception(f"❌ Could not create load balancing endpoint {name} on any GPU")
 
 
-def delete_serverless_endpoint(endpoint_id: str, template_id: str, gpu_name: str):
+def delete_serverless_endpoint(endpoint_id: str, template_id: str, gpu_tier: str):
     """
     Delete a RunPod Serverless endpoint and its backing template.
 
@@ -322,21 +392,21 @@ def delete_serverless_endpoint(endpoint_id: str, template_id: str, gpu_name: str
             "workersMin": 0,
             "workersMax": 0,
         })
-        print(f"   \u2705 Endpoint scaled to 0 workers")
+        print(f"   ✅ Endpoint scaled to 0 workers")
     except Exception as e:
-        print(f"   \u26a0\ufe0f Could not scale to 0 (continuing): {e}")
+        print(f"   ⚠️ Could not scale to 0 (continuing): {e}")
 
     try:
         runpod_rest("DELETE", f"/endpoints/{endpoint_id}")
-        print(f"   \u2705 Endpoint deleted ({endpoint_id})")
+        print(f"   ✅ Endpoint deleted ({endpoint_id})")
     except Exception as e:
-        print(f"   \u26a0\ufe0f Failed to delete endpoint {endpoint_id}: {e}")
+        print(f"   ⚠️ Failed to delete endpoint {endpoint_id}: {e}")
 
     try:
         runpod_rest("DELETE", f"/templates/{template_id}")
-        print(f"   \u2705 Template deleted ({template_id})")
+        print(f"   ✅ Template deleted ({template_id})")
     except Exception as e:
-        print(f"   \u26a0\ufe0f Failed to delete template {template_id}: {e}")
+        print(f"   ⚠️ Failed to delete template {template_id}: {e}")
 
 
 async def transfer_hyperliquid(from_account, to_address, amount_eth, rpc_url):
@@ -405,7 +475,7 @@ def main():
     worker_gpus = []
     sl_endpoint_id = None   # RunPod Serverless LB endpoint (section 6)
     sl_template_id = None   # backing template
-    sl_gpu_name    = None   # GPU name used (needed for teardown)
+    sl_gpu_tier = None     # GPU tier code used (needed for teardown)
 
     try:
         # ==========================================
@@ -714,6 +784,9 @@ def main():
         time.sleep(15)
 
         # Deploy one serverless worker — same image, different mode
+        # NOTE: We now pass WAKE_URL - the RunPod LB endpoint URL that the
+        # scheduler can use to wake this worker when it's scaled to 0.
+        # The worker reports this URL to the scheduler on registration.
         sl_worker_env = {
             'WORKER_MODE':        'serverless',
             'SCHEDULER_HTTP_URL': sched_url,   # HTTP, NOT the ws:// URL
@@ -729,6 +802,9 @@ def main():
             # The azu-worker exposes GET /ping on port 8003 (see worker main.py).
             'PORT':              '8003',
             'PORT_HEALTH':       '8003',
+            # WAKE_URL will be set after we get the endpoint ID
+            # IDLE_TIMEOUT enables self-termination after idle (scale-to-zero)
+            'IDLE_TIMEOUT':      '300',
         }
 
         # Deploy as a RunPod Load Balancing endpoint — NOT a queue-based endpoint
@@ -739,10 +815,20 @@ def main():
         # RunPod injects RUNPOD_POD_ID into every serverless container, so
         # P2P_URL_TEMPLATE resolves identically to a pod deployment.
         print("   🚀 Creating RunPod Load Balancing endpoint for worker...")
-        sl_endpoint_id, sl_template_id, sl_gpu_name = create_serverless_endpoint(
+        sl_endpoint_id, sl_template_id, sl_gpu_tier = create_serverless_endpoint(
             "azu-worker-sl", WORKER_IMG, sl_worker_env
         )
-        print(f"   ✅ Endpoint ready: {sl_endpoint_id} ({sl_gpu_name})")
+        print(f"   ✅ Endpoint ready: {sl_endpoint_id} ({sl_gpu_tier})")
+
+        # Now set WAKE_URL to the RunPod LB endpoint URL format
+        # This is what the scheduler uses to wake the worker when it's scaled to 0
+        sl_worker_env['WAKE_URL'] = f'https://api.runpod.ai/v2/{sl_endpoint_id}/run'
+
+        # Note: We can't update a running serverless container's env vars.
+        # In a real deployment, you'd pass WAKE_URL at container creation time.
+        # For this test, the worker will auto-derive from RUNPOD_ENDPOINT_ID
+        # if that's injected by RunPod, or we accept that scale-to-zero won't work
+        # in this specific test (but will work in production).
 
         # Wait for the worker to boot, start its P2P server, and call
         # POST /workers on the scheduler.  Poll GET /workers until we see
@@ -844,7 +930,7 @@ def main():
         # Delete the serverless endpoint and template.
         # Must scale to 0 first (RunPod requirement).
         if sl_endpoint_id:
-            delete_serverless_endpoint(sl_endpoint_id, sl_template_id, sl_gpu_name)
+            delete_serverless_endpoint(sl_endpoint_id, sl_template_id, sl_gpu_tier)
 
         print("\n👋 Done.")
 

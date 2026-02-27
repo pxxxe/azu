@@ -15,12 +15,13 @@ Two modes controlled by WORKER_MODE env var:
       1. Starts the P2P HTTP server on :8003 (unchanged)
       2. Resolves its public P2P URL
       3. Calls POST /workers on the scheduler to upsert its endpoint record
-      4. Waits — the scheduler invokes it by POSTing control messages to
-         POST /control (mounted on the same aiohttp app as the P2P server)
+      4. Polls scheduler via GET /worker/poll/{worker_id} for control messages
+         (instead of scheduler POSTing to worker's proxy URL, which fails with 403)
       5. When a job completes, POSTs result to POST /worker/result
       6. Sends periodic heartbeats to POST /worker/heartbeat
+      7. Idle watchdog terminates worker after IDLE_TIMEOUT seconds without a job
 
-The /control endpoint is added to the existing P2PServer aiohttp app so
+The /control endpoint is still added to the existing P2PServer aiohttp app so
 there is no second HTTP server or second port.  Tensor transfer (P2P)
 is completely untouched.
 """
@@ -46,6 +47,8 @@ from azu.worker.config import (
     P2P_PORT,
     DEFAULT_CPU_VRAM_MB,
     PAYMENT_PROVIDER,
+    WAKE_URL,
+    IDLE_TIMEOUT,
 )
 from azu.worker.layer_loader import LayerLoader
 from azu.worker.model_manager import ModelManager
@@ -58,26 +61,6 @@ try:
     HAS_WALLET = True
 except ImportError:
     HAS_WALLET = False
-
-
-# ── Health check flag ──────────────────────────────────────────────────────
-# Set True once this worker has registered with the azu scheduler.
-# Used by the /ping endpoint for RunPod load-balancer health checks.
-_worker_ready: bool = False
-
-
-async def handle_ping(request):
-    """
-    GET /ping — load balancer health check.
-
-    Returns 200 when the worker is registered and ready to receive azu jobs.
-    Returns 204 while the worker is still starting up (RunPod treats 204 as
-    "starting" and will not route traffic yet, but will not kill the worker).
-
-    This endpoint is not RunPod-specific; any HTTP load balancer can use it.
-    """
-    status = 200 if _worker_ready else 204
-    return web.Response(status=status)
 
 
 class MoEWorker:
@@ -135,6 +118,9 @@ class MoEWorker:
             device=self.device,
             dtype=self.dtype
         )
+
+        # ── serverless idle tracking (new) ───────────────────────────────────────
+        self._last_job_time = time.time() if WORKER_MODE == "serverless" else None
 
         sys.stdout.flush()
 
@@ -348,9 +334,6 @@ class MoEWorker:
 
         self.p2p_server.p2p_app.router.add_post('/control', handle_control)
 
-        # Health check — must be on the same port as PORT_HEALTH env var (8003).
-        self.p2p_server.p2p_app.router.add_get('/ping', handle_ping)
-
     async def _register_with_scheduler(self, p2p_url: Optional[str]):
         """
         Call POST /workers on the scheduler to upsert this worker's endpoint.
@@ -359,8 +342,6 @@ class MoEWorker:
         worker's own P2P server, since that's where the scheduler will POST
         control messages.
         """
-        global _worker_ready
-
         endpoint_url = f"{p2p_url}/control" if p2p_url else ""
 
         payload = {
@@ -372,6 +353,7 @@ class MoEWorker:
             "platform":        os.getenv("PLATFORM", "self_hosted"),
             "payment_address": self.payment_address,
             "p2p_url":         p2p_url,
+            "wake_url":        WAKE_URL,  # NEW: pass wake URL so scheduler can wake us if scaled to 0
         }
 
         session = await self._get_p2p_session()
@@ -381,8 +363,6 @@ class MoEWorker:
                                     timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status in (200, 201):
                     print(f"✅ [Serverless] Registered with scheduler at {url}")
-                    _worker_ready = True
-                    print("✅ Worker registered with azu scheduler — health check now returns 200")
                 else:
                     body = await resp.text()
                     print(f"⚠️ [Serverless] Registration returned HTTP {resp.status}: {body[:200]}")
@@ -468,6 +448,71 @@ class MoEWorker:
             except Exception:
                 pass  # heartbeat failure is non-fatal
 
+    async def _poll_scheduler(self):
+        """
+        Poll the scheduler for control messages via long-poll.
+
+        This replaces the push model (scheduler POSTing to worker proxy URL)
+        which fails on RunPod LB serverless because proxy URLs return 403.
+
+        The worker calls GET /worker/poll/{worker_id} and holds the request
+        for ~29 seconds. The scheduler either returns a queued message (200)
+        or times out (204), at which point we immediately re-poll.
+        """
+        import time
+        session = await self._get_p2p_session()
+        poll_url = f"{SCHEDULER_HTTP_URL}/worker/poll/{self._worker_id}"
+
+        while True:
+            try:
+                # Update last poll time for idle watchdog
+                self._last_job_time = time.time()
+
+                async with session.get(
+                    poll_url,
+                    timeout=aiohttp.ClientTimeout(total=35),  # slightly longer than scheduler's 29s
+                ) as resp:
+                    if resp.status == 200:
+                        msg = await resp.json()
+                        msg_type = msg.get("type", "unknown")
+                        print(f"📥 [Poll] Received: {msg_type}")
+                        await self._dispatch_message(msg, ws=None)
+                    elif resp.status == 204:
+                        # No message — normal, just re-poll
+                        pass
+                    else:
+                        body = await resp.text()
+                        print(f"⚠️ [Poll] Unexpected status {resp.status}: {body[:200]}")
+
+            except asyncio.CancelledError:
+                break
+            except asyncio.TimeoutError:
+                # Scheduler timed out — normal, re-poll
+                pass
+            except Exception as e:
+                print(f"⚠️ [Poll] Error: {e}")
+                await asyncio.sleep(1)  # brief backoff on error
+
+    async def _idle_watchdog(self):
+        """
+        Monitor idle time and self-terminate when IDLE_TIMEOUT is exceeded.
+
+        This enables scale-to-zero for cost savings.  After IDLE_TIMEOUT seconds
+        without receiving a job (meaning no poll requests are being processed),
+        the worker exits cleanly.
+        """
+        import time
+        while True:
+            await asyncio.sleep(30)
+            if WORKER_MODE != "serverless":
+                continue
+
+            idle_time = time.time() - self._last_job_time
+            if idle_time > IDLE_TIMEOUT:
+                print(f"😴 [Idle] No activity for {idle_time:.0f}s > {IDLE_TIMEOUT}s — terminating")
+                # Clean shutdown
+                os._exit(0)
+
     async def _run_serverless(self):
         """
         Serverless mode: no WebSocket.
@@ -475,12 +520,16 @@ class MoEWorker:
         On startup:
           1. Mounts POST /control on the P2P app (inbound channel for the scheduler)
           2. Starts the combined P2P + control HTTP server on :8003
-          3. Registers with the scheduler (advertises worker_id + endpoint_url)
-          4. Sends periodic heartbeats
-          5. Idles — the scheduler drives execution by POSTing to /control
+          3. Registers with the scheduler (advertises worker_id + endpoint_url + wake_url)
+          4. Starts background polling loop (long-poll for control messages)
+          5. Starts idle watchdog (self-terminates after idle timeout)
+          6. Sends periodic heartbeats
+          7. Idles — the scheduler drives execution via poll responses
 
-        The scheduler pushes JOB_START / EXECUTE_* to /control directly.
-        No polling. No long-lived outbound connection.
+        NOTE: The scheduler NO LONGER pushes to the worker's proxy URL.
+        Instead, the worker polls GET /worker/poll/{worker_id} and the scheduler
+        returns queued messages. This avoids the 403 error that occurs when the
+        scheduler tries to POST to {podId}-{port}.proxy.runpod.net for serverless.
         """
         # Mount /control on the P2P app BEFORE start() so the route is
         # registered on the same web.Application (not discarded by start()).
@@ -497,14 +546,17 @@ class MoEWorker:
 
         print(f"🌐 [Serverless] P2P/Control URL: {p2p_url}")
 
-        # Register endpoint with scheduler
+        # Register endpoint with scheduler (includes wake_url for scale-to-zero)
         await self._register_with_scheduler(p2p_url)
 
-        # Start background heartbeat
+        # Start background tasks
         asyncio.create_task(self._serverless_heartbeat())
+        asyncio.create_task(self._poll_scheduler())
+        asyncio.create_task(self._idle_watchdog())
 
         print(f"✅ [Serverless] Worker {self._worker_id} ready. "
-              f"Waiting for scheduler to POST to {p2p_url}/control ...")
+              f"Polling scheduler at {SCHEDULER_HTTP_URL}/worker/poll/{self._worker_id} ...")
+        print(f"   Idle timeout: {IDLE_TIMEOUT}s (scale-to-zero enabled)")
 
         # Keep process alive — aiohttp runner owns the event loop from here
         while True:

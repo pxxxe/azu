@@ -4,6 +4,7 @@ Contains environment variables and constants.
 """
 
 import os
+import time
 
 # HuggingFace token for model downloads (optional)
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -27,8 +28,8 @@ def _derive_scheduler_http_url() -> str:
 SCHEDULER_HTTP_URL = _derive_scheduler_http_url()
 
 # Worker mode: "persistent" (default) keeps a long-lived WebSocket to the
-# scheduler. "serverless" registers via HTTP, receives control messages on
-# POST /control, and reports results via POST /worker/result.
+# scheduler. "serverless" registers via HTTP, polls scheduler for control messages
+# via GET /worker/poll/{worker_id}, and reports results via POST /worker/result.
 WORKER_MODE = os.getenv("WORKER_MODE", "persistent").lower()
 
 # Registry URL for layer downloads
@@ -55,6 +56,29 @@ MAX_DOWNLOAD_SEMAPHORE = 10
 
 # VRAM settings
 DEFAULT_CPU_VRAM_MB = 32000
+
+# ============================================================================
+# Serverless Configuration (NEW)
+# ============================================================================
+
+# WAKE_URL: URL used by the scheduler to wake a dormant serverless worker.
+# For RunPod LB endpoints, this is typically:
+#   https://api.runpod.ai/v2/{endpoint_id}/run
+# The worker reports this URL to the scheduler on registration so the scheduler
+# can boot a cold worker when needed (scale-from-zero).
+# If not set explicitly, the worker will try to derive from RUNPOD_ENDPOINT_ID.
+WAKE_URL = os.getenv("WAKE_URL")
+
+# If WAKE_URL is not set, check if RunPod injected ENDPOINT_ID
+if not WAKE_URL and os.getenv("RUNPOD_ENDPOINT_ID"):
+    WAKE_URL = f"https://api.runpod.ai/v2/{os.getenv('RUNPOD_ENDPOINT_ID')}/run"
+
+# IDLE_TIMEOUT: Seconds of inactivity before the worker self-terminates.
+# Enables scale-to-zero for cost savings.  The idle watchdog monitors poll activity
+# and exits cleanly after IDLE_TIMEOUT seconds without receiving a job.
+# Set to 0 to disable (worker runs forever).
+# Default: 300 seconds (5 minutes)
+IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "300"))
 
 # ============================================================================
 # Payment Configuration

@@ -10,6 +10,7 @@ Separates two concerns previously conflated inside MoEScheduler.workers:
     • hardware specs: VRAM, capabilities, platform
     • payment address
     • static P2P URL for persistent workers
+    • wake_url for serverless workers (scale-from-zero)
 
   Session state  (MoEScheduler.workers — ephemeral):
     • open WebSocket handle
@@ -70,6 +71,9 @@ class WorkerEndpoint:
     # For serverless workers this starts None and is patched by update_p2p_url()
     # once the worker calls POST /worker/ready after cold-start.
     p2p_url:         Optional[str]  = None
+    # NEW: Wake URL for serverless workers.  Used by the scheduler to boot a
+    # dormant worker when scale-to-zero is enabled (e.g., RunPod LB endpoint URL).
+    wake_url:        Optional[str]  = None
     registered_at:   float          = field(default_factory=time.time)
     updated_at:      float          = field(default_factory=time.time)
 
@@ -113,7 +117,7 @@ class WorkerRegistry:
         Upsert a worker record.
 
         Safe to call on every reconnect: subsequent calls update updated_at
-        without losing accumulated p2p_url or payment_address.
+        without losing accumulated p2p_url, payment_address, or wake_url.
         """
         endpoint.updated_at = time.time()
         raw = json.dumps(endpoint.to_dict())
@@ -154,6 +158,23 @@ class WorkerRegistry:
         if ep is None:
             return False
         ep.p2p_url    = p2p_url
+        ep.updated_at = time.time()
+        await self._r.set(self._key(worker_id), json.dumps(ep.to_dict()))
+        return True
+
+    async def update_wake_url(self, worker_id: str, wake_url: str) -> bool:
+        """
+        Patch the wake_url for a serverless worker.
+
+        The wake_url is set on initial registration (passed by the worker) and
+        should rarely change.  This method exists for completeness.
+
+        Returns False if the worker_id is not in the registry.
+        """
+        ep = await self.get(worker_id)
+        if ep is None:
+            return False
+        ep.wake_url   = wake_url
         ep.updated_at = time.time()
         await self._r.set(self._key(worker_id), json.dumps(ep.to_dict()))
         return True

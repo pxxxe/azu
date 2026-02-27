@@ -59,17 +59,63 @@ class MoEScheduler:
         # The event is set when the worker calls POST /worker/ready.
         self._job_readiness: Dict[str, Dict[str, asyncio.Event]] = {}
 
+        # ── poll-based dispatch for serverless workers (new) ───────────────────
+        # Per-worker message queues. The scheduler enqueues control messages here;
+        # serverless workers drain them via GET /worker/poll/{worker_id} (long-poll).
+        # This avoids the scheduler ever needing to initiate an HTTP connection to a
+        # worker, which fails on RunPod LB serverless because pod proxy URLs
+        # ({podId}-{port}.proxy.runpod.net) return 403 for serverless containers.
+        self._serverless_queues: Dict[str, asyncio.Queue] = {}
+
+        # Worker IDs currently being woken (avoid duplicate wake calls)
+        self._waking: Set[str] = set()
+
     # ── transport helper (new) ────────────────────────────────────────────────
 
     async def _dispatch_control(self, w: WorkerState, payload: dict) -> None:
         """
         Send a control-plane message to a worker using the correct transport.
 
-        Selects PersistentDriver (WebSocket) or ServerlessDriver (HTTP POST)
+        Selects PersistentDriver (WebSocket) or serverless queue-based dispatch
         based on the worker's registered type.  Tensor data never passes here.
+
+        For serverless workers: enqueue the message in _serverless_queues[worker_id].
+        The worker drains messages via long-poll (GET /worker/poll).
         """
-        driver = get_driver_for_worker(w)
-        await driver.send_control(w, payload)
+        if w.specs.get("worker_type") == "serverless":
+            # Serverless: enqueue for poll-based dispatch
+            wid = w.pubkey
+            if wid not in self._serverless_queues:
+                self._serverless_queues[wid] = asyncio.Queue()
+            await self._serverless_queues[wid].put(payload)
+        else:
+            # Persistent: use WebSocket driver
+            driver = get_driver_for_worker(w)
+            await driver.send_control(w, payload)
+
+    async def _wake_worker(self, worker_id: str, wake_url: str) -> None:
+        """
+        Fire a single HTTP request to boot a dormant serverless worker.
+
+        The scheduler doesn't know or care what wake_url points to —
+        for RunPod LB workers it's the endpoint URL; could be anything.
+        The worker registers itself on boot and starts polling for messages.
+        """
+        try:
+            async with aiohttp.ClientSession() as sess:
+                # Payload is arbitrary — just needs to trigger a cold start.
+                # The worker ignores this request body; it registers via
+                # POST /workers as normal on boot.
+                async with sess.post(
+                    wake_url,
+                    json={"type": "WAKE"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    print(f"⚡ [Wake] Sent wake to {worker_id[:16]} via {wake_url} → {resp.status}")
+        except Exception as e:
+            print(f"⚠️ [Wake] Failed to wake {worker_id[:16]}: {e}")
+        finally:
+            self._waking.discard(worker_id)
 
     # ── registry integration: worker lifecycle ────────────────────────────────
 
@@ -94,6 +140,7 @@ class MoEScheduler:
                 platform        = specs.get('platform', 'self_hosted'),
                 payment_address = payment_addr,
                 p2p_url         = specs.get('p2p_url'),
+                wake_url        = specs.get('wake_url'),  # NEW: for serverless workers
             ))
         except Exception as exc:
             # Registry write failure must not block the WS handshake
@@ -134,6 +181,7 @@ class MoEScheduler:
                     "p2p_url":         ep.p2p_url,
                     "endpoint_url":    ep.endpoint_url,
                     "worker_type":     ep.worker_type.value,
+                    "wake_url":        ep.wake_url,  # NEW
                 }
 
                 self.workers[ep.worker_id] = WorkerState(
@@ -479,6 +527,20 @@ class MoEScheduler:
         }
         has_serverless = bool(serverless_worker_ids)
 
+        # ── wake dormant serverless workers (new) ─────────────────────────────
+        # If a serverless worker has wake_url but isn't currently in memory,
+        # wake it up so it can register and receive the job.
+        if has_serverless:
+            for wid in serverless_worker_ids:
+                w = self.workers.get(wid)
+                if w and not w.specs.get('p2p_url'):  # registered but not yet online
+                    # Try to get wake_url from registry
+                    ep = await self.worker_registry.get(wid)
+                    wake_url = ep.wake_url if ep else None
+                    if wake_url and wid not in self._waking:
+                        self._waking.add(wid)
+                        asyncio.create_task(self._wake_worker(wid, wake_url))
+
         # Register per-job readiness events for serverless workers so Phase 2
         # can wait until each has cold-started and reported its P2P URL.
         if has_serverless:
@@ -797,6 +859,7 @@ class RegisterWorkerReq(BaseModel):
     platform:        Optional[str]        = "self_hosted"
     payment_address: Optional[str]        = None
     p2p_url:         Optional[str]        = None
+    wake_url:        Optional[str]        = None   # NEW: URL to wake dormant serverless worker
 
 
 class WorkerReadyReq(BaseModel):
@@ -838,6 +901,7 @@ async def register_worker_http(req: RegisterWorkerReq):
         platform        = req.platform or "self_hosted",
         payment_address = req.payment_address,
         p2p_url         = req.p2p_url,
+        wake_url        = req.wake_url,  # NEW
     )
 
     await scheduler.worker_registry.register(endpoint)
@@ -853,6 +917,7 @@ async def register_worker_http(req: RegisterWorkerReq):
             "p2p_url":      req.p2p_url,
             "endpoint_url": req.endpoint_url,
             "worker_type":  "serverless",
+            "wake_url":     req.wake_url,  # NEW
         }
         scheduler.workers[req.worker_id] = WorkerState(
             pubkey          = req.worker_id,
@@ -926,6 +991,7 @@ async def list_workers_http():
             "capabilities":   ep.capabilities       if ep else [],
             "endpoint_url":   ep.endpoint_url       if ep else None,
             "p2p_url":        ep.p2p_url            if ep else (ws.specs.get('p2p_url') if ws else None),
+            "wake_url":       ep.wake_url           if ep else (ws.specs.get('wake_url') if ws else None),  # NEW
             "payment_address": ep.payment_address   if ep else (ws.payment_address if ws else None),
             "registered_at":  ep.registered_at      if ep else None,
             # live session state
@@ -1004,3 +1070,30 @@ async def worker_heartbeat_http(req: WorkerHeartbeatReq):
     """
     await scheduler.handle_heartbeat(req.worker_id, {"vram_free_mb": req.vram_free_mb})
     return {"status": "ok"}
+
+
+@app.get("/worker/poll/{worker_id}", summary="Long-poll for serverless control messages")
+async def worker_poll(worker_id: str, timeout: float = 29.0):
+    """
+    Long-poll endpoint consumed by serverless workers.
+
+    The worker calls this repeatedly.  The scheduler holds the request for up
+    to `timeout` seconds waiting for a queued control message (JOB_START,
+    EXECUTE_DENSE, etc.).  Returns the message as JSON (200) when one arrives,
+    or HTTP 204 (no content) on timeout so the worker can immediately re-poll.
+
+    This replaces the push model (ServerlessDriver POSTing to the worker's
+    proxy URL) which fails on RunPod LB because pod proxy URLs return 403 for
+    serverless containers.
+    """
+    from fastapi.responses import Response as FastAPIResponse
+
+    if worker_id not in scheduler._serverless_queues:
+        scheduler._serverless_queues[worker_id] = asyncio.Queue()
+    q = scheduler._serverless_queues[worker_id]
+
+    try:
+        msg = await asyncio.wait_for(q.get(), timeout=timeout)
+        return msg                              # 200 OK with JSON body
+    except asyncio.TimeoutError:
+        return FastAPIResponse(status_code=204) # No message this cycle — re-poll

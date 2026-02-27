@@ -657,5 +657,3 @@ class LayerLoader:
 
         self.loaded_cache[cache_key] = norm
         return norm
-
----

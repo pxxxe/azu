@@ -38,6 +38,7 @@ import torch
 import aiohttp
 import websockets
 from transformers import DynamicCache
+import time
 
 from azu.worker.config import (
     SCHEDULER_URL,

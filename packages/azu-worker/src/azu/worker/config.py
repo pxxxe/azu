@@ -112,5 +112,3 @@ AUTH_PROVIDER = os.getenv("AUTH_PROVIDER", "hmac")
 # in JOB_START against the x-auth-token header on incoming P2P requests.
 # When unset, authentication is disabled (dev / local mode).
 AUTH_SECRET_KEY = os.getenv("AUTH_SECRET_KEY")
-
----

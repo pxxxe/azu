@@ -62,16 +62,11 @@ DEFAULT_CPU_VRAM_MB = 32000
 # ============================================================================
 
 # WAKE_URL: URL used by the scheduler to wake a dormant serverless worker.
-# For RunPod LB endpoints, this is typically:
-#   https://api.runpod.ai/v2/{endpoint_id}/run
 # The worker reports this URL to the scheduler on registration so the scheduler
 # can boot a cold worker when needed (scale-from-zero).
-# If not set explicitly, the worker will try to derive from RUNPOD_ENDPOINT_ID.
+# Set this to whatever your platform uses to cold-start a new worker container.
+# If not set, scale-from-zero wake is disabled (worker must be pre-running).
 WAKE_URL = os.getenv("WAKE_URL")
-
-# If WAKE_URL is not set, check if RunPod injected ENDPOINT_ID
-if not WAKE_URL and os.getenv("RUNPOD_ENDPOINT_ID"):
-    WAKE_URL = f"https://api.runpod.ai/v2/{os.getenv('RUNPOD_ENDPOINT_ID')}/run"
 
 # IDLE_TIMEOUT: Seconds of inactivity before the worker self-terminates.
 # Enables scale-to-zero for cost savings.  The idle watchdog monitors poll activity
@@ -117,3 +112,5 @@ AUTH_PROVIDER = os.getenv("AUTH_PROVIDER", "hmac")
 # in JOB_START against the x-auth-token header on incoming P2P requests.
 # When unset, authentication is disabled (dev / local mode).
 AUTH_SECRET_KEY = os.getenv("AUTH_SECRET_KEY")
+
+---

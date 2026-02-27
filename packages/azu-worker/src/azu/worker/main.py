@@ -147,6 +147,17 @@ class MoEWorker:
 
         return None
 
+    def _resolve_endpoint(self, url: str) -> str:
+        """
+        If url points to this worker's own public P2P URL, return the local
+        address instead so we never route through an external proxy to reach
+        ourselves (proxies such as RunPod's return 403 for inbound serverless).
+        """
+        my_url = (self.get_p2p_url() or "").rstrip("/")
+        if my_url and url.rstrip("/").startswith(my_url):
+            return url.rstrip("/").replace(my_url, f"http://localhost:{P2P_PORT}", 1)
+        return url
+
     async def _get_p2p_session(self) -> aiohttp.ClientSession:
         """Get or create P2P session."""
         if self.p2p_session is None or self.p2p_session.closed:
@@ -190,6 +201,11 @@ class MoEWorker:
             model_id    = msg.get('model_id')
             auth_token  = msg.get('auth_token')
 
+            # Deduplicate: scheduler may deliver the same JOB_START multiple
+            # times before the job is acknowledged (tight poll loop).
+            if job_id_full in self.active_jobs:
+                return
+
             print(f"🔗 [Job {job_id}] Received JOB_START, initiating mesh handshake...")
 
             my_p2p_url = self.get_p2p_url()
@@ -197,8 +213,11 @@ class MoEWorker:
                 my_p2p_url = my_p2p_url.rstrip("/")
                 try:
                     session = await self._get_p2p_session()
+                    # Always use localhost — this POST is to our own P2PServer.
+                    # Going through the external proxy URL returns 403 on
+                    # platforms (e.g. RunPod serverless) that block inbound proxy traffic.
                     async with session.post(
-                        f"{my_p2p_url}/control/job_start",
+                        f"http://localhost:{P2P_PORT}/control/job_start",
                         json={
                             "job_id": job_id_full,
                             "model_id": model_id,
@@ -737,7 +756,7 @@ class MoEWorker:
                                 if ctx_ref and ctx_ref.auth_token:
                                     _loopback_headers["x-auth-token"] = ctx_ref.auth_token
                                 async with session.post(
-                                    f"{first_node_endpoint}/token_in",
+                                    f"{self._resolve_endpoint(first_node_endpoint)}/token_in",
                                     json={"job_id": job_id, "token_id": -1},
                                     headers=_loopback_headers
                                 ) as resp:
@@ -756,7 +775,7 @@ class MoEWorker:
                                 if ctx_ref and ctx_ref.auth_token:
                                     _loopback_headers["x-auth-token"] = ctx_ref.auth_token
                                 async with session.post(
-                                    f"{first_node_endpoint}/token_in",
+                                    f"{self._resolve_endpoint(first_node_endpoint)}/token_in",
                                     json={"job_id": job_id, "token_id": token_id},
                                     headers=_loopback_headers
                                 ) as resp:

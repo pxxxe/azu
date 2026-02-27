@@ -223,10 +223,11 @@ class LayerLoader:
         if self.device == "cuda":
             torch.cuda.empty_cache()
 
-        # Load directly to CPU first, standard practice for safetensors to avoid OOM
+        # Load directly to the target device — safetensors supports this natively
+        # and avoids staging through CPU RAM entirely.
         return await loop.run_in_executor(
             self.executor,
-            lambda: load_safetensors(path, device="cpu")
+            lambda: load_safetensors(path, device=self.device)
         )
 
     async def _download(self, url: str, path: Path, quiet: bool = False,
@@ -656,3 +657,5 @@ class LayerLoader:
 
         self.loaded_cache[cache_key] = norm
         return norm
+
+---

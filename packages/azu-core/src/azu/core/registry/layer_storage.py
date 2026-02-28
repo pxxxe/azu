@@ -27,7 +27,16 @@ class LayerStore:
     def _find_layers(self, model):
         """Find transformer layers in model architecture (works on meta device)."""
         print(f"   🔍 Searching for layers in model structure...")
-        possible_paths = ['model.layers', 'transformer.h', 'model.decoder.layers', 'transformer.layers']
+        possible_paths = [
+            'model.layers',
+            'transformer.h',
+            'model.decoder.layers',
+            'transformer.layers',
+            # VLM / conditional-generation layouts (e.g. Qwen3.5):
+            'language_model.model.layers',
+            'model.language_model.layers',
+            'model.text_model.layers',
+        ]
         for attr_path in possible_paths:
             try:
                 parts = attr_path.split('.')
@@ -290,8 +299,45 @@ class LayerStore:
 
             # 3. Instantiate Meta Model (Zero RAM)
             print("   🏗️ Building Meta Model...")
-            with init_empty_weights():
-                model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+            #
+            # Try AutoModelForCausalLM first (standard LMs).
+            # For VLM / conditional-generation architectures (e.g. Qwen3.5's
+            # Qwen3_5ForConditionalGeneration) that do not register as ForCausalLM,
+            # fall back through AutoModelForVision2Seq then AutoModel so that the
+            # meta model is always available for layer-structure inspection.
+            _meta_loaders = []
+            try:
+                from transformers import AutoModelForCausalLM as _CausalLM
+                _meta_loaders.append(_CausalLM)
+            except ImportError:
+                pass
+            try:
+                from transformers import AutoModelForVision2Seq as _V2S
+                _meta_loaders.append(_V2S)
+            except ImportError:
+                pass
+            try:
+                from transformers import AutoModel as _AM
+                _meta_loaders.append(_AM)
+            except ImportError:
+                pass
+
+            model = None
+            _last_exc = None
+            for _loader_cls in _meta_loaders:
+                try:
+                    with init_empty_weights():
+                        model = _loader_cls.from_config(config, trust_remote_code=True)
+                    break
+                except Exception as _e:
+                    _last_exc = _e
+                    continue
+
+            if model is None:
+                raise RuntimeError(
+                    f"Could not build meta model for {model_id}. "
+                    f"Last error: {_last_exc}"
+                )
 
             # Populate weight map if single file
             if weight_map is None:

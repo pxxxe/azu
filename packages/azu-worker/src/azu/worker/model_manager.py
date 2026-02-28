@@ -5,9 +5,10 @@ Manages VRAM, rotary embeddings, tokenizers, and model components.
 
 import asyncio
 import gc
+import inspect
 import sys
 import traceback
-from typing import Dict, Optional, Any
+from typing import Dict, FrozenSet, Optional, Any
 
 import torch
 from transformers import AutoTokenizer, AutoConfig
@@ -57,6 +58,16 @@ class ModelManager:
         self.moe_routers: Dict[int, torch.nn.Module] = {}
         self.moe_experts: Dict[tuple, torch.nn.Module] = {}
 
+        # Per-class cache of the frozenset of accepted forward() parameter names.
+        # Built lazily via inspect.signature on first encounter of each class.
+        # Avoids repeated introspection on the hot inference path.
+        #
+        # Design note: the value is a frozenset of parameter names present in
+        # the layer's forward() signature.  A sentinel key "_has_var_keyword" is
+        # included when the signature contains **kwargs — in that case all
+        # positional kwargs are safe to pass through without filtering.
+        self._layer_forward_params: Dict[type, FrozenSet[str]] = {}
+
         # Current model ID
         self.current_model_id: Optional[str] = None
 
@@ -104,6 +115,7 @@ class ModelManager:
         self.dense_layers.clear()
         self.moe_routers.clear()
         self.moe_experts.clear()
+        self._layer_forward_params.clear()
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -129,7 +141,12 @@ class ModelManager:
                       f"base={getattr(self.config, 'rope_theta', 10000.0)})")
 
         except Exception as e:
-            print(f"   ⚠️ Failed to init RoPE: {e}")
+            # Trust_remote_code models (e.g. Qwen3.5) often have a non-standard
+            # head_dim or handle RoPE entirely inside their layer's forward().
+            # Setting rotary_emb = None causes prepare_inputs() to return
+            # position_embeddings=None; the layer then computes RoPE internally
+            # using the position_ids we do pass.
+            print(f"   ⚠️ External RoPE init skipped ({e}); layers will handle position encoding internally.")
             traceback.print_exc()
             self.rotary_emb = None
 
@@ -220,7 +237,7 @@ class ModelManager:
         if past_kv is None:
             return 0
 
-        # DynamicCache (transformers >= 4.38): query per-layer length
+        # DynamicCache / HybridCache (transformers >= 4.38): query per-layer length
         if hasattr(past_kv, 'get_seq_length'):
             try:
                 return past_kv.get_seq_length(layer_idx)
@@ -245,7 +262,7 @@ class ModelManager:
 
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden]
-            past_kv: Past key/value cache
+            past_kv: Past key/value cache (may be None on the first forward pass)
             layer_idx: Index of the layer being processed, used to get correct per-layer past length
 
         Returns:
@@ -281,6 +298,52 @@ class ModelManager:
 
         return position_embeddings, mask, position_ids
 
+    def _get_layer_forward_params(self, layer: torch.nn.Module) -> FrozenSet[str]:
+        """
+        Return the frozenset of parameter names accepted by layer.forward().
+
+        The result is cached by layer class so introspection only happens once
+        per layer type per model switch.  This is used by callers to build the
+        exact kwargs dict for each forward() call, avoiding TypeError on layers
+        that don't accept every positional arg azu would normally pass (e.g.
+        Qwen3.5 Gated-DeltaNet layers that have no use for position_embeddings).
+
+        The special sentinel "_has_var_keyword" is included in the returned set
+        when the signature contains a **kwargs catch-all — in that case all
+        positional kwargs are safe to pass unconditionally.
+
+        Args:
+            layer: A loaded nn.Module whose forward() signature we inspect
+
+        Returns:
+            Frozenset of accepted parameter names (plus sentinel if **kwargs present)
+        """
+        cls = type(layer)
+        if cls in self._layer_forward_params:
+            return self._layer_forward_params[cls]
+
+        try:
+            sig = inspect.signature(cls.forward)
+            params = sig.parameters
+            names = set(params.keys())
+
+            has_var_keyword = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in params.values()
+            )
+            if has_var_keyword:
+                names.add("_has_var_keyword")
+
+            result = frozenset(names)
+        except Exception:
+            # If introspection fails for any reason, assume the layer accepts
+            # everything (safe fallback — worst case is a runtime TypeError
+            # which surfaces as a job error rather than a silent wrong result).
+            result = frozenset({"_has_var_keyword"})
+
+        self._layer_forward_params[cls] = result
+        return result
+
     def _print_vram_stats(self, tag: str, ctx: Any = None) -> None:
         """Print VRAM statistics."""
         if not torch.cuda.is_available():
@@ -299,7 +362,7 @@ class ModelManager:
 
             # KV Cache Size
             kv_mb = 0.0
-            if ctx and hasattr(ctx, 'kv_cache'):
+            if ctx and hasattr(ctx, 'kv_cache') and ctx.kv_cache is not None:
                 try:
                     if hasattr(ctx.kv_cache, 'key_cache') and hasattr(ctx.kv_cache, 'value_cache'):
                         for t_list in ctx.kv_cache.key_cache + ctx.kv_cache.value_cache:

@@ -569,7 +569,7 @@ def main():
         # ==========================================
         log_section(f"⚡ 2. Checking Model Status")
 
-        status_res = requests.get(f"{reg_url}/models/status", params={"model_id": TEST_MODEL}, timeout=10)
+        status_res = requests.get(f"{reg_url}/models/status", params={"model_id": TEST_MODEL}, timeout=30)
         if status_res.status_code == 200:
             status = status_res.json().get('status')
             print(f"   📊 Model status: {status}")

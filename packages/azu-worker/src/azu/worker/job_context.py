@@ -5,8 +5,6 @@ Manages state for each inference job including queues, KV cache, and peer tracki
 
 import asyncio
 from typing import Dict, Tuple, List, Optional, Set
-from dataclasses import dataclass, field
-from transformers import DynamicCache
 
 
 class JobContext:
@@ -39,8 +37,15 @@ class JobContext:
         # Pending expert requests - futures waiting for expert results
         self.pending_expert_requests: Dict[Tuple[int, int], asyncio.Future] = {}
 
-        # KV cache for attention
-        self.kv_cache = DynamicCache()
+        # KV / recurrent-state cache.
+        #
+        # Intentionally initialised to None rather than DynamicCache().
+        # Forcing DynamicCache breaks hybrid architectures (e.g. Qwen3.5) whose
+        # DeltaNet recurrent layers require HybridCache.  Setting None lets the
+        # model create the correct cache type on its first forward pass; azu
+        # captures and stores whatever cache object comes back in the layer
+        # output tuple, so subsequent steps reuse the model-native cache type.
+        self.kv_cache = None
 
         # Generated token IDs for this job
         self.generated_ids: List[int] = []
@@ -86,7 +91,7 @@ class JobContext:
         self.layer_input_queues.clear()
         self.expert_input_queues.clear()
         self.pending_expert_requests.clear()
-        self.kv_cache = DynamicCache()
+        self.kv_cache = None          # see __init__ comment
         self.generated_ids.clear()
         self.done = False
         self.auth_token = None

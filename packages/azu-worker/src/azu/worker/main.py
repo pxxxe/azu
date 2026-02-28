@@ -37,7 +37,7 @@ from typing import Dict, Optional
 import torch
 import aiohttp
 import websockets
-from transformers import DynamicCache
+# from transformers import DynamicCache
 import time
 
 from azu.worker.config import (
@@ -646,7 +646,7 @@ class MoEWorker:
 
                     if should_encode:
                         print(f"   📝 Encoding Prompt...")
-                        ctx.kv_cache = DynamicCache()
+                        ctx.kv_cache = None   # model creates DynamicCache or HybridCache on first forward
                         input_tensor = self.model_manager.tokenizer.encode(
                             initial_prompt, return_tensors='pt'
                         ).to(self.device)
@@ -805,14 +805,21 @@ class MoEWorker:
                     )
 
                     with torch.no_grad():
-                        layer_out = dense_layer(
-                            hidden_states,
-                            position_embeddings=pos_emb,
-                            attention_mask=attn_mask,
-                            position_ids=pos_ids,
-                            past_key_values=ctx.kv_cache,
-                            use_cache=True
-                        )
+                        # Build kwargs dynamically so that layers with non-standard
+                        # forward() signatures (e.g. Qwen3.5 Gated-DeltaNet layers
+                        # that don't accept position_embeddings) don't raise TypeError.
+                        _fwd_params = self.model_manager._get_layer_forward_params(dense_layer)
+                        _accept_all = "_has_var_keyword" in _fwd_params
+                        _call_kw: dict = {"use_cache": True}
+                        if _accept_all or "past_key_values"     in _fwd_params:
+                            _call_kw["past_key_values"]     = ctx.kv_cache
+                        if _accept_all or "position_embeddings" in _fwd_params:
+                            _call_kw["position_embeddings"] = pos_emb
+                        if _accept_all or "attention_mask"      in _fwd_params:
+                            _call_kw["attention_mask"]      = attn_mask
+                        if _accept_all or "position_ids"        in _fwd_params:
+                            _call_kw["position_ids"]        = pos_ids
+                        layer_out = dense_layer(hidden_states, **_call_kw)
 
                     if isinstance(layer_out, tuple):
                         hidden_states = layer_out[0]

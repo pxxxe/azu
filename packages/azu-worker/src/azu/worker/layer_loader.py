@@ -9,7 +9,7 @@ import sys
 import asyncio
 import concurrent.futures
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Type
 
 import torch
 import aiohttp
@@ -49,6 +49,11 @@ class LayerLoader:
 
         # Per-model HF checksum cache: {model_id: {filename: sha256}}
         self._hf_checksums: Dict[str, Dict[str, str]] = {}
+
+        # Per-architecture layer-class list built from a zero-weight meta model.
+        # Keys are config.architectures[0]; values are lists of layer classes,
+        # one entry per layer index.  Built lazily on first trust_remote_code miss.
+        self._layer_class_cache: Dict[str, List[Type[torch.nn.Module]]] = {}
 
         # --- PRECISION & DEVICE SETTINGS ---
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -307,15 +312,26 @@ class LayerLoader:
                         os.remove(temp)
                     raise e
 
+    # =========================================================================
+    # Layer class resolution
+    # =========================================================================
+
     def _get_layer_class(self, config: AutoConfig):
         """
         Get the transformer layer class from config architecture.
+
+        Fast path: works for all architectures that live inside
+        transformers.models.<name>.modeling_<name>.  Raises ValueError if the
+        architecture is not found there (e.g. trust_remote_code models).
 
         Args:
             config: Model configuration
 
         Returns:
             Decoder layer class
+
+        Raises:
+            ValueError: If the class cannot be resolved via importlib
         """
         arch = config.architectures[0]
         try:
@@ -339,248 +355,127 @@ class LayerLoader:
         except Exception as e:
             raise ValueError(f"Could not load layer class for {arch}: {e}")
 
-    def _get_paths(self, model_id: str, filename: str):
+    def _build_layer_class_cache(self, config: AutoConfig) -> None:
         """
-        Get local path and URL for a model file.
+        Populate _layer_class_cache for an architecture that cannot be resolved
+        via importlib (e.g. trust_remote_code models such as Qwen3.5).
+
+        Instantiates the full model on meta device (zero RAM / zero VRAM) and
+        records the concrete Python class of every layer, indexed by position.
+        The result is cached by architecture name so this only runs once per
+        worker process per model family.
+
+        For homogeneous models (all layers the same class) this degenerates to
+        a single repeated entry — no overhead versus the old approach.
+
+        For hybrid models (e.g. Qwen3.5 which alternates Gated-DeltaNet and
+        Gated-Attention layers) this gives the exact per-position class needed
+        for correct layer instantiation during load_dense_layer.
 
         Args:
-            model_id: HuggingFace model ID
-            filename: Name of the file
-
-        Returns:
-            Tuple of (local_path, url)
+            config: Model configuration (must have been loaded with
+                    trust_remote_code=True so custom code is registered)
         """
-        sanitized = model_id.replace("/", "_")
-        path = self.cache_dir / sanitized / filename
-        url = f"{self.registry_url}/layers/{sanitized}/{filename}"
-        return path, url
+        arch = config.architectures[0]
+        if arch in self._layer_class_cache:
+            return
 
-    # =========================================================================
-    # Load Shared Components (Attention + Norms) for MoE Layers
-    # =========================================================================
-    async def load_moe_shared(self, model_id: str, layer_idx: int):
+        print(f"   🏗️ Building layer-class cache for {arch} (meta device, one-time)...")
+
+        from accelerate import init_empty_weights
+        from transformers import AutoModelForCausalLM, AutoModel
+
+        # Try CausalLM first; fall back to generic AutoModel for VLMs /
+        # conditional-generation models (e.g. Qwen3.5's
+        # Qwen3_5ForConditionalGeneration which does not register as ForCausalLM).
+        model = None
+        for loader_cls in (AutoModelForCausalLM, AutoModel):
+            try:
+                with init_empty_weights():
+                    model = loader_cls.from_config(config, trust_remote_code=True)
+                break
+            except Exception:
+                continue
+
+        if model is None:
+            raise ValueError(
+                f"Could not instantiate meta model for {arch}. "
+                "Ensure the model was downloaded with trust_remote_code=True."
+            )
+
+        # Locate the layers list — try standard and VLM layout variants.
+        layer_paths = [
+            "model.layers",
+            "transformer.h",
+            "model.decoder.layers",
+            "transformer.layers",
+            "language_model.model.layers",
+            "model.language_model.layers",
+        ]
+
+        layers = None
+        for attr_path in layer_paths:
+            try:
+                obj = model
+                for part in attr_path.split("."):
+                    obj = getattr(obj, part)
+                if hasattr(obj, "__len__") and len(obj) > 0:
+                    layers = obj
+                    break
+            except AttributeError:
+                continue
+
+        if layers is None:
+            del model
+            raise ValueError(
+                f"Could not locate layer list in meta model for {arch}. "
+                f"Tried paths: {layer_paths}"
+            )
+
+        self._layer_class_cache[arch] = [type(layers[i]) for i in range(len(layers))]
+        print(
+            f"   ✅ Layer-class cache built: {len(self._layer_class_cache[arch])} layers, "
+            f"{len(set(self._layer_class_cache[arch]))} distinct class(es)"
+        )
+        del model
+
+    def _get_layer_class_for_idx(self, config: AutoConfig, layer_idx: int) -> Type[torch.nn.Module]:
         """
-        Load shared attention and normalization components for MoE layer.
+        Return the concrete layer class for a specific layer index.
+
+        For well-known architectures that live in transformers.models.* this
+        is the same as _get_layer_class (fast importlib path, O(1)).
+
+        For trust_remote_code / VLM architectures (e.g. Qwen3.5) where
+        importlib fails — or for hybrid models where different layer positions
+        have different classes — this builds the per-index class list from a
+        zero-weight meta model (once per architecture, then cached).
 
         Args:
-            model_id: HuggingFace model ID
-            layer_idx: Layer index
+            config: Model configuration
+            layer_idx: Index of the layer to load
 
         Returns:
-            Loaded layer with experts removed (lobotomized)
+            Concrete nn.Module subclass for that layer position
         """
-        cache_key = f"{model_id}:shared:{layer_idx}"
-        if cache_key in self.loaded_cache:
-            return self.loaded_cache[cache_key]
+        # Fast path: importlib resolution works for standard transformers models.
+        try:
+            return self._get_layer_class(config)
+        except ValueError:
+            pass
 
-        config_path, config_url = self._get_paths(model_id, "config.json")
-        await self._download(config_url, config_path)
-        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+        # Slow path: trust_remote_code or non-standard architecture.
+        # Build (or reuse) the per-architecture class list.
+        arch = config.architectures[0]
+        if arch not in self._layer_class_cache:
+            self._build_layer_class_cache(config)
 
-        filename = f"layer_{layer_idx}_shared.safetensors"
-        path, url = self._get_paths(model_id, filename)
-        await self._download(url, path, model_id=model_id)
+        classes = self._layer_class_cache[arch]
+        if layer_idx < len(classes):
+            return classes[layer_idx]
 
-        LayerClass = self._get_layer_class(config)
-
-        # VRAM LEAK FIX: INSTANTIATE ON CPU FIRST
-        # Create layer on CPU to perform surgery before moving to GPU
-        layer = LayerClass(config, layer_idx=layer_idx)
-
-        # LOBOTOMY: Remove Experts from the container
-        if hasattr(layer, "block_sparse_moe"):
-            del layer.block_sparse_moe
-            layer.block_sparse_moe = None
-        elif hasattr(layer, "mlp"):
-            del layer.mlp
-            layer.mlp = None
-
-        # Move slimmed-down layer to GPU
-        layer = layer.to(self.device).to(self.dtype)
-
-        state_dict = await self._load_weights_safe(path)
-
-        # strict=False because experts/router weights are missing
-        layer.load_state_dict(state_dict, strict=False)
-        layer.eval()
-
-        self.loaded_cache[cache_key] = layer
-        return layer
-
-    async def load_dense_layer(self, model_id: str, layer_idx: int):
-        """
-        Load a dense transformer layer.
-
-        Args:
-            model_id: HuggingFace model ID
-            layer_idx: Layer index
-
-        Returns:
-            Loaded dense layer
-        """
-        cache_key = f"{model_id}:dense:{layer_idx}"
-        if cache_key in self.loaded_cache:
-            return self.loaded_cache[cache_key]
-
-        config_path, config_url = self._get_paths(model_id, "config.json")
-        await self._download(config_url, config_path)
-        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
-
-        filename = f"layer_{layer_idx}_dense.safetensors"
-        path, url = self._get_paths(model_id, filename)
-        await self._download(url, path, model_id=model_id)
-
-        LayerClass = self._get_layer_class(config)
-        # FORCE DTYPE
-        layer = LayerClass(config, layer_idx=layer_idx).to(self.device).to(self.dtype)
-
-        state_dict = await self._load_weights_safe(path)
-        layer.load_state_dict(state_dict, strict=False)
-        layer.eval()
-
-        self.loaded_cache[cache_key] = layer
-        return layer
-
-    async def load_moe_router(self, model_id: str, layer_idx: int):
-        """
-        Load an MoE router (gate) network.
-
-        Args:
-            model_id: HuggingFace model ID
-            layer_idx: Layer index
-
-        Returns:
-            Loaded router linear layer
-        """
-        cache_key = f"{model_id}:router:{layer_idx}"
-        if cache_key in self.loaded_cache:
-            return self.loaded_cache[cache_key]
-
-        config_path, config_url = self._get_paths(model_id, "config.json")
-        await self._download(config_url, config_path)
-        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
-
-        filename = f"layer_{layer_idx}_router.safetensors"
-        path, url = self._get_paths(model_id, filename)
-        await self._download(url, path, model_id=model_id)
-
-        num_experts = getattr(config, 'num_local_experts', 8)
-        # FORCE DTYPE
-        router = torch.nn.Linear(config.hidden_size, num_experts, bias=False).to(self.device).to(self.dtype)
-
-        state_dict = await self._load_weights_safe(path)
-        router.load_state_dict(state_dict, strict=False)
-        router.eval()
-
-        self.loaded_cache[cache_key] = router
-        return router
-
-    async def load_moe_expert(self, model_id: str, layer_idx: int, expert_idx: int):
-        """
-        Load an MoE expert FFN.
-
-        Args:
-            model_id: HuggingFace model ID
-            layer_idx: Layer index
-            expert_idx: Expert index
-
-        Returns:
-            Loaded expert FFN
-        """
-        cache_key = f"{model_id}:expert:{layer_idx}:{expert_idx}"
-        if cache_key in self.loaded_cache:
-            return self.loaded_cache[cache_key]
-
-        config_path, config_url = self._get_paths(model_id, "config.json")
-        await self._download(config_url, config_path)
-        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
-
-        filename = f"layer_{layer_idx}_expert_{expert_idx}.safetensors"
-        path, url = self._get_paths(model_id, filename)
-        await self._download(url, path, model_id=model_id)
-
-        class ExpertFFN(torch.nn.Module):
-            """Expert FFN with SwiGLU activation."""
-            def __init__(self, hidden_size: int, intermediate_size: int):
-                super().__init__()
-                self.w1 = torch.nn.Linear(hidden_size, intermediate_size, bias=False)
-                self.w2 = torch.nn.Linear(intermediate_size, hidden_size, bias=False)
-                self.w3 = torch.nn.Linear(hidden_size, intermediate_size, bias=False)
-                self.act_fn = torch.nn.SiLU()
-
-            def forward(self, x):
-                return self.w2(self.act_fn(self.w1(x)) * self.w3(x))
-
-        # FORCE DTYPE
-        expert = ExpertFFN(config.hidden_size, config.intermediate_size).to(self.device).to(self.dtype)
-
-        state_dict = await self._load_weights_safe(path)
-        expert.load_state_dict(state_dict, strict=False)
-        expert.eval()
-
-        self.loaded_cache[cache_key] = expert
-        return expert
-
-    async def load_embeddings(self, model_id: str):
-        """
-        Load token embeddings.
-
-        Args:
-            model_id: HuggingFace model ID
-
-        Returns:
-            Loaded embedding layer
-        """
-        cache_key = f"{model_id}:embeddings"
-        if cache_key in self.loaded_cache:
-            return self.loaded_cache[cache_key]
-
-        config_path, config_url = self._get_paths(model_id, "config.json")
-        await self._download(config_url, config_path)
-        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
-
-        path, url = self._get_paths(model_id, "embeddings.safetensors")
-        await self._download(url, path, model_id=model_id)
-
-        # FORCE DTYPE
-        emb = torch.nn.Embedding(config.vocab_size, config.hidden_size).to(self.device).to(self.dtype)
-        state_dict = await self._load_weights_safe(path)
-        emb.load_state_dict(state_dict)
-        emb.eval()
-
-        self.loaded_cache[cache_key] = emb
-        return emb
-
-    async def load_lm_head(self, model_id: str):
-        """
-        Load language model head.
-
-        Args:
-            model_id: HuggingFace model ID
-
-        Returns:
-            Loaded LM head
-        """
-        cache_key = f"{model_id}:lm_head"
-        if cache_key in self.loaded_cache:
-            return self.loaded_cache[cache_key]
-
-        config_path, config_url = self._get_paths(model_id, "config.json")
-        await self._download(config_url, config_path)
-        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
-
-        path, url = self._get_paths(model_id, "lm_head.safetensors")
-        await self._download(url, path, model_id=model_id)
-
-        state_dict = await self._load_weights_safe(path)
-        actual_vocab_size = state_dict['weight'].shape[0]
-        # FORCE DTYPE
-        head = torch.nn.Linear(config.hidden_size, actual_vocab_size, bias=False).to(self.device).to(self.dtype)
-        head.load_state_dict(state_dict)
-        head.eval()
-
-        self.loaded_cache[cache_key] = head
-        return head
+        # layer_idx out of range (shouldn't happen in practice) — use last class.
+        return classes[-1]
 
     def _get_norm_class(self, config: AutoConfig):
         """
@@ -657,3 +552,233 @@ class LayerLoader:
 
         self.loaded_cache[cache_key] = norm
         return norm
+
+    def _get_paths(self, model_id: str, filename: str):
+        """
+        Get local path and URL for a model file.
+
+        Args:
+            model_id: HuggingFace model ID
+            filename: Name of the file
+
+        Returns:
+            Tuple of (local_path, url)
+        """
+        sanitized = model_id.replace("/", "_")
+        path = self.cache_dir / sanitized / filename
+        url = f"{self.registry_url}/layers/{sanitized}/{filename}"
+        return path, url
+
+    # =========================================================================
+    # Load Shared Components (Attention + Norms) for MoE Layers
+    # =========================================================================
+    async def load_moe_shared(self, model_id: str, layer_idx: int):
+        """
+        Load shared attention and normalization components for MoE layer.
+
+        Args:
+            model_id: HuggingFace model ID
+            layer_idx: Layer index
+
+        Returns:
+            Loaded layer with experts removed (lobotomized)
+        """
+        cache_key = f"{model_id}:shared:{layer_idx}"
+        if cache_key in self.loaded_cache:
+            return self.loaded_cache[cache_key]
+
+        config_path, config_url = self._get_paths(model_id, "config.json")
+        await self._download(config_url, config_path)
+        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+
+        filename = f"layer_{layer_idx}_shared.safetensors"
+        path, url = self._get_paths(model_id, filename)
+        await self._download(url, path, model_id=model_id)
+
+        # Use per-index class resolution so MoE layers in hybrid architectures
+        # get the right class.
+        LayerClass = self._get_layer_class_for_idx(config, layer_idx)
+
+        # VRAM LEAK FIX: INSTANTIATE ON CPU FIRST
+        # Create layer on CPU to perform surgery before moving to GPU
+        try:
+            layer = LayerClass(config, layer_idx=layer_idx)
+        except TypeError:
+            layer = LayerClass(config)
+
+        # LOBOTOMY: Remove Experts from the container
+        if hasattr(layer, "block_sparse_moe"):
+            del layer.block_sparse_moe
+            layer.block_sparse_moe = None
+        elif hasattr(layer, "mlp"):
+            del layer.mlp
+            layer.mlp = None
+
+        # Move slimmed-down layer to GPU
+        layer = layer.to(self.device).to(self.dtype)
+
+        state_dict = await self._load_weights_safe(path)
+
+        # strict=False because experts/router weights are missing
+        layer.load_state_dict(state_dict, strict=False)
+        layer.eval()
+
+        self.loaded_cache[cache_key] = layer
+        return layer
+
+    async def load_dense_layer(self, model_id: str, layer_idx: int):
+        """
+        Load a dense transformer layer.
+
+        Args:
+            model_id: HuggingFace model ID
+            layer_idx: Layer index
+
+        Returns:
+            Loaded dense layer
+        """
+        cache_key = f"{model_id}:dense:{layer_idx}"
+        if cache_key in self.loaded_cache:
+            return self.loaded_cache[cache_key]
+
+        config_path, config_url = self._get_paths(model_id, "config.json")
+        await self._download(config_url, config_path)
+        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+
+        filename = f"layer_{layer_idx}_dense.safetensors"
+        path, url = self._get_paths(model_id, filename)
+        await self._download(url, path, model_id=model_id)
+
+        # Per-index class resolution: required for hybrid architectures such as
+        # Qwen3.5 where even-positioned layers are Gated-DeltaNet and
+        # every-fourth layer is Gated-Attention.
+        LayerClass = self._get_layer_class_for_idx(config, layer_idx)
+
+        # Some custom layer constructors accept only (config) without layer_idx.
+        try:
+            layer = LayerClass(config, layer_idx=layer_idx)
+        except TypeError:
+            layer = LayerClass(config)
+
+        layer = layer.to(self.device).to(self.dtype)
+
+        state_dict = await self._load_weights_safe(path)
+        layer.load_state_dict(state_dict, strict=False)
+        layer.eval()
+
+        self.loaded_cache[cache_key] = layer
+        return layer
+
+    async def load_moe_router(self, model_id: str, layer_idx: int):
+        """
+        Load an MoE router (gate) network.
+        """
+        cache_key = f"{model_id}:router:{layer_idx}"
+        if cache_key in self.loaded_cache:
+            return self.loaded_cache[cache_key]
+
+        config_path, config_url = self._get_paths(model_id, "config.json")
+        await self._download(config_url, config_path)
+        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+
+        filename = f"layer_{layer_idx}_router.safetensors"
+        path, url = self._get_paths(model_id, filename)
+        await self._download(url, path, model_id=model_id)
+
+        num_experts = self._get_num_experts(config)
+        hidden_size = config.hidden_size
+        router = torch.nn.Linear(hidden_size, num_experts, bias=False).to(self.device).to(self.dtype)
+
+        state_dict = await self._load_weights_safe(path)
+        router.load_state_dict(state_dict)
+        router.eval()
+
+        self.loaded_cache[cache_key] = router
+        return router
+
+    def _get_num_experts(self, config):
+        """Get number of experts from config."""
+        for key in ['num_local_experts', 'num_experts', 'moe_num_experts', 'n_routed_experts']:
+            if hasattr(config, key):
+                num = getattr(config, key)
+                if num > 0:
+                    return num
+        return 8
+
+    async def load_moe_expert(self, model_id: str, layer_idx: int, expert_idx: int):
+        """Load a single MoE expert."""
+        cache_key = f"{model_id}:expert:{layer_idx}:{expert_idx}"
+        if cache_key in self.loaded_cache:
+            return self.loaded_cache[cache_key]
+
+        config_path, config_url = self._get_paths(model_id, "config.json")
+        await self._download(config_url, config_path)
+        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+
+        filename = f"layer_{layer_idx}_expert_{expert_idx}.safetensors"
+        path, url = self._get_paths(model_id, filename)
+        await self._download(url, path, model_id=model_id)
+
+        intermediate = getattr(config, 'intermediate_size', config.hidden_size * 4)
+        hidden = config.hidden_size
+
+        expert = torch.nn.Sequential(
+            torch.nn.Linear(hidden, intermediate, bias=False),
+            torch.nn.SiLU(),
+            torch.nn.Linear(intermediate, hidden, bias=False),
+        ).to(self.device).to(self.dtype)
+
+        state_dict = await self._load_weights_safe(path)
+        expert.load_state_dict(state_dict, strict=False)
+        expert.eval()
+
+        self.loaded_cache[cache_key] = expert
+        return expert
+
+    async def load_embeddings(self, model_id: str):
+        """Load token embeddings."""
+        cache_key = f"{model_id}:embeddings"
+        if cache_key in self.loaded_cache:
+            return self.loaded_cache[cache_key]
+
+        config_path, config_url = self._get_paths(model_id, "config.json")
+        await self._download(config_url, config_path)
+        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+
+        path, url = self._get_paths(model_id, "embeddings.safetensors")
+        await self._download(url, path, model_id=model_id)
+
+        vocab_size = config.vocab_size
+        hidden_size = config.hidden_size
+        emb = torch.nn.Embedding(vocab_size, hidden_size).to(self.device).to(self.dtype)
+
+        state_dict = await self._load_weights_safe(path)
+        emb.load_state_dict(state_dict)
+        emb.eval()
+
+        self.loaded_cache[cache_key] = emb
+        return emb
+
+    async def load_lm_head(self, model_id: str):
+        """Load the language model head."""
+        cache_key = f"{model_id}:lm_head"
+        if cache_key in self.loaded_cache:
+            return self.loaded_cache[cache_key]
+
+        config_path, config_url = self._get_paths(model_id, "config.json")
+        await self._download(config_url, config_path)
+        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+
+        path, url = self._get_paths(model_id, "lm_head.safetensors")
+        await self._download(url, path, model_id=model_id)
+
+        vocab_size = config.vocab_size
+        hidden_size = config.hidden_size
+        head = torch.nn.Linear(hidden_size, vocab_size, bias=False).to(self.device).to(self.dtype)
+
+        state_dict = await self._load_weights_safe(path)
+        head.load_state_dict(state_dict)
+        head.eval()
+
+        self.loaded_cache[cache_key] = head
+        return head

@@ -130,6 +130,9 @@ class ModelManager:
 
             self.config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
+            # Proxy missing top-level attrs from nested text_config (e.g. Qwen3.5 VLM)
+            self.loader._normalize_config(self.config)
+
             if MixtralRotaryEmbedding:
                 # TRANSFORMERS 5.0+ FIX: Pass config object instead of individual params
                 self.rotary_emb = MixtralRotaryEmbedding(
@@ -137,7 +140,8 @@ class ModelManager:
                     device=self.device
                 ).to(self.dtype)
 
-                print(f"   ✅ RoPE Initialized (head_dim={self.config.hidden_size // self.config.num_attention_heads}, "
+                _head_dim = getattr(self.config, "hidden_size", 0) // max(getattr(self.config, "num_attention_heads", 1), 1)
+                print(f"   ✅ RoPE Initialized (head_dim={_head_dim}, "
                       f"base={getattr(self.config, 'rope_theta', 10000.0)})")
 
         except Exception as e:

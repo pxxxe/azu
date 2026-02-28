@@ -80,6 +80,57 @@ class LayerLoader:
             self.session = aiohttp.ClientSession(connector=connector, timeout=timeout)
         return self.session
 
+    @staticmethod
+    def _normalize_config(config) -> None:
+        """
+        Proxy missing top-level config attributes from a nested text_config.
+
+        Some VLM / multimodal architectures (e.g. Qwen3.5-27B) store the
+        language-model config inside config.text_config rather than at the
+        top level.  Transformers exposes the outer config object, so attributes
+        like vocab_size, hidden_size, max_position_embeddings etc. raise
+        AttributeError when accessed directly.
+
+        This method checks for a text_config sub-object and, for each
+        attribute that is missing on the outer config, copies the value across
+        so the rest of the loader can use config.vocab_size etc. uniformly.
+
+        Mutates config in place; safe to call multiple times (no-op if attrs
+        already present).
+        """
+        text_cfg = getattr(config, "text_config", None)
+        if text_cfg is None:
+            return
+
+        _PROXY_ATTRS = [
+            "vocab_size",
+            "hidden_size",
+            "intermediate_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "max_position_embeddings",
+            "rms_norm_eps",
+            "layer_norm_eps",
+            "rope_theta",
+            "rope_scaling",
+            "attention_bias",
+            "attention_dropout",
+            "hidden_act",
+            "initializer_range",
+            "tie_word_embeddings",
+        ]
+
+        for attr in _PROXY_ATTRS:
+            try:
+                # Will raise AttributeError if missing on outer config
+                _ = getattr(config, attr)
+            except AttributeError:
+                try:
+                    setattr(config, attr, getattr(text_cfg, attr))
+                except AttributeError:
+                    pass  # not on text_config either — skip
+
     # =========================================================================
     # Security: Extension Guard + HF Checksum Verification
     # =========================================================================
@@ -529,6 +580,7 @@ class LayerLoader:
         config_path, config_url = self._get_paths(model_id, "config.json")
         await self._download(config_url, config_path)
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+        self._normalize_config(config)
 
         path, url = self._get_paths(model_id, "final_norm.safetensors")
         try:
@@ -590,6 +642,7 @@ class LayerLoader:
         config_path, config_url = self._get_paths(model_id, "config.json")
         await self._download(config_url, config_path)
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+        self._normalize_config(config)
 
         filename = f"layer_{layer_idx}_shared.safetensors"
         path, url = self._get_paths(model_id, filename)
@@ -644,6 +697,7 @@ class LayerLoader:
         config_path, config_url = self._get_paths(model_id, "config.json")
         await self._download(config_url, config_path)
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+        self._normalize_config(config)
 
         filename = f"layer_{layer_idx}_dense.safetensors"
         path, url = self._get_paths(model_id, filename)
@@ -680,6 +734,7 @@ class LayerLoader:
         config_path, config_url = self._get_paths(model_id, "config.json")
         await self._download(config_url, config_path)
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+        self._normalize_config(config)
 
         filename = f"layer_{layer_idx}_router.safetensors"
         path, url = self._get_paths(model_id, filename)
@@ -714,6 +769,7 @@ class LayerLoader:
         config_path, config_url = self._get_paths(model_id, "config.json")
         await self._download(config_url, config_path)
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+        self._normalize_config(config)
 
         filename = f"layer_{layer_idx}_expert_{expert_idx}.safetensors"
         path, url = self._get_paths(model_id, filename)
@@ -744,6 +800,7 @@ class LayerLoader:
         config_path, config_url = self._get_paths(model_id, "config.json")
         await self._download(config_url, config_path)
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+        self._normalize_config(config)
 
         path, url = self._get_paths(model_id, "embeddings.safetensors")
         await self._download(url, path, model_id=model_id)
@@ -768,6 +825,7 @@ class LayerLoader:
         config_path, config_url = self._get_paths(model_id, "config.json")
         await self._download(config_url, config_path)
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
+        self._normalize_config(config)
 
         path, url = self._get_paths(model_id, "lm_head.safetensors")
         await self._download(url, path, model_id=model_id)

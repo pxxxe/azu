@@ -1,5 +1,5 @@
 import redis.asyncio as redis
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Header
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import json
@@ -31,6 +31,23 @@ except Exception as e:
     print(f"🔥 FATAL: Failed to initialize LayerStore or Mounts: {e}")
     traceback.print_exc()
 
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+_REGISTRY_SECRET = os.environ.get("AUTH_SECRET_KEY", "")
+
+async def require_registry_auth(x_auth_key: str = Header(default="")) -> None:
+    """
+    Guard sensitive registry endpoints with a shared secret.
+    Set AUTH_SECRET_KEY in the environment (same value used by workers for
+    HMAC auth).  If AUTH_SECRET_KEY is unset the check is skipped so that
+    local dev environments keep working without any config change.
+    """
+    if _REGISTRY_SECRET and x_auth_key != _REGISTRY_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid registry auth key")
+
+
 class ShardRequest(BaseModel):
     model_id: str
     force: bool = False
@@ -38,8 +55,7 @@ class ShardRequest(BaseModel):
 async def background_shard_task(model_id: str, hf_token: str):
     try:
         print(f"🔄 BACKGROUND: Starting shard for {model_id}")
-        # Run the heavy blocking IO in a separate thread
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         num_layers = await loop.run_in_executor(None, store.shard_model, model_id, hf_token)
         await r.set(f"shard_status:{model_id}", "ready")
         print(f"✅ BACKGROUND: Finished sharding {model_id} ({num_layers} layers)")
@@ -49,10 +65,11 @@ async def background_shard_task(model_id: str, hf_token: str):
         traceback.print_exc()
         await r.set(f"shard_status:{model_id}", f"failed: {err_msg}")
 
-@app.post("/models/shard")
+@app.post("/models/shard", dependencies=[Depends(require_registry_auth)])
 async def shard_model(req: ShardRequest, background_tasks: BackgroundTasks):
     """
     Trigger the sharding process using the robust LayerStore.
+    Requires X-Auth-Key header matching AUTH_SECRET_KEY env var.
     """
     # Check if already done
     if not req.force:
@@ -141,6 +158,3 @@ async def health():
         "storage_path": str(store.storage_path),
         "storage_exists": store.storage_path.exists()
     }
-
-
-# Import LayerStore at the end to avoid circular imports

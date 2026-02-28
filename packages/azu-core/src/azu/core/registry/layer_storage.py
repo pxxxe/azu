@@ -18,6 +18,54 @@ class LayerStore:
         self.storage_path = Path(storage_path)
         self.storage_path.mkdir(exist_ok=True, parents=True)
 
+    @staticmethod
+    def _normalize_config(config) -> None:
+        """
+        Proxy missing top-level config attributes from a nested text_config.
+
+        VLM / multimodal architectures (e.g. Qwen3.5-27B) store the language-model
+        config inside config.text_config rather than at the top level. This causes
+        AttributeError when code accesses config.vocab_size, config.hidden_size, etc.
+
+        Mutates config in place; safe to call multiple times (idempotent).
+        """
+        text_cfg = getattr(config, "text_config", None)
+        if text_cfg is None:
+            return
+
+        _PROXY_ATTRS = [
+            "vocab_size",
+            "hidden_size",
+            "intermediate_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "max_position_embeddings",
+            "rms_norm_eps",
+            "layer_norm_eps",
+            "rope_theta",
+            "rope_scaling",
+            "attention_bias",
+            "attention_dropout",
+            "hidden_act",
+            "initializer_range",
+            "tie_word_embeddings",
+            "num_local_experts",
+            "num_experts",
+            "num_experts_per_tok",
+            "n_routed_experts",
+            "architectures",
+        ]
+
+        for attr in _PROXY_ATTRS:
+            try:
+                _ = getattr(config, attr)
+            except AttributeError:
+                try:
+                    setattr(config, attr, getattr(text_cfg, attr))
+                except AttributeError:
+                    pass
+
     def has_model(self, model_id: str) -> bool:
         """Check if a model is already fully sharded and stored."""
         sanitized = model_id.replace("/", "_")
@@ -276,6 +324,29 @@ class LayerStore:
                         alt = target_key.replace("model.", "")
                         if alt in index: target_key = alt
 
+                # Strategy 5: strip VLM wrapper prefixes
+                # e.g. "model.language_model.lm_head.weight" -> "lm_head.weight"
+                #      "model.language_model.embed_tokens.weight" -> "model.embed_tokens.weight"
+                if target_key not in index:
+                    _vlm_strip_prefixes = (
+                        "model.language_model.",
+                        "language_model.",
+                        "model.text_model.",
+                        "text_model.",
+                        "model.model.",
+                    )
+                    for _strip in _vlm_strip_prefixes:
+                        if target_key.startswith(_strip):
+                            alt = target_key[len(_strip):]
+                            if alt in index:
+                                target_key = alt
+                                break
+                            # Also try with "model." prefix after stripping
+                            alt2 = "model." + alt
+                            if alt2 in index:
+                                target_key = alt2
+                                break
+
             if target_key in index:
                 state_dict[name] = self._load_tensor_for_key(target_key, model_path, index, loaded_shards)
             else:
@@ -321,6 +392,7 @@ class LayerStore:
 
             # 2. Load Config & Index
             config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+            self._normalize_config(config)
 
             # Load index.json for weights mapping
             index_path = os.path.join(model_path, "model.safetensors.index.json")
@@ -732,15 +804,46 @@ class LayerStore:
             for _wk in weight_map.keys():
                 if _wk.endswith("lm_head.weight"):
                     _candidate_prefix = _wk[: -len(".weight")]   # strip ".weight"
-                    # Navigate to the module at this prefix
+                    # Navigate to the module at this prefix in the PyTorch tree.
+                    # For standard LMs the checkpoint prefix matches the module path
+                    # (e.g. "lm_head" -> model.lm_head).
+                    # For VLMs (e.g. Qwen3.5) the weight is stored flat as "lm_head.weight"
+                    # in the checkpoint but the module lives at model.language_model.lm_head.
+                    # In that case we KEEP the checkpoint prefix (so _save_module constructs
+                    # the correct key) but find the module via known VLM paths.
+                    _mod_found = None
+                    # First try: direct navigation using checkpoint prefix
                     try:
                         _candidate_mod = model
                         for _p in _candidate_prefix.split("."):
                             _candidate_mod = getattr(_candidate_mod, _p)
-                        _lm_head_candidates.append((_candidate_mod, _candidate_prefix))
-                        break
+                        _mod_found = _candidate_mod
                     except AttributeError:
-                        continue
+                        pass
+
+                    # Second try: VLM wrapper paths — module is deeper than checkpoint key
+                    if _mod_found is None:
+                        _vlm_search_paths = [
+                            "language_model.lm_head",
+                            "model.language_model.lm_head",
+                            "model.lm_head",
+                            f"{_backbone_weight_prefix}.lm_head",
+                        ]
+                        for _vlm_path in dict.fromkeys(_vlm_search_paths):  # dedup, preserve order
+                            try:
+                                _vlm_mod = model
+                                for _p in _vlm_path.split("."):
+                                    _vlm_mod = getattr(_vlm_mod, _p)
+                                _mod_found = _vlm_mod
+                                print(f"      🔧 lm_head module found via '{_vlm_path}'; "
+                                      f"using checkpoint prefix '{_candidate_prefix}'")
+                                break
+                            except AttributeError:
+                                continue
+
+                    if _mod_found is not None:
+                        _lm_head_candidates.append((_mod_found, _candidate_prefix))
+                        break
 
             # Fallback: try known structural paths if weight_map scan found nothing
             if not _lm_head_candidates:

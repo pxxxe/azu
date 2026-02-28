@@ -674,22 +674,35 @@ class LayerStore:
             # 6. Embeddings, Norm & Head
             print("   💾 Saving embeddings, final norm & head...")
 
-            # A. Embeddings
-            if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
-                emb_file = out_dir / "embeddings.safetensors"
-                self._save_module(model.model.embed_tokens, "model.embed_tokens", model_path, weight_map, emb_file, loaded_shards)
-                if not emb_file.exists():
-                      raise RuntimeError(f"Embeddings file was not created: {emb_file}")
-                print(f"      ✅ Embeddings saved")
+            # Derive the backbone module and its weight_map prefix from
+            # layer_prefix_base (e.g. "model.language_model.layers" -> backbone
+            # module is model.language_model, weight prefix is "model.language_model").
+            # This handles both standard models (model.layers -> model)
+            # and VLM-wrapped models (model.language_model.layers -> model.language_model).
+            _backbone_weight_prefix = layer_prefix_base.rsplit(".layers", 1)[0]  # e.g. "model.language_model"
+            _backbone_module = model
+            for _part in _backbone_weight_prefix.split("."):
+                _backbone_module = getattr(_backbone_module, _part, _backbone_module)
 
-            # B. Final Norm (CRITICAL FIX)
-            # Support Llama/Mistral/Mixtral (model.norm) and others (transformer.ln_f)
+            # A. Embeddings
+            _emb_module = getattr(_backbone_module, "embed_tokens", None)
+            if _emb_module is not None:
+                emb_file = out_dir / "embeddings.safetensors"
+                self._save_module(_emb_module, f"{_backbone_weight_prefix}.embed_tokens", model_path, weight_map, emb_file, loaded_shards)
+                if not emb_file.exists():
+                    raise RuntimeError(f"Embeddings file was not created: {emb_file}")
+                print(f"      ✅ Embeddings saved")
+            else:
+                print(f"      ⚠️ Warning: No embed_tokens found on backbone ({_backbone_weight_prefix})")
+
+            # B. Final Norm
             final_norm_module = None
             final_norm_prefix = None
 
-            if hasattr(model, "model") and hasattr(model.model, "norm"):
-                final_norm_module = model.model.norm
-                final_norm_prefix = "model.norm"
+            _norm = getattr(_backbone_module, "norm", None)
+            if _norm is not None:
+                final_norm_module = _norm
+                final_norm_prefix = f"{_backbone_weight_prefix}.norm"
             elif hasattr(model, "transformer") and hasattr(model.transformer, "ln_f"):
                 final_norm_module = model.transformer.ln_f
                 final_norm_prefix = "transformer.ln_f"
@@ -703,13 +716,21 @@ class LayerStore:
             else:
                 print("      ⚠️ Warning: No final normalization layer found (might be correct for some architectures)")
 
-            if hasattr(model, "lm_head"):
-                # --- CHANGE: .pt -> .safetensors ---
+            # C. LM Head — check backbone first, then top-level model
+            _lm_head_module = getattr(_backbone_module, "lm_head", None) or getattr(model, "lm_head", None)
+            _lm_head_prefix = (
+                f"{_backbone_weight_prefix}.lm_head"
+                if getattr(_backbone_module, "lm_head", None) is not None
+                else "lm_head"
+            )
+            if _lm_head_module is not None:
                 head_file = out_dir / "lm_head.safetensors"
-                self._save_module(model.lm_head, "lm_head", model_path, weight_map, head_file, loaded_shards)
+                self._save_module(_lm_head_module, _lm_head_prefix, model_path, weight_map, head_file, loaded_shards)
                 if not head_file.exists():
                     raise RuntimeError(f"LM head file was not created: {head_file}")
                 print(f"      ✅ LM head saved")
+            else:
+                print(f"      ⚠️ Warning: No lm_head found")
 
             # 7. Metadata & Tokenizer
             print("   💾 Saving metadata and tokenizer assets...")
@@ -744,11 +765,22 @@ class LayerStore:
                         shutil.copy2(src_path, dst_path)
                         print(f"      📦 Manually copied: {filename}")
 
+            # hidden_size lives directly on standard configs but on nested
+            # text_config / language_config for VLM composite configs.
+            _hidden_size = (
+                getattr(config, "hidden_size", None)
+                or getattr(getattr(config, "text_config", None), "hidden_size", None)
+                or getattr(getattr(config, "language_config", None), "hidden_size", None)
+                or getattr(getattr(config, "llm_config", None), "hidden_size", None)
+            )
+            if _hidden_size is None:
+                raise RuntimeError(f"Could not resolve hidden_size from config for {model_id}")
+
             structure = {
                 "model_id": model_id,
                 "num_layers": num_layers,
                 "architecture": config.architectures[0],
-                "hidden_size": config.hidden_size,
+                "hidden_size": _hidden_size,
                 "total_size_mb": total_size_mb,
                 "is_moe": any(x['type'] == 'moe' for x in layer_metadata),
                 "num_experts_per_tok": getattr(config, "num_experts_per_tok", 2),

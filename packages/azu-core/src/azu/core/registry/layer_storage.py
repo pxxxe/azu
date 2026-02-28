@@ -716,21 +716,52 @@ class LayerStore:
             else:
                 print("      ⚠️ Warning: No final normalization layer found (might be correct for some architectures)")
 
-            # C. LM Head — check backbone first, then top-level model
-            _lm_head_module = getattr(_backbone_module, "lm_head", None) or getattr(model, "lm_head", None)
-            _lm_head_prefix = (
-                f"{_backbone_weight_prefix}.lm_head"
-                if getattr(_backbone_module, "lm_head", None) is not None
-                else "lm_head"
-            )
-            if _lm_head_module is not None:
+            # C. LM Head
+            # Walk candidate (module, weight_prefix) pairs from most-specific to
+            # least-specific.  The first one that actually has an lm_head attribute wins.
+            # This covers:
+            #   - Standard LMs:            model.lm_head          (prefix "lm_head")
+            #   - Qwen3.5 / VLMs:          model.language_model.lm_head
+            #                              (prefix "model.language_model.lm_head")
+            #   - Other nested backbones:  _backbone_module.lm_head
+            _lm_head_candidates = []
+
+            # Build candidate list from the weight_map — find any key ending in
+            # "lm_head.weight" and derive the prefix from it.  This is the most
+            # reliable approach since it's grounded in what's actually in the checkpoint.
+            for _wk in weight_map.keys():
+                if _wk.endswith("lm_head.weight"):
+                    _candidate_prefix = _wk[: -len(".weight")]   # strip ".weight"
+                    # Navigate to the module at this prefix
+                    try:
+                        _candidate_mod = model
+                        for _p in _candidate_prefix.split("."):
+                            _candidate_mod = getattr(_candidate_mod, _p)
+                        _lm_head_candidates.append((_candidate_mod, _candidate_prefix))
+                        break
+                    except AttributeError:
+                        continue
+
+            # Fallback: try known structural paths if weight_map scan found nothing
+            if not _lm_head_candidates:
+                for _mod, _pfx in [
+                    (_backbone_module,                          f"{_backbone_weight_prefix}.lm_head"),
+                    (model,                                     "lm_head"),
+                    (getattr(model, "language_model", None),   "language_model.lm_head"),
+                ]:
+                    if _mod is not None and getattr(_mod, "lm_head", None) is not None:
+                        _lm_head_candidates.append((getattr(_mod, "lm_head"), _pfx))
+                        break
+
+            if _lm_head_candidates:
+                _lm_head_module, _lm_head_prefix = _lm_head_candidates[0]
                 head_file = out_dir / "lm_head.safetensors"
                 self._save_module(_lm_head_module, _lm_head_prefix, model_path, weight_map, head_file, loaded_shards)
                 if not head_file.exists():
                     raise RuntimeError(f"LM head file was not created: {head_file}")
-                print(f"      ✅ LM head saved")
+                print(f"      ✅ LM head saved (prefix: {_lm_head_prefix})")
             else:
-                print(f"      ⚠️ Warning: No lm_head found")
+                print(f"      ⚠️ Warning: No lm_head found in weight_map or model structure")
 
             # 7. Metadata & Tokenizer
             print("   💾 Saving metadata and tokenizer assets...")

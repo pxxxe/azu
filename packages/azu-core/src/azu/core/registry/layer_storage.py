@@ -409,6 +409,33 @@ class LayerStore:
             # 5. Extract Structure
             layers_obj, layer_prefix_base = self._find_layers(model)
             num_layers = len(layers_obj)
+
+            # ── Prefix reconciliation ────────────────────────────────────────
+            # _find_layers returns the module-hierarchy path (e.g.
+            # "language_model.layers") which is the path you'd use to traverse
+            # the nn.Module tree.  But weight_map keys come from state_dict(),
+            # which may include additional top-level prefixes not present in the
+            # module path (e.g. "model.language_model.layers.0.*" when the
+            # backbone is wrapped inside a VLM's self.model attribute).
+            #
+            # Detect the actual prefix used in the weight_map by probing with
+            # increasing prefix candidates until we find one that matches a real
+            # key.  This happens once here and fixes all 64 layers in one shot.
+            _probe_layer_key = f"{layer_prefix_base}.0."
+            if not any(k.startswith(_probe_layer_key) for k in weight_map):
+                # Try prepending common top-level wrappers
+                for _candidate_prefix in ("model.", "transformer.", "language_model."):
+                    _candidate = f"{_candidate_prefix}{layer_prefix_base}.0."
+                    if any(k.startswith(_candidate) for k in weight_map):
+                        layer_prefix_base = f"{_candidate_prefix}{layer_prefix_base}"
+                        print(f"   🔧 Adjusted layer_prefix_base to: {layer_prefix_base}")
+                        break
+                else:
+                    # Nothing matched — log a warning but continue; _save_module's
+                    # suffix-match fallback will still run (with all its known issues).
+                    print(f"   ⚠️ Could not reconcile layer_prefix_base '{layer_prefix_base}' "
+                          f"with weight_map keys. Sharding may produce incorrect weights.")
+            # ────────────────────────────────────────────────────────────────
             layer_metadata = []
             total_size_mb = 0
 

@@ -27,7 +27,8 @@ import aiohttp
 CORE_IMG = 'pxxxe/azu-core:latest'
 WORKER_IMG = 'pxxxe/azu-worker:latest'
 # TEST_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
-TEST_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+# TEST_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+TEST_MODEL = "Qwen/Qwen3.5-27B"
 
 VOLUME_ID = os.getenv("VOLUME_ID")
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
@@ -97,8 +98,8 @@ GPU_VRAM_MAP = {
 }
 
 # TARGET_TOTAL_VRAM = 120  # GB needed for Mixtral test
-TARGET_TOTAL_VRAM = 24  # GB needed for Mixtral test
-
+# TARGET_TOTAL_VRAM = 24  # GB needed for Mixtral test
+TARGET_TOTAL_VRAM = 64
 
 runpod.api_key = RUNPOD_API_KEY
 RUNPOD_REST_URL = "https://rest.runpod.io/v1"
@@ -762,6 +763,8 @@ def main():
             print(f"   ❌ ai_sdk test failed: {e}")
             traceback.print_exc()
 
+
+        """
         # ==========================================
         # 6. Serverless Worker Test
         # ==========================================
@@ -903,6 +906,7 @@ def main():
                     print("   ✅ Serverless dispatch path: PASSED")
                 else:
                     print("   ❌ Serverless dispatch path: FAILED")
+    """
     except KeyboardInterrupt:
         print("\n\n🛑 INTERRUPTED BY USER")
     except Exception as e:

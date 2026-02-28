@@ -25,30 +25,89 @@ class LayerStore:
         return (self.storage_path / sanitized / "structure.json").exists()
 
     def _find_layers(self, model):
-        """Find transformer layers in model architecture (works on meta device)."""
+        """
+        Find transformer decoder layers in model architecture (works on meta device).
+
+        Strategy:
+          1. Try a list of known explicit attribute paths (fast, covers 99% of models).
+          2. Fall back to a recursive scan of all nn.ModuleList / nn.Sequential
+              children, picking the one with the most elements that contains
+              nn.Module instances — this covers VLM / trust_remote_code architectures
+              (e.g. Qwen3.5) where the LLM backbone is nested inside a wrapper and
+              the layer container may not be a plain ModuleList.
+        """
+        import torch.nn as nn
+
         print(f"   🔍 Searching for layers in model structure...")
+
+        # ── Pass 1: explicit known paths ─────────────────────────────────────
         possible_paths = [
+            # Standard causal LMs
             'model.layers',
             'transformer.h',
             'model.decoder.layers',
             'transformer.layers',
-            # VLM / conditional-generation layouts (e.g. Qwen3.5):
+            # VLM / conditional-generation wrappers (Qwen3.5, LLaVA, etc.)
             'language_model.model.layers',
             'model.language_model.layers',
             'model.text_model.layers',
+            'text_model.encoder.layers',
+            'model.model.layers',
         ]
+
+        def _is_valid_layers_obj(obj):
+            """True if obj looks like a list of transformer decoder layers."""
+            try:
+                length = len(obj)
+            except TypeError:
+                return False
+            if length == 0:
+                return False
+            # Must contain nn.Module instances, not raw tensors
+            first = obj[0] if hasattr(obj, '__getitem__') else next(iter(obj), None)
+            return isinstance(first, nn.Module)
+
         for attr_path in possible_paths:
             try:
-                parts = attr_path.split('.')
                 obj = model
-                for part in parts:
+                for part in attr_path.split('.'):
                     obj = getattr(obj, part)
-                if hasattr(obj, '__len__'):
+                if _is_valid_layers_obj(obj):
                     print(f"   ✅ Found layers at: {attr_path}")
                     return obj, attr_path
             except AttributeError:
                 continue
-        raise ValueError(f"Could not find layers. Model keys: {list(model.state_dict().keys())[:5]}...")
+
+        # ── Pass 2: recursive scan ────────────────────────────────────────────
+        # Walk every named child module. Collect all ModuleList / Sequential
+        # instances that pass the validity check. Pick the largest one — for a
+        # 27B-class model that will be the 64-entry decoder layer list.
+        print(f"   🔍 Explicit paths exhausted, falling back to recursive scan...")
+
+        best_obj = None
+        best_path = None
+        best_len = 0
+
+        for name, module in model.named_modules():
+            if not isinstance(module, (nn.ModuleList, nn.Sequential)):
+                continue
+            if not _is_valid_layers_obj(module):
+                continue
+            if len(module) > best_len:
+                best_len = len(module)
+                best_obj = module
+                # Convert "model.layers" style named_modules path to
+                # dot-attribute path. named_modules() uses '.' as separator
+                # and returns the same format we need.
+                best_path = name
+
+        if best_obj is not None:
+            print(f"   ✅ Found layers via scan at: {best_path} ({best_len} layers)")
+            return best_obj, best_path
+
+        raise ValueError(
+            f"Could not find layers. Model keys: {list(model.state_dict().keys())[:5]}..."
+        )
 
     def _is_moe_layer(self, layer, config):
         """Find the MoE block inside a layer.

@@ -462,6 +462,7 @@ class LayerLoader:
             "transformer.layers",
             "language_model.model.layers",
             "model.language_model.layers",
+            "language_model.layers",
         ]
 
         layers = None

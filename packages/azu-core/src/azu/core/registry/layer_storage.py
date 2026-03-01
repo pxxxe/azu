@@ -864,7 +864,27 @@ class LayerStore:
                     raise RuntimeError(f"LM head file was not created: {head_file}")
                 print(f"      ✅ LM head saved (prefix: {_lm_head_prefix})")
             else:
-                print(f"      ⚠️ Warning: No lm_head found in weight_map or model structure")
+                # LAST RESORT: lm_head.weight is in the checkpoint but the module is
+                # inaccessible (weight-tied and not exposed as an nn.Module attribute —
+                # exactly what Qwen3.5 does). Skip module navigation entirely and load
+                # the raw tensor straight from the shard.
+                _lm_head_raw_key = next(
+                    (k for k in weight_map if k.endswith("lm_head.weight")), None
+                )
+                if _lm_head_raw_key is not None:
+                    print(f"      🔧 lm_head module not navigable (likely weight-tied); "
+                          f"loading raw tensor from checkpoint key '{_lm_head_raw_key}'")
+                    _lm_head_tensor = self._load_tensor_for_key(
+                        _lm_head_raw_key, model_path, weight_map, loaded_shards
+                    )
+                    if _lm_head_tensor is not None:
+                        head_file = out_dir / "lm_head.safetensors"
+                        save_safetensors({"weight": _lm_head_tensor.contiguous()}, str(head_file))
+                        print(f"      ✅ LM head saved directly from checkpoint")
+                    else:
+                        print(f"      ⚠️ Warning: lm_head.weight key found but tensor failed to load")
+                else:
+                    print(f"      ⚠️ Warning: No lm_head found in weight_map or model structure")
 
             # 7. Metadata & Tokenizer
             print("   💾 Saving metadata and tokenizer assets...")

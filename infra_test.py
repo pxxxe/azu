@@ -588,13 +588,57 @@ def main():
                         break
             else:
                 print(f"   🔪 Triggering shard...")
-                shard_res = requests.post(f"{reg_url}/models/shard", json={"model_id": TEST_MODEL}, timeout=900)
+                shard_res = requests.post(
+                    f"{reg_url}/models/shard",
+                    json={"model_id": TEST_MODEL},
+                    headers={"X-Auth-Key": interworker_secret},
+                    timeout=30,
+                )
                 if shard_res.status_code != 200:
                     raise Exception(f"Sharding Failed: {shard_res.text}")
-                print(f"   ✅ Sharding Complete: {shard_res.json()}")
+                print(f"   ✅ Shard triggered: {shard_res.json()}")
+
+                # Wait for background sharding to complete (can take 10-30 min for large models)
+                print(f"   ⏳ Waiting for sharding to complete (polling every 10s)...")
+                for i in range(360):  # 60 minute max
+                    time.sleep(10)
+                    check = requests.get(f"{reg_url}/models/status", params={"model_id": TEST_MODEL}, timeout=10)
+                    status = check.json().get('status', '') if check.status_code == 200 else ''
+                    if status == 'ready':
+                        print(f"   ✅ Sharding complete!")
+                        break
+                    if status.startswith('failed'):
+                        raise Exception(f"Sharding failed: {status}")
+                    if i % 6 == 0:
+                        print(f"      [{i*10}s] Still sharding...")
+                else:
+                    raise Exception("Sharding timed out after 60 minutes")
         else:
             print(f"   ⚠️ Could not get status, will attempt to shard...")
-            shard_res = requests.post(f"{reg_url}/models/shard", json={"model_id": TEST_MODEL}, timeout=900)
+            shard_res = requests.post(
+                f"{reg_url}/models/shard",
+                json={"model_id": TEST_MODEL},
+                headers={"X-Auth-Key": interworker_secret},
+                timeout=30,
+            )
+            if shard_res.status_code != 200:
+                raise Exception(f"Sharding Failed: {shard_res.text}")
+            print(f"   ✅ Shard triggered: {shard_res.json()}")
+
+            print(f"   ⏳ Waiting for sharding to complete (polling every 10s)...")
+            for i in range(360):  # 60 minute max
+                time.sleep(10)
+                check = requests.get(f"{reg_url}/models/status", params={"model_id": TEST_MODEL}, timeout=10)
+                status = check.json().get('status', '') if check.status_code == 200 else ''
+                if status == 'ready':
+                    print(f"   ✅ Sharding complete!")
+                    break
+                if status.startswith('failed'):
+                    raise Exception(f"Sharding failed: {status}")
+                if i % 6 == 0:
+                    print(f"      [{i*10}s] Still sharding...")
+            else:
+                raise Exception("Sharding timed out after 60 minutes")
 
         # ==========================================
         # 3. Deploy Workers (DYNAMIC PROVISIONING)

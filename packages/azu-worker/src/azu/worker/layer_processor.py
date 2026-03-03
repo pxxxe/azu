@@ -120,15 +120,23 @@ class DenseLayerProcessor:
                         hidden_states, job_context.kv_cache, layer_idx
                     )
 
+                    layer = self.model_manager.dense_layers[layer_idx]
+
+                    # Driver builds the exact kwargs this layer's forward() accepts,
+                    # filtering out args unsupported by this architecture (e.g.
+                    # position_embeddings for models that handle RoPE internally).
+                    kwargs = self.model_manager.build_forward_kwargs(
+                        layer,
+                        hidden_states,
+                        pos_emb,
+                        attn_mask,
+                        pos_ids,
+                        job_context.kv_cache,
+                        layer_idx,
+                    )
+
                     with torch.no_grad():
-                        out = self.model_manager.dense_layers[layer_idx](
-                            hidden_states,
-                            past_key_values=job_context.kv_cache,
-                            use_cache=True,
-                            position_embeddings=pos_emb,
-                            attention_mask=attn_mask,
-                            position_ids=pos_ids
-                        )
+                        out = layer(**kwargs)
 
                         if isinstance(out, tuple):
                             layer_out = out[0]
@@ -267,15 +275,17 @@ class MoERouterProcessor:
 
                 # B. Self Attention
                 if hasattr(shared_layer, 'self_attn'):
-                    attn_out, new_kv = shared_layer.self_attn(
+                    attn_kwargs = self.model_manager.build_forward_kwargs(
+                        shared_layer.self_attn,
                         hidden_states,
-                        position_embeddings=pos_emb,
-                        attention_mask=attn_mask,
-                        position_ids=pos_ids,
-                        past_key_values=job_context.kv_cache,
-                        use_cache=True
+                        pos_emb,
+                        attn_mask,
+                        pos_ids,
+                        job_context.kv_cache,
+                        layer_idx,
                     )
-                    hidden_states = attn_out
+                    attn_out = shared_layer.self_attn(**attn_kwargs)
+                    hidden_states = attn_out[0] if isinstance(attn_out, tuple) else attn_out
 
                 # C. First Residual Connection
                 hidden_states = residual + hidden_states

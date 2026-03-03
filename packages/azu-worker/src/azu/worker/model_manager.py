@@ -15,17 +15,7 @@ from transformers import AutoTokenizer, AutoConfig
 
 from azu.worker.layer_loader import LayerLoader
 from azu.worker.config import LAYER_CACHE_DIR
-
-
-# Try to import Rotary Embeddings for v5 Compatibility
-try:
-    from transformers.models.mixtral.modeling_mixtral import MixtralRotaryEmbedding
-except ImportError:
-    try:
-        from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding as MixtralRotaryEmbedding
-    except ImportError:
-        print("⚠️ Could not import RotaryEmbedding. v5 Compat mode might fail.")
-        MixtralRotaryEmbedding = None
+from azu.shared.model_drivers import get_driver, ModelDriver
 
 
 class ModelManager:
@@ -52,6 +42,9 @@ class ModelManager:
         self.lm_head: Optional[torch.nn.Module] = None
         self.tokenizer: Optional[AutoTokenizer] = None
         self.final_norm: Optional[torch.nn.Module] = None
+
+        # Active driver for the current model
+        self._driver: Optional[ModelDriver] = None
 
         # Layer caches
         self.dense_layers: Dict[int, torch.nn.Module] = {}
@@ -98,8 +91,8 @@ class ModelManager:
             # Log clear state
             self._print_vram_stats("Cleared")
 
-            # Initialize Rotary Embeddings for v5 Compat
-            await self._init_rotary_embeddings(model_id)
+            # Initialize model components via driver
+            await self._init_model(model_id)
 
             # Update current model ID
             self.current_model_id = model_id
@@ -116,12 +109,13 @@ class ModelManager:
         self.moe_routers.clear()
         self.moe_experts.clear()
         self._layer_forward_params.clear()
+        self._driver = None
 
         gc.collect()
         torch.cuda.empty_cache()
 
-    async def _init_rotary_embeddings(self, model_id: str) -> None:
-        """Initialize global rotary embeddings for the model."""
+    async def _init_model(self, model_id: str) -> None:
+        """Initialize global model components (config, driver, rotary embeddings)."""
         try:
             print(f"   ⚙️ Initializing Rotary Embeddings for {model_id}...")
             config_path, config_url = self.loader._get_paths(model_id, "config.json")
@@ -130,19 +124,25 @@ class ModelManager:
 
             self.config = AutoConfig.from_pretrained(config_path, trust_remote_code=True)
 
-            # Proxy missing top-level attrs from nested text_config (e.g. Qwen3.5 VLM)
-            self.loader._normalize_config(self.config)
+            # Resolve driver and normalize config (handles VLM nested text_config etc.)
+            self._driver = get_driver(self.config)
+            self._driver.normalize_config(self.config)
+            print(f"   🔧 Driver: {type(self._driver).__name__}")
 
-            if MixtralRotaryEmbedding:
-                # TRANSFORMERS 5.0+ FIX: Pass config object instead of individual params
-                self.rotary_emb = MixtralRotaryEmbedding(
-                    config=self.config,
-                    device=self.device
-                ).to(self.dtype)
-
-                _head_dim = getattr(self.config, "hidden_size", 0) // max(getattr(self.config, "num_attention_heads", 1), 1)
+            # Driver decides whether external RoPE is needed, or None if the
+            # architecture computes it internally (e.g. Qwen3.5).
+            rope = self._driver.init_rope(self.config, self.device, self.dtype)
+            if rope is not None:
+                self.rotary_emb = rope
+                _head_dim = (
+                    getattr(self.config, 'hidden_size', 0)
+                    // max(getattr(self.config, 'num_attention_heads', 1), 1)
+                )
                 print(f"   ✅ RoPE Initialized (head_dim={_head_dim}, "
                       f"base={getattr(self.config, 'rope_theta', 10000.0)})")
+            else:
+                self.rotary_emb = None
+                print(f"   ℹ️ RoPE handled internally by layers (no external module)")
 
         except Exception as e:
             # Trust_remote_code models (e.g. Qwen3.5) often have a non-standard
@@ -347,6 +347,51 @@ class ModelManager:
 
         self._layer_forward_params[cls] = result
         return result
+
+    def build_forward_kwargs(
+        self,
+        layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        position_embeddings,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_kv: Any,
+        layer_idx: int,
+    ) -> dict:
+        """
+        Build the kwargs dict for layer.forward() by delegating to the active driver.
+
+        The driver knows which kwargs each architecture's layers accept, preventing
+        TypeError on layers that don't take every standard arg (e.g. Qwen3.5 layers
+        that compute RoPE internally and have no use for position_embeddings).
+
+        Falls back to signature introspection via _get_layer_forward_params if
+        _driver is somehow None.
+        """
+        layer_forward_params = self._get_layer_forward_params(layer)
+
+        if self._driver is not None:
+            return self._driver.build_forward_kwargs(
+                layer_forward_params,
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                position_ids,
+                past_kv,
+                layer_idx,
+            )
+
+        # Fallback: base driver behaviour (introspection-based filtering)
+        from azu.shared.model_drivers.base import ModelDriver as _BaseDriver
+        return _BaseDriver().build_forward_kwargs(
+            layer_forward_params,
+            hidden_states,
+            position_embeddings,
+            attention_mask,
+            position_ids,
+            past_kv,
+            layer_idx,
+        )
 
     def _print_vram_stats(self, tag: str, ctx: Any = None) -> None:
         """Print VRAM statistics."""

@@ -1,152 +1,80 @@
+"""
+Layer storage module for sharding and storing model weights on the registry.
+All architecture-specific logic is delegated to the model driver system.
+"""
+
 import torch
 import os
 import sys
 import json
 import gc
 import shutil
-import glob # <--- ADDED for Nuclear Option
+import glob
 from pathlib import Path
 from transformers import AutoConfig, AutoModelForCausalLM
-from transformers.utils import ContextManagers
 from accelerate import init_empty_weights
 from safetensors.torch import load_file as load_safetensors
-# --- CHANGE: Import save_file ---
 from safetensors.torch import save_file as save_safetensors
+
+from azu.shared.model_drivers import get_driver
+
 
 class LayerStore:
     def __init__(self, storage_path="/data/layers"):
         self.storage_path = Path(storage_path)
         self.storage_path.mkdir(exist_ok=True, parents=True)
 
-    @staticmethod
-    def _normalize_config(config) -> None:
-        """
-        Proxy missing top-level config attributes from a nested text_config.
-
-        VLM / multimodal architectures (e.g. Qwen3.5-27B) store the language-model
-        config inside config.text_config rather than at the top level. This causes
-        AttributeError when code accesses config.vocab_size, config.hidden_size, etc.
-
-        Mutates config in place; safe to call multiple times (idempotent).
-        """
-        text_cfg = getattr(config, "text_config", None)
-        if text_cfg is None:
-            return
-
-        _PROXY_ATTRS = [
-            "vocab_size",
-            "hidden_size",
-            "intermediate_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "num_key_value_heads",
-            "max_position_embeddings",
-            "rms_norm_eps",
-            "layer_norm_eps",
-            "rope_theta",
-            "rope_scaling",
-            "attention_bias",
-            "attention_dropout",
-            "hidden_act",
-            "initializer_range",
-            "tie_word_embeddings",
-            "num_local_experts",
-            "num_experts",
-            "num_experts_per_tok",
-            "n_routed_experts",
-            "architectures",
-        ]
-
-        for attr in _PROXY_ATTRS:
-            try:
-                _ = getattr(config, attr)
-            except AttributeError:
-                try:
-                    setattr(config, attr, getattr(text_cfg, attr))
-                except AttributeError:
-                    pass
-
     def has_model(self, model_id: str) -> bool:
         """Check if a model is already fully sharded and stored."""
         sanitized = model_id.replace("/", "_")
-        # We assume if structure.json exists, the sharding completed successfully
         return (self.storage_path / sanitized / "structure.json").exists()
 
-    def _find_layers(self, model):
-        """
-        Find transformer decoder layers in model architecture (works on meta device).
+    # =========================================================================
+    # Layer discovery
+    # =========================================================================
 
-        Strategy:
-          1. Try a list of known explicit attribute paths (fast, covers 99% of models).
-          2. Fall back to a recursive scan of all nn.ModuleList / nn.Sequential
-              children, picking the one with the most elements that contains
-              nn.Module instances — this covers VLM / trust_remote_code architectures
-              (e.g. Qwen3.5) where the LLM backbone is nested inside a wrapper and
-              the layer container may not be a plain ModuleList.
+    def _find_layers(self, model, driver):
+        """
+        Find transformer decoder layers using driver-provided paths,
+        falling back to a recursive ModuleList scan if explicit paths miss.
         """
         import torch.nn as nn
 
-        print(f"   🔍 Searching for layers in model structure...")
+        print("   🔍 Searching for layers in model structure...")
 
-        # ── Pass 1: explicit known paths ─────────────────────────────────────
-        possible_paths = [
-            # Standard causal LMs
-            'model.layers',
-            'transformer.h',
-            'model.decoder.layers',
-            'transformer.layers',
-            # VLM / conditional-generation wrappers (Qwen3.5, LLaVA, etc.)
-            'language_model.model.layers',
-            'model.language_model.layers',
-            'model.text_model.layers',
-            'text_model.encoder.layers',
-            'model.model.layers',
-        ]
-
-        def _is_valid_layers_obj(obj):
-            """True if obj looks like a list of transformer decoder layers."""
+        def _is_valid(obj):
             try:
                 length = len(obj)
             except TypeError:
                 return False
             if length == 0:
                 return False
-            # Must contain nn.Module instances, not raw tensors
-            first = obj[0] if hasattr(obj, '__getitem__') else next(iter(obj), None)
+            first = obj[0] if hasattr(obj, "__getitem__") else next(iter(obj), None)
             return isinstance(first, nn.Module)
 
-        for attr_path in possible_paths:
+        # Pass 1: driver-provided explicit paths
+        for attr_path in driver.layer_module_paths:
             try:
                 obj = model
-                for part in attr_path.split('.'):
+                for part in attr_path.split("."):
                     obj = getattr(obj, part)
-                if _is_valid_layers_obj(obj):
+                if _is_valid(obj):
                     print(f"   ✅ Found layers at: {attr_path}")
                     return obj, attr_path
             except AttributeError:
                 continue
 
-        # ── Pass 2: recursive scan ────────────────────────────────────────────
-        # Walk every named child module. Collect all ModuleList / Sequential
-        # instances that pass the validity check. Pick the largest one — for a
-        # 27B-class model that will be the 64-entry decoder layer list.
-        print(f"   🔍 Explicit paths exhausted, falling back to recursive scan...")
-
-        best_obj = None
-        best_path = None
-        best_len = 0
-
+        # Pass 2: recursive scan — pick the largest valid ModuleList
+        print("   🔍 Explicit paths exhausted, falling back to recursive scan...")
+        best_obj, best_path, best_len = None, None, 0
         for name, module in model.named_modules():
             if not isinstance(module, (nn.ModuleList, nn.Sequential)):
                 continue
-            if not _is_valid_layers_obj(module):
+            if not _is_valid(module):
                 continue
             if len(module) > best_len:
                 best_len = len(module)
                 best_obj = module
-                # Convert "model.layers" style named_modules path to
-                # dot-attribute path. named_modules() uses '.' as separator
-                # and returns the same format we need.
                 best_path = name
 
         if best_obj is not None:
@@ -157,285 +85,114 @@ class LayerStore:
             f"Could not find layers. Model keys: {list(model.state_dict().keys())[:5]}..."
         )
 
-    def _is_moe_layer(self, layer, config):
-        """Find the MoE block inside a layer.
-
-        FIXED VERSION: Checks config FIRST instead of relying on broken meta model structure.
-
-        Returns (is_moe, path_to_moe_block) where path_to_moe_block points to
-        the module that CONTAINS both the router (gate) and the experts list —
-        e.g. "mlp" for Mixtral, NOT "mlp.experts".
-        """
-
-        # ===================================================================
-        # STEP 1: Check config to determine if this is an MoE architecture
-        # ===================================================================
-        # This is CRITICAL - meta models don't reliably expose structure
-        is_moe_architecture = False
-
-        # Check for MoE-specific config attributes
-        if hasattr(config, 'num_local_experts') and config.num_local_experts > 1:
-            is_moe_architecture = True
-        elif hasattr(config, 'num_experts') and config.num_experts > 1:
-            is_moe_architecture = True
-        elif hasattr(config, 'moe_num_experts') and config.moe_num_experts > 1:
-            is_moe_architecture = True
-
-        # Also check architecture name for known MoE models
-        if hasattr(config, 'architectures') and config.architectures:
-            arch_name = config.architectures[0].lower()
-            if 'mixtral' in arch_name or 'moe' in arch_name:
-                is_moe_architecture = True
-
-        # If config says it's NOT MoE, return immediately
-        if not is_moe_architecture:
-            return False, None
-
-        # ===================================================================
-        # STEP 2: If config confirms MoE, find the path to the MoE block
-        # ===================================================================
-        # We try common paths where the MoE block lives
-        candidates = [
-            ("block_sparse_moe", ["gate", "router"]),   # some Mixtral variants
-            ("mlp",              ["gate", "router"]),   # Mixtral standard (MOST COMMON)
-            ("moe",              ["gate", "router"]),   # generic
-            ("",                 ["gate", "router"]),   # layer itself is the block
-        ]
-
-        for block_path, router_names in candidates:
-            try:
-                obj = layer
-                if block_path:
-                    for part in block_path.split('.'):
-                        obj = getattr(obj, part)
-
-                # CRITICAL FIX: On meta device, we can't rely on checking if
-                # experts has __len__ or if it's empty. Just check EXISTENCE.
-                has_router = any(hasattr(obj, name) for name in router_names)
-                has_experts = hasattr(obj, 'experts')
-
-                # If we found EITHER router OR experts, this is the MoE block
-                if has_router or has_experts:
-                    print(f"      🔍 Found MoE block at path: '{block_path or 'ROOT'}'")
-                    return True, block_path
-            except AttributeError:
-                continue
-
-        # ===================================================================
-        # STEP 3: Fallback - config says MoE but we can't find structure
-        # ===================================================================
-        # For Mixtral and most MoE models in 2026, it's always "mlp"
-        print(f"      ⚠️  Config indicates MoE but couldn't detect structure. Assuming 'mlp' path.")
-        return True, "mlp"
-
-    def _get_num_experts(self, config):
-        """
-        Get number of experts from config.
-        Works for Mixtral and other MoE models.
-        """
-        # Common config keys for number of experts
-        for key in ['num_local_experts', 'num_experts', 'moe_num_experts', 'n_routed_experts']:
-            if hasattr(config, key):
-                num = getattr(config, key)
-                if num > 0:
-                    return num
-
-        # Fallback: default to 8 for Mixtral-style models
-        print(f"   ⚠️ Warning: Could not find num_experts in config, defaulting to 8")
-        return 8
+    # =========================================================================
+    # Weight loading helpers
+    # =========================================================================
 
     def _load_tensor_for_key(self, key, model_path, index, loaded_shards):
-        """
-        Loads a specific tensor key from the checkpoint files.
-        Uses a cache (loaded_shards) to avoid re-reading files unnecessarily.
-        """
+        """Load a specific tensor key from checkpoint shards (with shard cache)."""
         filename = index.get(key)
         if not filename:
-            # Maybe it's a non-sharded model (bin/safetensors directly)
-            # We assume sharded for large models, but handle fallback?
-            return None # Fail gracefully so we can try patterns
-
+            return None
         filepath = os.path.join(model_path, filename)
-
-        # Check cache
         if filepath not in loaded_shards:
-            # Free memory if we have too many shards loaded?
-            # For strict memory, we keep only ONE shard.
             loaded_shards.clear()
             gc.collect()
-
             print(f"      📖 Loading shard: {filename}")
             if filename.endswith(".safetensors"):
                 loaded_shards[filepath] = load_safetensors(filepath)
             else:
                 loaded_shards[filepath] = torch.load(filepath, map_location="cpu")
-
         return loaded_shards[filepath][key]
 
-    def _save_module(self, module, prefix, model_path, index, output_path, loaded_shards):
+    def _save_module(self, module, prefix, model_path, index, output_path, loaded_shards, driver):
         """
-        Reconstructs a module's state_dict by fetching keys from disk and saving to output_path.
-        prefix: e.g. "model.layers.0.mlp.experts.0"
-
-        INCLUDES FIX FOR MIXTRAL ALIASING (block_sparse_moe <-> mlp)
-        INCLUDES FIX FOR QWEN/LLAMA ALIASING (model.lm_head <-> lm_head, etc)
+        Reconstruct a module's state_dict from the checkpoint and save it.
+        Uses driver.resolve_weight_key() for all aliasing; falls back to
+        suffix-match only as a last resort.
         """
         state_dict = {}
-        # Iterate named parameters of the meta module to know what to look for
         for name, _ in module.named_parameters(recurse=True):
             global_key = f"{prefix}.{name}"
-
-            # --- FIX: Handle Key Aliasing ---
-            # If the exact key isn't in the index, try various aliasing strategies
-            target_key = global_key
-            if target_key not in index:
-                # Strategy 1: mlp <-> block_sparse_moe (Mixtral)
-                if ".mlp." in target_key:
-                    alt = target_key.replace(".mlp.", ".block_sparse_moe.")
-                    if alt in index: target_key = alt
-                elif ".block_sparse_moe." in target_key:
-                    alt = target_key.replace(".block_sparse_moe.", ".mlp.")
-                    if alt in index: target_key = alt
-
-                # Strategy 2: model.lm_head <-> lm_head (Qwen, Llama, etc)
-                if target_key not in index:
-                    if target_key.startswith("lm_head."):
-                        alt = "model." + target_key
-                        if alt in index: target_key = alt
-                    elif target_key.startswith("model.lm_head."):
-                        alt = target_key.replace("model.", "")
-                        if alt in index: target_key = alt
-
-                # Strategy 3: model.embed_tokens <-> embed_tokens
-                if target_key not in index:
-                    if target_key.startswith("embed_tokens."):
-                        alt = "model." + target_key
-                        if alt in index: target_key = alt
-                    elif target_key.startswith("model.embed_tokens."):
-                        alt = target_key.replace("model.", "")
-                        if alt in index: target_key = alt
-
-                # Strategy 4: model.norm <-> norm (final norm)
-                if target_key not in index:
-                    if target_key.startswith("norm."):
-                        alt = "model." + target_key
-                        if alt in index: target_key = alt
-                    elif target_key.startswith("model.norm."):
-                        alt = target_key.replace("model.", "")
-                        if alt in index: target_key = alt
-
-                # Strategy 5: strip VLM wrapper prefixes
-                # e.g. "model.language_model.lm_head.weight" -> "lm_head.weight"
-                #      "model.language_model.embed_tokens.weight" -> "model.embed_tokens.weight"
-                if target_key not in index:
-                    _vlm_strip_prefixes = (
-                        "model.language_model.",
-                        "language_model.",
-                        "model.text_model.",
-                        "text_model.",
-                        "model.model.",
-                    )
-                    for _strip in _vlm_strip_prefixes:
-                        if target_key.startswith(_strip):
-                            alt = target_key[len(_strip):]
-                            if alt in index:
-                                target_key = alt
-                                break
-                            # Also try with "model." prefix after stripping
-                            alt2 = "model." + alt
-                            if alt2 in index:
-                                target_key = alt2
-                                break
-
-            if target_key in index:
-                state_dict[name] = self._load_tensor_for_key(target_key, model_path, index, loaded_shards)
+            resolved = driver.resolve_weight_key(global_key, index)
+            if resolved in index:
+                state_dict[name] = self._load_tensor_for_key(resolved, model_path, index, loaded_shards)
             else:
-                # Last resort: search for any key that ends with the parameter name
-                param_name = name
                 found = False
-                for key in index.keys():
-                    if key.endswith(f".{param_name}") or key == param_name:
+                for key in index:
+                    if key.endswith(f".{name}") or key == name:
                         state_dict[name] = self._load_tensor_for_key(key, model_path, index, loaded_shards)
                         print(f"      🔍 Found key via suffix match: {key}")
                         found = True
                         break
                 if not found:
-                    print(f"      ⚠️ Warning: Missing key {global_key} (checked alias: {target_key})")
+                    print(f"      ⚠️ Missing key {global_key} (resolved: {resolved})")
 
-        # --- CHANGE: .pt -> .safetensors ---
-        # 1. Ensure contiguous (required for safetensors)
-        state_dict = {k: v.contiguous() for k, v in state_dict.items()}
-        # 2. Save
+        state_dict = {k: v.contiguous() for k, v in state_dict.items() if v is not None}
         save_safetensors(state_dict, output_path)
-        return output_path.stat().st_size / (1024**2)
+        return output_path.stat().st_size / (1024 ** 2)
+
+    # =========================================================================
+    # Main sharding entry point
+    # =========================================================================
 
     def shard_model(self, model_id: str, hf_token: str):
         print(f"\n🔪 SHARDING {model_id} (Streaming Mode)")
 
-        # Check disk space
-        import shutil
         total, _, free = shutil.disk_usage(self.storage_path)
-        if free < 50 * (2**30): # 50GB check
-            print(f"   ⚠️ Low disk space: {free // (2**30)}GB free")
+        if free < 50 * (2 ** 30):
+            print(f"   ⚠️ Low disk space: {free // (2 ** 30)}GB free")
 
         from huggingface_hub import snapshot_download
 
         try:
-            # 1. Download Model Artifacts (Metadata + Weights)
+            # ── 1. Download ──────────────────────────────────────────────────
             print("   📥 Fetching model artifacts (snapshot)...")
             model_path = snapshot_download(
                 repo_id=model_id,
                 token=hf_token,
-                allow_patterns=["*.json", "*.safetensors", "*.bin", "*.model", "*.txt", "*.py"]
+                allow_patterns=["*.json", "*.safetensors", "*.bin", "*.model", "*.txt", "*.py"],
             )
             print(f"   ✅ Model available at: {model_path}")
 
-            # 2. Load Config & Index
+            # ── 2. Config + driver ───────────────────────────────────────────
             config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-            self._normalize_config(config)
+            driver = get_driver(config)
+            driver.normalize_config(config)
+            print(f"   🔧 Driver: {type(driver).__name__}")
 
-            # Load index.json for weights mapping
+            # ── 3. Weight index ──────────────────────────────────────────────
             index_path = os.path.join(model_path, "model.safetensors.index.json")
             if not os.path.exists(index_path):
                 index_path = os.path.join(model_path, "pytorch_model.bin_index.json")
 
+            weight_map = None
             if os.path.exists(index_path):
                 with open(index_path) as f:
                     weight_map = json.load(f)["weight_map"]
             else:
-                # Single file model
                 print("   ℹ️ Single file model detected.")
-                files = glob.glob(os.path.join(model_path, "*.safetensors")) or glob.glob(os.path.join(model_path, "*.bin"))
+                files = (glob.glob(os.path.join(model_path, "*.safetensors")) or
+                         glob.glob(os.path.join(model_path, "*.bin")))
                 if not files:
                     raise RuntimeError(f"No model files found in {model_path}")
                 file_name = os.path.basename(files[0])
                 file_path = os.path.join(model_path, file_name)
-
-                # ROBUST FIX: Actually read the keys from the checkpoint file
-                # instead of relying on meta model (which might have different key names)
                 print(f"   🔍 Reading keys directly from {file_name}...")
                 if file_name.endswith(".safetensors"):
-                    # Load just the metadata (keys) without loading tensors
                     from safetensors import safe_open
-                    with safe_open(file_path, framework="pt", device="cpu") as f:
-                        checkpoint_keys = list(f.keys())
+                    with safe_open(file_path, framework="pt", device="cpu") as sf:
+                        checkpoint_keys = list(sf.keys())
                     weight_map = {k: file_name for k in checkpoint_keys}
                     print(f"   ✅ Found {len(checkpoint_keys)} keys in checkpoint")
                 else:
-                    # For .bin files, still use meta model as fallback
                     with init_empty_weights():
                         temp_model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
                     weight_map = {k: file_name for k in temp_model.state_dict().keys()}
                     del temp_model
 
-            # 3. Instantiate Meta Model (Zero RAM)
+            # ── 4. Meta model ────────────────────────────────────────────────
             print("   🏗️ Building Meta Model...")
-            #
-            # Try AutoModelForCausalLM first (standard LMs).
-            # For VLM / conditional-generation architectures (e.g. Qwen3.5's
-            # Qwen3_5ForConditionalGeneration) that do not register as ForCausalLM,
-            # fall back through AutoModelForVision2Seq then AutoModel so that the
-            # meta model is always available for layer-structure inspection.
             _meta_loaders = []
             try:
                 from transformers import AutoModelForCausalLM as _CausalLM
@@ -462,238 +219,153 @@ class LayerStore:
                     break
                 except Exception as _e:
                     _last_exc = _e
-                    continue
 
             if model is None:
                 raise RuntimeError(
-                    f"Could not build meta model for {model_id}. "
-                    f"Last error: {_last_exc}"
+                    f"Could not build meta model for {model_id}. Last error: {_last_exc}"
                 )
 
-            # Populate weight map if single file
             if weight_map is None:
-                weight_map = {k: file_name for k in model.state_dict().keys()}
+                weight_map = {k: files[0] for k in model.state_dict().keys()}
 
-            # 4. Prepare Output Dir
+            # ── 5. Output directory ──────────────────────────────────────────
             out_dir = self.storage_path / model_id.replace("/", "_")
             out_dir.mkdir(exist_ok=True, parents=True)
 
-            # 5. Extract Structure
-            layers_obj, layer_prefix_base = self._find_layers(model)
+            # ── 6. Layer discovery & prefix reconciliation ───────────────────
+            layers_obj, layer_prefix_base = self._find_layers(model, driver)
             num_layers = len(layers_obj)
 
-            # ── Prefix reconciliation ────────────────────────────────────────
-            # _find_layers returns the module-hierarchy path (e.g.
-            # "language_model.layers") which is the path you'd use to traverse
-            # the nn.Module tree.  But weight_map keys come from state_dict(),
-            # which may include additional top-level prefixes not present in the
-            # module path (e.g. "model.language_model.layers.0.*" when the
-            # backbone is wrapped inside a VLM's self.model attribute).
-            #
-            # Detect the actual prefix used in the weight_map by probing with
-            # increasing prefix candidates until we find one that matches a real
-            # key.  This happens once here and fixes all 64 layers in one shot.
-            _probe_layer_key = f"{layer_prefix_base}.0."
-            if not any(k.startswith(_probe_layer_key) for k in weight_map):
-                # Try prepending common top-level wrappers
-                for _candidate_prefix in ("model.", "transformer.", "language_model."):
-                    _candidate = f"{_candidate_prefix}{layer_prefix_base}.0."
-                    if any(k.startswith(_candidate) for k in weight_map):
-                        layer_prefix_base = f"{_candidate_prefix}{layer_prefix_base}"
-                        print(f"   🔧 Adjusted layer_prefix_base to: {layer_prefix_base}")
-                        break
-                else:
-                    # Nothing matched — log a warning but continue; _save_module's
-                    # suffix-match fallback will still run (with all its known issues).
-                    print(f"   ⚠️ Could not reconcile layer_prefix_base '{layer_prefix_base}' "
-                          f"with weight_map keys. Sharding may produce incorrect weights.")
-            # ────────────────────────────────────────────────────────────────
+            layer_prefix_base = driver.reconcile_layer_weight_prefix(layer_prefix_base, weight_map)
+            print(f"   🔧 Layer weight prefix: {layer_prefix_base}")
+
+            _backbone_weight_prefix = layer_prefix_base.rsplit(".layers", 1)[0]
+            _backbone_module = model
+            for _part in _backbone_weight_prefix.split("."):
+                _backbone_module = getattr(_backbone_module, _part, _backbone_module)
+
+            # ── 7. Shard layers ──────────────────────────────────────────────
             layer_metadata = []
             total_size_mb = 0
-
-            # State for streaming loader
-            loaded_shards = {} # path -> dict (cache current file)
+            loaded_shards = {}
 
             print(f"   💾 Processing {num_layers} layers...")
 
             for i in range(num_layers):
                 layer = layers_obj[i]
                 layer_prefix = f"{layer_prefix_base}.{i}"
-
-                is_moe, moe_rel_path = self._is_moe_layer(layer, config)
-
-                # Debug: print what we detected
-                if is_moe:
-                    print(f"   Layer {i}: MoE (path: {moe_rel_path})")
-                else:
-                    print(f"   Layer {i}: Dense")
+                is_moe = driver.is_moe(config)
+                print(f"   Layer {i}: {'MoE' if is_moe else 'Dense'}")
 
                 if is_moe:
-                    # =====================================================
-                    # SAVE SHARED ATTENTION & NORMS
-                    # =====================================================
-                    # The MoE layer is not JUST experts. It has Attention and Norms.
-                    # We need to save these so the worker can run the Attention block.
-
+                    # ── Shared (attention + norms) ────────────────────────────
                     shared_file = out_dir / f"layer_{i}_shared.safetensors"
                     shared_state = {}
+                    for comp_attr, comp_prefix in [
+                        ("input_layernorm",         f"{layer_prefix}.input_layernorm"),
+                        ("self_attn",               f"{layer_prefix}.self_attn"),
+                        ("post_attention_layernorm", f"{layer_prefix}.post_attention_layernorm"),
+                    ]:
+                        comp_mod = getattr(layer, comp_attr, None)
+                        if comp_mod is None:
+                            continue
+                        for pname, _ in comp_mod.named_parameters(recurse=True):
+                            raw = f"{comp_prefix}.{pname}"
+                            resolved = driver.resolve_weight_key(raw, weight_map)
+                            if resolved in weight_map:
+                                shared_state[f"{comp_attr}.{pname}"] = self._load_tensor_for_key(
+                                    resolved, model_path, weight_map, loaded_shards
+                                )
+
                     shared_size_mb = 0
-
-                    # Components to extract (Standard Transformer structure)
-                    # 1. Input Norm (before Attn)
-                    if hasattr(layer, 'input_layernorm'):
-                        prefix = f"{layer_prefix}.input_layernorm"
-                        for name, _ in layer.input_layernorm.named_parameters():
-                            key = f"{prefix}.{name}"
-                            if key in weight_map:
-                                shared_state[f"input_layernorm.{name}"] = self._load_tensor_for_key(key, model_path, weight_map, loaded_shards)
-
-                    # 2. Self Attention
-                    if hasattr(layer, 'self_attn'):
-                        prefix = f"{layer_prefix}.self_attn"
-                        for name, _ in layer.self_attn.named_parameters(recurse=True):
-                            key = f"{prefix}.{name}"
-                            if key in weight_map:
-                                shared_state[f"self_attn.{name}"] = self._load_tensor_for_key(key, model_path, weight_map, loaded_shards)
-
-                    # 3. Post Attention Norm (before MoE)
-                    if hasattr(layer, 'post_attention_layernorm'):
-                        prefix = f"{layer_prefix}.post_attention_layernorm"
-                        for name, _ in layer.post_attention_layernorm.named_parameters():
-                            key = f"{prefix}.{name}"
-                            if key in weight_map:
-                                shared_state[f"post_attention_layernorm.{name}"] = self._load_tensor_for_key(key, model_path, weight_map, loaded_shards)
-
                     if shared_state:
-                        # Save safely
-                        shared_state = {k: v.contiguous() for k, v in shared_state.items()}
+                        shared_state = {k: v.contiguous() for k, v in shared_state.items() if v is not None}
                         save_safetensors(shared_state, shared_file)
-
-                        # --- CAPTURE EXACT SHARED SIZE ---
-                        shared_size_mb = shared_file.stat().st_size / (1024**2)
-
-                        print(f"      ✅ Shared (Attn+Norm) saved ({shared_size_mb:.2f}MB)")
+                        shared_size_mb = shared_file.stat().st_size / (1024 ** 2)
+                        print(f"      ✅ Shared saved ({shared_size_mb:.2f}MB)")
                     else:
-                        print(f"      ⚠️ WARNING: No shared weights found for layer {i} (Unusual for MoE)")
+                        print(f"      ⚠️ WARNING: No shared weights found for layer {i}")
 
-
-                    # Navigate to the MoE block (e.g. layer.mlp for Mixtral).
+                    # ── Navigate to MoE block ─────────────────────────────────
+                    moe_rel_path = driver.moe_router_path(layer)
                     moe_module = layer
-                    if moe_rel_path:  # guard: empty string means layer itself is the block
-                        for part in moe_rel_path.split('.'):
+                    if moe_rel_path:
+                        for part in moe_rel_path.split("."):
                             moe_module = getattr(moe_module, part)
                         moe_prefix = f"{layer_prefix}.{moe_rel_path}"
                     else:
                         moe_prefix = layer_prefix
 
-                    # 1. Router/Gate — extract from checkpoint
+                    # ── Router ────────────────────────────────────────────────
                     router_attr = "gate" if hasattr(moe_module, "gate") else "router"
-                    # --- CHANGE: .pt -> .safetensors ---
                     router_file = out_dir / f"layer_{i}_router.safetensors"
-                    router_prefix = f"{moe_prefix}.{router_attr}"
                     router_size_mb = 0
-
-                    # Build router state dict manually from weight_map
                     router_state = {}
 
-                    # The router/gate is typically a single weight tensor
-                    # In checkpoint it's stored as "layer.X.block_sparse_moe.gate.weight"
-                    # We need to find this exact key
-
-                    # Try direct key match first
-                    direct_key = f"{router_prefix}.weight"
-                    if direct_key in weight_map:
-                        router_state["weight"] = self._load_tensor_for_key(direct_key, model_path, weight_map, loaded_shards)
+                    direct_key = f"{moe_prefix}.{router_attr}.weight"
+                    resolved = driver.resolve_weight_key(direct_key, weight_map)
+                    if resolved in weight_map:
+                        router_state["weight"] = self._load_tensor_for_key(
+                            resolved, model_path, weight_map, loaded_shards
+                        )
                     else:
-                        # Try with aliasing (mlp <-> block_sparse_moe)
-                        if ".mlp." in direct_key:
-                            alt_key = direct_key.replace(".mlp.", ".block_sparse_moe.")
-                        elif ".block_sparse_moe." in direct_key:
-                            alt_key = direct_key.replace(".block_sparse_moe.", ".mlp.")
-                        else:
-                            alt_key = None
-
-                        if alt_key and alt_key in weight_map:
-                            router_state["weight"] = self._load_tensor_for_key(alt_key, model_path, weight_map, loaded_shards)
-                        else:
-                            # Last resort: search for any key containing this layer's gate/router
-                            pattern = f"layers.{i}.*.{router_attr}.weight"
-                            for key in weight_map.keys():
-                                if f"layers.{i}." in key and f"{router_attr}.weight" in key:
-                                    param_name = "weight"
-                                    router_state[param_name] = self._load_tensor_for_key(key, model_path, weight_map, loaded_shards)
-                                    print(f"      🔍 Found router via pattern match: {key}")
-                                    break
+                        for key in weight_map:
+                            if f"layers.{i}." in key and f"{router_attr}.weight" in key:
+                                router_state["weight"] = self._load_tensor_for_key(
+                                    key, model_path, weight_map, loaded_shards
+                                )
+                                print(f"      🔍 Found router via pattern: {key}")
+                                break
 
                     if router_state:
-                        # --- CHANGE: save_file + contiguous ---
-                        router_state = {k: v.contiguous() for k, v in router_state.items()}
+                        router_state = {k: v.contiguous() for k, v in router_state.items() if v is not None}
                         save_safetensors(router_state, router_file)
                         if not router_file.exists():
-                            raise RuntimeError(f"Router file was not created: {router_file}")
-
-                        # --- CAPTURE EXACT ROUTER SIZE ---
-                        router_size_mb = router_file.stat().st_size / (1024**2)
-
+                            raise RuntimeError(f"Router file not created: {router_file}")
+                        router_size_mb = router_file.stat().st_size / (1024 ** 2)
                         print(f"      ✅ Router saved ({router_size_mb:.2f}MB)")
                     else:
-                        # CRITICAL: Router is mandatory for MoE layers
-                        print(f"      ❌ CRITICAL: No router weights found!")
-                        print(f"      Tried: {direct_key}, {alt_key if 'alt_key' in locals() else 'N/A'}")
-                        # Show some sample keys from this layer to debug
-                        layer_keys = [k for k in weight_map.keys() if f"layers.{i}." in k][:5]
-                        print(f"      Sample keys for layer {i}: {layer_keys}")
-                        raise RuntimeError(f"Router missing for MoE layer {i}")
+                        sample = [k for k in weight_map if f"layers.{i}." in k][:5]
+                        raise RuntimeError(
+                            f"Router missing for MoE layer {i}. Tried: {direct_key}. "
+                            f"Sample keys: {sample}"
+                        )
 
-                    # 2. Experts — handle both ModuleList and custom MixtralExperts class
-                    num_experts = self._get_num_experts(config)
-                    experts_list = getattr(moe_module, 'experts', None)
-
-                    # CRITICAL: In 2026, Mixtral uses MixtralExperts which doesn't have __len__
-                    # We can't use the traditional ModuleList[i] approach
-                    # Instead, we ALWAYS use the weight_map approach for MoE models
-
+                    # ── Experts ───────────────────────────────────────────────
+                    num_experts = driver.num_experts(config)
                     expert_size_acc = 0
 
-                    # DEBUG: Show sample expert keys from checkpoint
-                    sample_expert_keys = [k for k in weight_map.keys() if f"layers.{i}." in k and "expert" in k.lower()]
-                    if sample_expert_keys:
-                        print(f"      🔍 Sample expert keys for layer {i}: {sample_expert_keys[:3]}")
+                    sample_exp = [k for k in weight_map if f"layers.{i}." in k and "expert" in k.lower()]
+                    if sample_exp:
+                        print(f"      🔍 Sample expert keys: {sample_exp[:3]}")
 
                     for exp_idx in range(num_experts):
-                        # --- CHANGE: .pt -> .safetensors ---
                         expert_file = out_dir / f"layer_{i}_expert_{exp_idx}.safetensors"
-
-                        # Build state dict by finding all keys for this expert in weight_map
-                        expert_state = {}
                         expert_prefix = f"{moe_prefix}.experts.{exp_idx}"
+                        expert_state = {}
 
-                        # Try both mlp and block_sparse_moe aliases
-                        possible_prefixes = [expert_prefix]
-                        if ".mlp." in expert_prefix:
-                            possible_prefixes.append(expert_prefix.replace(".mlp.", ".block_sparse_moe."))
-                        elif ".block_sparse_moe." in expert_prefix:
-                            possible_prefixes.append(expert_prefix.replace(".block_sparse_moe.", ".mlp."))
+                        # Collect all weight keys for this expert
+                        possible_prefixes = {expert_prefix}
+                        # Also check resolved alias
+                        probe_resolved = driver.resolve_weight_key(f"{expert_prefix}.weight", weight_map)
+                        if "." in probe_resolved:
+                            possible_prefixes.add(probe_resolved.rsplit(".", 1)[0])
 
-                        for key in weight_map.keys():
-                            for prefix in possible_prefixes:
-                                if key.startswith(prefix):
-                                    # Extract the relative parameter name (everything after "experts.N.")
-                                    param_name = key[len(prefix)+1:]  # +1 for the dot
-                                    expert_state[param_name] = self._load_tensor_for_key(key, model_path, weight_map, loaded_shards)
-                                    break  # Found with this prefix, don't check others
+                        for key in weight_map:
+                            for pfx in possible_prefixes:
+                                if key.startswith(pfx + "."):
+                                    param_name = key[len(pfx) + 1:]
+                                    expert_state[param_name] = self._load_tensor_for_key(
+                                        key, model_path, weight_map, loaded_shards
+                                    )
+                                    break
 
                         if not expert_state:
-                            print(f"      ⚠️  WARNING: No weights found for expert {exp_idx}")
-                            print(f"      Tried prefixes: {possible_prefixes}")
-                            # This is actually a critical error for MoE models
                             raise RuntimeError(f"Expert {exp_idx} has no weights in checkpoint")
 
-                        # --- CHANGE: save_file + contiguous ---
-                        expert_state = {k: v.contiguous() for k, v in expert_state.items()}
+                        expert_state = {k: v.contiguous() for k, v in expert_state.items() if v is not None}
                         save_safetensors(expert_state, expert_file)
-
-                        sz = expert_file.stat().st_size / (1024**2)
+                        sz = expert_file.stat().st_size / (1024 ** 2)
                         expert_size_acc += sz
 
                         if exp_idx % 4 == 0:
@@ -702,225 +374,162 @@ class LayerStore:
 
                     print(f" Layer {i} MoE done ({num_experts} experts)")
 
-                    # Update metadata with Total Size = Experts + Shared
                     total_moe_size = expert_size_acc + shared_size_mb + router_size_mb
-
-                    # --- NEW: Calculate Avg Expert Size ---
                     avg_expert_size = expert_size_acc / max(1, num_experts)
-
                     layer_metadata.append({
                         "layer_idx": i,
                         "type": "moe",
                         "num_experts": num_experts,
-                        # Detailed metadata for Scheduler
                         "shared_size_mb": shared_size_mb,
                         "router_size_mb": router_size_mb,
                         "expert_size_mb": avg_expert_size,
-                        # Legacy field
-                        "size_mb": total_moe_size
+                        "size_mb": total_moe_size,
                     })
                     total_size_mb += total_moe_size
 
                 else:
-                    # Dense Layer
-                    # --- CHANGE: .pt -> .safetensors ---
+                    # ── Dense ─────────────────────────────────────────────────
                     dense_file = out_dir / f"layer_{i}_dense.safetensors"
-                    sz = self._save_module(layer, layer_prefix, model_path, weight_map, dense_file, loaded_shards)
-
+                    sz = self._save_module(
+                        layer, layer_prefix, model_path, weight_map, dense_file, loaded_shards, driver
+                    )
                     if not dense_file.exists():
-                        raise RuntimeError(f"Dense layer file was not created: {dense_file}")
-
+                        raise RuntimeError(f"Dense layer file not created: {dense_file}")
                     layer_metadata.append({
                         "layer_idx": i,
                         "type": "dense",
                         "size_mb": sz,
-                        "num_experts": 0
+                        "num_experts": 0,
                     })
                     total_size_mb += sz
                     print(f"   Layer {i} Dense done ({sz:.2f}MB)")
 
-                # GC after every layer to be safe
                 loaded_shards.clear()
                 gc.collect()
 
-            # 6. Embeddings, Norm & Head
+            # ── 8. Shared components ─────────────────────────────────────────
             print("   💾 Saving embeddings, final norm & head...")
 
-            # Derive the backbone module and its weight_map prefix from
-            # layer_prefix_base (e.g. "model.language_model.layers" -> backbone
-            # module is model.language_model, weight prefix is "model.language_model").
-            # This handles both standard models (model.layers -> model)
-            # and VLM-wrapped models (model.language_model.layers -> model.language_model).
-            _backbone_weight_prefix = layer_prefix_base.rsplit(".layers", 1)[0]  # e.g. "model.language_model"
-            _backbone_module = model
-            for _part in _backbone_weight_prefix.split("."):
-                _backbone_module = getattr(_backbone_module, _part, _backbone_module)
-
             # A. Embeddings
-            _emb_module = getattr(_backbone_module, "embed_tokens", None)
+            emb_attr = driver.embedding_module_attr
+            _emb_module = getattr(_backbone_module, emb_attr, None)
             if _emb_module is not None:
                 emb_file = out_dir / "embeddings.safetensors"
-                self._save_module(_emb_module, f"{_backbone_weight_prefix}.embed_tokens", model_path, weight_map, emb_file, loaded_shards)
+                self._save_module(
+                    _emb_module,
+                    f"{_backbone_weight_prefix}.{emb_attr}",
+                    model_path, weight_map, emb_file, loaded_shards, driver,
+                )
                 if not emb_file.exists():
-                    raise RuntimeError(f"Embeddings file was not created: {emb_file}")
-                print(f"      ✅ Embeddings saved")
+                    raise RuntimeError(f"Embeddings file not created: {emb_file}")
+                print("      ✅ Embeddings saved")
             else:
-                print(f"      ⚠️ Warning: No embed_tokens found on backbone ({_backbone_weight_prefix})")
+                print(f"      ⚠️ No {emb_attr} on backbone ({_backbone_weight_prefix})")
 
-            # B. Final Norm
-            final_norm_module = None
-            final_norm_prefix = None
+            # B. Final norm
+            norm_attr = driver.final_norm_module_attr
+            final_norm_module = getattr(_backbone_module, norm_attr, None)
+            final_norm_prefix = f"{_backbone_weight_prefix}.{norm_attr}" if final_norm_module else None
 
-            _norm = getattr(_backbone_module, "norm", None)
-            if _norm is not None:
-                final_norm_module = _norm
-                final_norm_prefix = f"{_backbone_weight_prefix}.norm"
-            elif hasattr(model, "transformer") and hasattr(model.transformer, "ln_f"):
+            if final_norm_module is None and hasattr(model, "transformer") and hasattr(model.transformer, "ln_f"):
                 final_norm_module = model.transformer.ln_f
                 final_norm_prefix = "transformer.ln_f"
 
             if final_norm_module:
                 norm_file = out_dir / "final_norm.safetensors"
-                self._save_module(final_norm_module, final_norm_prefix, model_path, weight_map, norm_file, loaded_shards)
+                self._save_module(
+                    final_norm_module, final_norm_prefix,
+                    model_path, weight_map, norm_file, loaded_shards, driver,
+                )
                 if not norm_file.exists():
-                    raise RuntimeError(f"Final Norm file was not created: {norm_file}")
-                print(f"      ✅ Final Norm saved")
+                    raise RuntimeError(f"Final norm file not created: {norm_file}")
+                print("      ✅ Final norm saved")
             else:
-                print("      ⚠️ Warning: No final normalization layer found (might be correct for some architectures)")
+                print("      ⚠️ No final norm found")
 
-            # C. LM Head
-            # Walk candidate (module, weight_prefix) pairs from most-specific to
-            # least-specific.  The first one that actually has an lm_head attribute wins.
-            # This covers:
-            #   - Standard LMs:            model.lm_head          (prefix "lm_head")
-            #   - Qwen3.5 / VLMs:          model.language_model.lm_head
-            #                              (prefix "model.language_model.lm_head")
-            #   - Other nested backbones:  _backbone_module.lm_head
-            _lm_head_candidates = []
+            # C. LM head — driver first, then generic scan, then structural fallback
+            lm_head_result = driver.resolve_lm_head(model, weight_map, _backbone_weight_prefix)
 
-            # Build candidate list from the weight_map — find any key ending in
-            # "lm_head.weight" and derive the prefix from it.  This is the most
-            # reliable approach since it's grounded in what's actually in the checkpoint.
-            for _wk in weight_map.keys():
-                if _wk.endswith("lm_head.weight"):
-                    _candidate_prefix = _wk[: -len(".weight")]   # strip ".weight"
-                    # Navigate to the module at this prefix in the PyTorch tree.
-                    # For standard LMs the checkpoint prefix matches the module path
-                    # (e.g. "lm_head" -> model.lm_head).
-                    # For VLMs (e.g. Qwen3.5) the weight is stored flat as "lm_head.weight"
-                    # in the checkpoint but the module lives at model.language_model.lm_head.
-                    # In that case we KEEP the checkpoint prefix (so _save_module constructs
-                    # the correct key) but find the module via known VLM paths.
-                    _mod_found = None
-                    # First try: direct navigation using checkpoint prefix
+            if lm_head_result is None:
+                for wk in weight_map:
+                    if not wk.endswith("lm_head.weight"):
+                        continue
+                    candidate_prefix = wk[: -len(".weight")]
+                    _mod = None
+                    # Try direct navigation
                     try:
-                        _candidate_mod = model
-                        for _p in _candidate_prefix.split("."):
-                            _candidate_mod = getattr(_candidate_mod, _p)
-                        _mod_found = _candidate_mod
+                        _mod = model
+                        for _p in candidate_prefix.split("."):
+                            _mod = getattr(_mod, _p)
                     except AttributeError:
-                        pass
-
-                    # Second try: VLM wrapper paths — module is deeper than checkpoint key
-                    if _mod_found is None:
-                        _vlm_search_paths = [
+                        _mod = None
+                    # Try VLM structural paths
+                    if _mod is None:
+                        for _path in [
                             "language_model.lm_head",
                             "model.language_model.lm_head",
                             "model.lm_head",
                             f"{_backbone_weight_prefix}.lm_head",
-                        ]
-                        for _vlm_path in dict.fromkeys(_vlm_search_paths):  # dedup, preserve order
+                        ]:
                             try:
-                                _vlm_mod = model
-                                for _p in _vlm_path.split("."):
-                                    _vlm_mod = getattr(_vlm_mod, _p)
-                                _mod_found = _vlm_mod
-                                print(f"      🔧 lm_head module found via '{_vlm_path}'; "
-                                      f"using checkpoint prefix '{_candidate_prefix}'")
+                                _vlm = model
+                                for _p in _path.split("."):
+                                    _vlm = getattr(_vlm, _p)
+                                _mod = _vlm
+                                print(f"      🔧 lm_head module at '{_path}', "
+                                      f"checkpoint prefix '{candidate_prefix}'")
                                 break
                             except AttributeError:
                                 continue
-
-                    if _mod_found is not None:
-                        _lm_head_candidates.append((_mod_found, _candidate_prefix))
+                    if _mod is not None:
+                        lm_head_result = (_mod, candidate_prefix)
                         break
 
-            # Fallback: try known structural paths if weight_map scan found nothing
-            if not _lm_head_candidates:
+            if lm_head_result is None:
                 for _mod, _pfx in [
-                    (_backbone_module,                          f"{_backbone_weight_prefix}.lm_head"),
-                    (model,                                     "lm_head"),
-                    (getattr(model, "language_model", None),   "language_model.lm_head"),
+                    (_backbone_module, f"{_backbone_weight_prefix}.lm_head"),
+                    (model, "lm_head"),
+                    (getattr(model, "language_model", None), "language_model.lm_head"),
                 ]:
                     if _mod is not None and getattr(_mod, "lm_head", None) is not None:
-                        _lm_head_candidates.append((getattr(_mod, "lm_head"), _pfx))
+                        lm_head_result = (getattr(_mod, "lm_head"), _pfx)
                         break
 
-            if _lm_head_candidates:
-                _lm_head_module, _lm_head_prefix = _lm_head_candidates[0]
+            if lm_head_result:
+                _lm_mod, _lm_prefix = lm_head_result
                 head_file = out_dir / "lm_head.safetensors"
-                self._save_module(_lm_head_module, _lm_head_prefix, model_path, weight_map, head_file, loaded_shards)
-                if not head_file.exists():
-                    raise RuntimeError(f"LM head file was not created: {head_file}")
-                print(f"      ✅ LM head saved (prefix: {_lm_head_prefix})")
-            else:
-                # LAST RESORT: lm_head.weight is in the checkpoint but the module is
-                # inaccessible (weight-tied and not exposed as an nn.Module attribute —
-                # exactly what Qwen3.5 does). Skip module navigation entirely and load
-                # the raw tensor straight from the shard.
-                _lm_head_raw_key = next(
-                    (k for k in weight_map if k.endswith("lm_head.weight")), None
+                self._save_module(
+                    _lm_mod, _lm_prefix,
+                    model_path, weight_map, head_file, loaded_shards, driver,
                 )
-                if _lm_head_raw_key is not None:
-                    print(f"      🔧 lm_head module not navigable (likely weight-tied); "
-                          f"loading raw tensor from checkpoint key '{_lm_head_raw_key}'")
-                    _lm_head_tensor = self._load_tensor_for_key(
-                        _lm_head_raw_key, model_path, weight_map, loaded_shards
-                    )
-                    if _lm_head_tensor is not None:
-                        head_file = out_dir / "lm_head.safetensors"
-                        save_safetensors({"weight": _lm_head_tensor.contiguous()}, str(head_file))
-                        print(f"      ✅ LM head saved directly from checkpoint")
-                    else:
-                        print(f"      ⚠️ Warning: lm_head.weight key found but tensor failed to load")
-                else:
-                    print(f"      ⚠️ Warning: No lm_head found in weight_map or model structure")
+                if not head_file.exists():
+                    raise RuntimeError(f"LM head file not created: {head_file}")
+                print(f"      ✅ LM head saved (prefix: {_lm_prefix})")
+            else:
+                print("      ⚠️ No lm_head found in weight_map or model structure")
 
-            # 7. Metadata & Tokenizer
+            # ── 9. Metadata & tokenizer ──────────────────────────────────────
             print("   💾 Saving metadata and tokenizer assets...")
             config.save_pretrained(out_dir)
 
-            # A. Try standard save_pretrained
             try:
-                from transformers import AutoTokenizer as TokenizerClass
-                tokenizer = TokenizerClass.from_pretrained(
-                    model_path,
-                    token=hf_token,
-                    trust_remote_code=True
-                )
+                from transformers import AutoTokenizer as _Tok
+                tokenizer = _Tok.from_pretrained(model_path, token=hf_token, trust_remote_code=True)
                 tokenizer.save_pretrained(out_dir)
             except Exception as e:
-                print(f"      ⚠️ standard save_pretrained failed: {e}")
+                print(f"      ⚠️ tokenizer save_pretrained failed: {e}")
 
-            # B. "NUCLEAR" COPY STRATEGY
-            # Copy ANY file that looks like metadata/config/tokenizer/code
-            aux_extensions = ['*.json', '*.model', '*.txt', '*.py']
-            for ext in aux_extensions:
+            for ext in ["*.json", "*.model", "*.txt", "*.py"]:
                 for src_path in Path(model_path).rglob(ext):
-                    filename = os.path.basename(src_path)
+                    fname = os.path.basename(src_path)
+                    if fname.startswith(".") or "index" in fname:
+                        continue
+                    dst = out_dir / fname
+                    if not dst.exists():
+                        shutil.copy2(src_path, dst)
+                        print(f"      📦 Manually copied: {fname}")
 
-                    # Skip hidden files or index files if huge
-                    if filename.startswith(".") or "index" in filename: continue
-
-                    dst_path = out_dir / filename
-
-                    # Copy if it doesn't exist (e.g. tokenizer.model often missed by save_pretrained)
-                    if not dst_path.exists():
-                        shutil.copy2(src_path, dst_path)
-                        print(f"      📦 Manually copied: {filename}")
-
-            # hidden_size lives directly on standard configs but on nested
-            # text_config / language_config for VLM composite configs.
+            # ── 10. structure.json ───────────────────────────────────────────
             _hidden_size = (
                 getattr(config, "hidden_size", None)
                 or getattr(getattr(config, "text_config", None), "hidden_size", None)
@@ -934,28 +543,23 @@ class LayerStore:
                 "model_id": model_id,
                 "num_layers": num_layers,
                 "architecture": config.architectures[0],
+                "driver": type(driver).__name__,
                 "hidden_size": _hidden_size,
                 "total_size_mb": total_size_mb,
-                "is_moe": any(x['type'] == 'moe' for x in layer_metadata),
+                "is_moe": any(x["type"] == "moe" for x in layer_metadata),
                 "num_experts_per_tok": getattr(config, "num_experts_per_tok", 2),
-                "layer_metadata": layer_metadata
+                "layer_metadata": layer_metadata,
             }
 
             with open(out_dir / "structure.json", "w") as f:
                 json.dump(structure, f, indent=2)
 
-            # 8. Verify all critical files exist
-            print(f"   🔍 Verifying files...")
-            critical_files = ["structure.json", "config.json"]
-            for cf in critical_files:
+            for cf in ["structure.json", "config.json"]:
                 if not (out_dir / cf).exists():
                     raise RuntimeError(f"Critical file missing: {cf}")
 
-            # List all files created
-            # --- CHANGE: glob .safetensors ---
             all_files = list(out_dir.glob("*.safetensors")) + list(out_dir.glob("*.json"))
             print(f"   📁 Created {len(all_files)} files in {out_dir}")
-
             print(f"✅ Sharding Complete. Total Size: {total_size_mb:.1f}MB")
             return num_layers
 
@@ -963,9 +567,10 @@ class LayerStore:
             print(f"❌ Sharding Error: {e}")
             import traceback
             traceback.print_exc()
-            raise e
+            raise
         finally:
-            # Cleanup
-            if 'loaded_shards' in locals(): loaded_shards.clear()
-            if 'model' in locals(): del model
+            if "loaded_shards" in locals():
+                loaded_shards.clear()  # type: ignore[name-defined]
+            if "model" in locals():
+                del model  # type: ignore[name-defined]
             gc.collect()

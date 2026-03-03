@@ -418,14 +418,8 @@ class LayerLoader:
             )
 
         # Locate the layers list — try standard and VLM layout variants.
-        layer_paths = [
-            "model.layers",
-            "transformer.h",
-            "model.decoder.layers",
-            "transformer.layers",
-            "language_model.model.layers",
-            "model.language_model.layers",
-        ]
+        driver = get_driver(config)
+        layer_paths = driver.layer_module_paths
 
         layers = None
         for attr_path in layer_paths:

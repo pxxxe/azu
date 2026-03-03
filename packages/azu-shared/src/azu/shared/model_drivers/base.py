@@ -202,6 +202,16 @@ class ModelDriver:
         """
         return None
 
+    def is_lm_head_tied(self, config) -> bool:
+        """
+        Return True if lm_head shares weights with embed_tokens and therefore
+        no lm_head.safetensors file was sharded.
+
+        Default: reads the standard transformers tie_word_embeddings field.
+        Override only if a model signals this in a non-standard way.
+        """
+        return bool(getattr(config, "tie_word_embeddings", False))
+
     # ── Shared component attribute names ─────────────────────────────────────
 
     @property

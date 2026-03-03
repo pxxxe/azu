@@ -335,7 +335,7 @@ class LayerLoader:
         Get the transformer layer class from config architecture.
 
         Fast path: works for all architectures that live inside
-        transformers.models.<name>.modeling_<name>.  Raises ValueError if the
+        transformers.models.<n>.modeling_<n>.  Raises ValueError if the
         architecture is not found there (e.g. trust_remote_code models).
 
         Args:
@@ -759,6 +759,11 @@ class LayerLoader:
             return self.loaded_cache[cache_key]
 
         config = await self._load_config_with_driver(model_id)
+        driver = get_driver(config)
+
+        if driver.is_lm_head_tied(config):
+            self.loaded_cache[cache_key] = None
+            return None
 
         path, url = self._get_paths(model_id, "lm_head.safetensors")
         await self._download(url, path, model_id=model_id)

@@ -119,6 +119,7 @@ class LayerLoader:
             "hidden_act",
             "initializer_range",
             "tie_word_embeddings",
+            "layer_types",
         ]
 
         for attr in _PROXY_ATTRS:

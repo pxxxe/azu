@@ -107,22 +107,8 @@ class Qwen35Driver(ModelDriver):
 
     @property
     def layer_module_paths(self) -> list[str]:
-        # Qwen3_5ForConditionalGeneration wraps a ForCausalLM which in turn
-        # wraps a Model, so the live Python module tree is:
-        #   self.model                        (VLM outer)
-        #     .language_model                 (Qwen3ForCausalLM)
-        #       .model                        (Qwen3Model backbone)
-        #         .layers                     (nn.ModuleList)
-        #
-        # HuggingFace serialises checkpoints stripping the inner .model.,
-        # so weight_map keys use "model.language_model.layers.N.*" while
-        # getattr traversal requires "model.language_model.model.layers".
-        # Both paths are listed so _build_layer_class_cache (module tree
-        # traversal) and reconcile_layer_weight_prefix (weight-map probe)
-        # each hit their correct variant.
         return [
-            "model.language_model.model.layers",  # live Python module path
-            "model.language_model.layers",         # checkpoint weight-map path
+            "model.language_model.layers",  # Qwen3.5 primary path
         ] + super().layer_module_paths
 
     # ── MoE ──────────────────────────────────────────────────────────────────

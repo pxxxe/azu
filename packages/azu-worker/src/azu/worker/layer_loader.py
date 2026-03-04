@@ -204,7 +204,7 @@ class LayerLoader:
                 f"tampering detected.\n"
                 f"  Expected (HuggingFace): {expected}\n"
                 f"  Received (registry):    {actual}\n"
-                f"The file has been deleted. This worker will not load it."
+                "The file has been deleted. This worker will not load it."
             )
 
         print(f"   ✅ [Security] Hash verified: {path.name}")
@@ -369,22 +369,152 @@ class LayerLoader:
         except Exception as e:
             raise ValueError(f"Could not load layer class for {arch}: {e}")
 
+    @staticmethod
+    def _resolve_layer_classes_from_model_class(config: AutoConfig) -> Optional[List[Type[torch.nn.Module]]]:
+        """
+        Resolve per-index layer classes by inspecting the model *class* — no
+        model instantiation, no tensor allocation.
+
+        This is the fallback for trust_remote_code architectures (e.g. Qwen3.5)
+        whose layer __init__ code is incompatible with init_empty_weights /
+        meta device, causing the meta model's ModuleList to come back empty.
+
+        Strategy
+        --------
+        1. Get the model class from sys.modules via config.auto_map (the
+           trust_remote_code module is already imported by the time we reach
+           here, because AutoConfig.from_pretrained(trust_remote_code=True)
+           loaded it earlier in _load_config_with_driver).
+
+        2. Read _no_split_modules — every HuggingFace model defines this list
+           of layer class name strings for pipeline-parallel sharding.  It
+           directly enumerates all distinct layer types in the model.
+
+        3. Homogeneous models (one entry): fill the full depth with that class.
+
+        4. Hybrid models (multiple entries): look for a per-layer type list in
+           the config.  fla-based models (and others) encode the per-layer
+           pattern as a list-valued config attribute of length num_hidden_layers.
+           Scan common attribute names and match each entry to a class by
+           keyword overlap between the pattern string and the class name.
+
+        Returns None if the class cannot be determined (caller falls through to
+        meta-device path or raises).
+        """
+        n = getattr(config, 'num_hidden_layers', None)
+        if not n:
+            return None
+
+        # ── Step 1: get model class from already-loaded sys.modules ──────────
+        model_cls = None
+
+        # trust_remote_code models always populate config.auto_map
+        auto_map = getattr(config, 'auto_map', {}) or {}
+        for key in ('AutoModelForCausalLM', 'AutoModel', 'AutoModelForSeq2SeqLM'):
+            dotted = auto_map.get(key)
+            if not dotted:
+                continue
+            try:
+                mod_path, cls_name = dotted.rsplit('.', 1)
+                mod = sys.modules.get(mod_path)
+                if mod:
+                    model_cls = getattr(mod, cls_name, None)
+                    if model_cls:
+                        break
+            except (ValueError, AttributeError):
+                continue
+
+        # Standard (non-trust_remote_code) models: look up transformers registry
+        if model_cls is None:
+            try:
+                from transformers.models.auto.modeling_auto import (
+                    MODEL_FOR_CAUSAL_LM_MAPPING, MODEL_MAPPING,
+                )
+                for mapping in (MODEL_FOR_CAUSAL_LM_MAPPING, MODEL_MAPPING):
+                    model_cls = mapping.get(type(config))
+                    if model_cls:
+                        break
+            except Exception:
+                pass
+
+        if model_cls is None:
+            return None
+
+        # ── Step 2: read _no_split_modules ────────────────────────────────────
+        no_split: List[str] = getattr(model_cls, '_no_split_modules', None) or []
+        if not no_split:
+            return None
+
+        # Resolve class name strings → actual classes from the same module
+        src_mod = sys.modules.get(model_cls.__module__)
+        cls_by_name: Dict[str, Type] = {}
+        for name in no_split:
+            cls = getattr(src_mod, name, None) if src_mod else None
+            if cls is not None:
+                cls_by_name[name] = cls
+
+        if not cls_by_name:
+            return None
+
+        # ── Step 3: homogeneous model ─────────────────────────────────────────
+        if len(cls_by_name) == 1:
+            return [next(iter(cls_by_name.values()))] * n
+
+        # ── Step 4: hybrid model — find per-layer pattern in config ───────────
+        # fla / other custom models encode the layer type sequence as a
+        # list-valued config attribute of length num_hidden_layers.
+        pattern = None
+        for attr in ('layer_type', 'layer_types', 'attn_mode', 'attn_modes',
+                     'layer_mode', 'layer_modes', 'model_type_list'):
+            for cfg in (config, getattr(config, 'text_config', None)):
+                if cfg is None:
+                    continue
+                val = getattr(cfg, attr, None)
+                if isinstance(val, (list, tuple)) and len(val) == n:
+                    pattern = val
+                    break
+            if pattern is not None:
+                break
+
+        if pattern is None:
+            return None
+
+        # Map each pattern string → class by keyword overlap with class name.
+        # e.g. pattern entry "chunk_simple_gla" overlaps with "GatedDeltaNet",
+        # "full_attn" overlaps with "Attention".
+        pattern_to_cls: Dict[str, Type] = {}
+        for pval in set(pattern):
+            tokens = set(str(pval).lower().replace('_', ' ').split())
+            best: Optional[Type] = None
+            best_score = 0
+            for cls_name, cls in cls_by_name.items():
+                cls_lower = cls_name.lower()
+                score = sum(1 for t in tokens if len(t) > 3 and t in cls_lower)
+                if score > best_score:
+                    best_score = score
+                    best = cls
+            if best is None:
+                return None  # can't map this pattern value; give up
+            pattern_to_cls[pval] = best
+
+        return [pattern_to_cls[p] for p in pattern]
+
     def _build_layer_class_cache(self, config: AutoConfig) -> None:
         """
         Populate _layer_class_cache for an architecture that cannot be resolved
         via importlib (e.g. trust_remote_code models such as Qwen3.5).
 
-        Instantiates the full model on meta device (zero RAM / zero VRAM) and
-        records the concrete Python class of every layer, indexed by position.
-        The result is cached by architecture name so this only runs once per
-        worker process per model family.
+        Two paths, in order:
 
-        For homogeneous models (all layers the same class) this degenerates to
-        a single repeated entry — no overhead versus the old approach.
+        1. Meta-device model (zero RAM/VRAM) — works for all standard
+           transformers architectures and most trust_remote_code models.
 
-        For hybrid models (e.g. Qwen3.5 which alternates Gated-DeltaNet and
-        Gated-Attention layers) this gives the exact per-position class needed
-        for correct layer instantiation during load_dense_layer.
+        2. Class inspection (zero instantiation) — fallback for models whose
+           layer __init__ is incompatible with meta device (e.g. fla-based
+           models like Qwen3.5 whose GatedDeltaNet layers fail to populate the
+           ModuleList under init_empty_weights).  Resolves classes purely from
+           the already-loaded module in sys.modules, _no_split_modules, and
+           config attributes — no tensors are ever created.
 
         Args:
             config: Model configuration (must have been loaded with
@@ -399,53 +529,64 @@ class LayerLoader:
         from accelerate import init_empty_weights
         from transformers import AutoModelForCausalLM, AutoModel
 
-        # Try CausalLM first; fall back to generic AutoModel for VLMs /
-        # conditional-generation models (e.g. Qwen3.5's
-        # Qwen3_5ForConditionalGeneration which does not register as ForCausalLM).
-        model = None
+        driver = get_driver(config)
+        layer_paths = driver.layer_module_paths
+
+        def _search_layers(model):
+            for attr_path in layer_paths:
+                try:
+                    obj = model
+                    for part in attr_path.split("."):
+                        obj = getattr(obj, part)
+                    if hasattr(obj, "__len__") and len(obj) > 0:
+                        return obj
+                except AttributeError:
+                    continue
+            return None
+
+        # ── Path 1: meta-device model ─────────────────────────────────────────
+        layers = None
         for loader_cls in (AutoModelForCausalLM, AutoModel):
             try:
                 with init_empty_weights():
                     model = loader_cls.from_config(config, trust_remote_code=True)
-                break
+                layers = _search_layers(model)
+                del model
+                if layers is not None:
+                    break
             except Exception:
                 continue
 
-        if model is None:
-            raise ValueError(
-                f"Could not instantiate meta model for {arch}. "
-                "Ensure the model was downloaded with trust_remote_code=True."
+        if layers is not None:
+            self._layer_class_cache[arch] = [type(layers[i]) for i in range(len(layers))]
+            print(
+                f"   ✅ Layer-class cache built: {len(self._layer_class_cache[arch])} layers, "
+                f"{len(set(self._layer_class_cache[arch]))} distinct class(es)"
             )
+            del layers
+            return
 
-        # Locate the layers list — try standard and VLM layout variants.
-        driver = get_driver(config)
-        layer_paths = driver.layer_module_paths
+        # ── Path 2: class inspection — no instantiation, no tensors ──────────
+        # Meta device yielded empty layers (fla/custom kernels silently fail
+        # under init_empty_weights).  Resolve classes directly from the module
+        # that was already loaded by AutoConfig.from_pretrained(trust_remote_code=True).
+        print(f"   ⚠️  Meta model gave empty layers for {arch}; "
+              "falling back to class inspection (no instantiation)...")
 
-        layers = None
-        for attr_path in layer_paths:
-            try:
-                obj = model
-                for part in attr_path.split("."):
-                    obj = getattr(obj, part)
-                if hasattr(obj, "__len__") and len(obj) > 0:
-                    layers = obj
-                    break
-            except AttributeError:
-                continue
-
-        if layers is None:
-            del model
-            raise ValueError(
-                f"Could not locate layer list in meta model for {arch}. "
-                f"Tried paths: {layer_paths}"
+        classes = self._resolve_layer_classes_from_model_class(config)
+        if classes is not None:
+            self._layer_class_cache[arch] = classes
+            print(
+                f"   ✅ Layer-class cache built via class inspection: "
+                f"{len(classes)} layers, {len(set(classes))} distinct class(es)"
             )
+            return
 
-        self._layer_class_cache[arch] = [type(layers[i]) for i in range(len(layers))]
-        print(
-            f"   ✅ Layer-class cache built: {len(self._layer_class_cache[arch])} layers, "
-            f"{len(set(self._layer_class_cache[arch]))} distinct class(es)"
+        raise ValueError(
+            f"Could not resolve layer classes for {arch}. "
+            f"Meta-device model gave empty layers and class inspection failed. "
+            f"Tried module paths: {layer_paths}"
         )
-        del model
 
     def _get_layer_class_for_idx(self, config: AutoConfig, layer_idx: int) -> Type[torch.nn.Module]:
         """

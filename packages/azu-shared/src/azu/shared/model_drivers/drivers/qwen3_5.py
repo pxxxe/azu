@@ -143,9 +143,9 @@ class Qwen35Driver(ModelDriver):
         2. Read _no_split_modules to get the set of distinct layer class names.
         3. Homogeneous (1 class): return [cls] * num_hidden_layers.
         4. Hybrid (multiple classes): find the per-layer pattern list in
-           config.text_config (fla encodes it as e.g. attn_mode of length
-           num_hidden_layers), then map each pattern token to a class by
-           keyword overlap with the class name.
+            config.text_config (fla encodes it as e.g. attn_mode of length
+            num_hidden_layers), then map each pattern token to a class by
+            keyword overlap with the class name.
         """
         n = getattr(config, 'num_hidden_layers', None)
         if not n:
@@ -157,7 +157,8 @@ class Qwen35Driver(ModelDriver):
         # no I/O or imports happen here.
         model_cls = None
         auto_map = getattr(config, 'auto_map', {}) or {}
-        for key in ('AutoModelForCausalLM', 'AutoModel', 'AutoModelForSeq2SeqLM'):
+        for key in ('AutoModelForCausalLM', 'AutoModel', 'AutoModelForSeq2SeqLM',
+                    'AutoModelForConditionalGeneration'):
             dotted = auto_map.get(key)
             if not dotted:
                 continue
@@ -198,7 +199,7 @@ class Qwen35Driver(ModelDriver):
         # attribute of length num_hidden_layers in text_config.
         pattern = None
         for attr in ('attn_mode', 'attn_modes', 'layer_type', 'layer_types',
-                     'layer_mode', 'layer_modes', 'model_type_list'):
+                      'layer_mode', 'layer_modes', 'model_type_list'):
             for cfg in (config, getattr(config, 'text_config', None)):
                 if cfg is None:
                     continue

@@ -7,7 +7,7 @@ The core (LayerStore, LayerLoader, ModelManager) stays model-agnostic.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Any, TYPE_CHECKING
+from typing import Optional, List, Tuple, Any, Type, TYPE_CHECKING
 
 if TYPE_CHECKING:
     import torch
@@ -48,7 +48,7 @@ class ModelDriver:
         Default is a no-op — flat configs need no patching.
         """
 
-    # ── Layer discovery (sharding) ────────────────────────────────────────────
+    # ── Layer discovery (sharding + loading) ─────────────────────────────────
 
     @property
     def layer_module_paths(self) -> list[str]:
@@ -67,6 +67,23 @@ class ModelDriver:
             "text_model.encoder.layers",
             "model.model.layers",
         ]
+
+    def get_layer_classes(self, config) -> Optional[List[Type]]:
+        """
+        Return the per-index list of layer classes for this architecture,
+        or None to let LayerLoader fall back to meta-device model inspection.
+
+        Override this for architectures whose layer __init__ is incompatible
+        with init_empty_weights / meta device (e.g. fla-based models like
+        Qwen3.5 whose custom kernels silently leave the ModuleList empty).
+
+        The returned list must have exactly config.num_hidden_layers entries.
+        LayerLoader caches the result — this is called at most once per
+        worker process per architecture.
+
+        Default: None (LayerLoader uses meta-device model).
+        """
+        return None
 
     def reconcile_layer_weight_prefix(
         self, layer_prefix_base: str, weight_map: dict

@@ -25,6 +25,18 @@ Key differences from standard transformers layout:
     "model.language_model.layers.N.mlp.*"             ← nested
     "mtp.layers.0.*"                                  ← MTP head, not a decoder layer
 
+  Layer class resolution
+  ----------------------
+  Qwen3.5 is a hybrid model — layers alternate between GatedDeltaNet and
+  standard attention.  The layer __init__ code (from fla) is incompatible
+  with init_empty_weights / meta device: GatedDeltaNet silently fails to
+  populate the ModuleList, so the generic meta-model path in LayerLoader
+  always returns an empty list.
+
+  get_layer_classes() resolves classes without any model instantiation by
+  reading _no_split_modules from the already-loaded trust_remote_code module
+  and matching against the per-layer pattern encoded in config.text_config.
+
   RoPE
   ----
   Qwen3.5 layers compute RoPE internally; they do not accept an external
@@ -42,7 +54,8 @@ Key differences from standard transformers layout:
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Any
+import sys
+from typing import Optional, List, Tuple, Any, Type
 
 from ..base import ModelDriver
 from ..registry import register
@@ -107,9 +120,117 @@ class Qwen35Driver(ModelDriver):
 
     @property
     def layer_module_paths(self) -> list[str]:
+        # Qwen3.5's language_model IS the backbone (not a ForCausalLM wrapper),
+        # so layers sit directly at model.language_model.layers — matching both
+        # the live Python module tree and the checkpoint weight-map keys.
         return [
             "model.language_model.layers",  # Qwen3.5 primary path
         ] + super().layer_module_paths
+
+    def get_layer_classes(self, config) -> Optional[List[Type]]:
+        """
+        Resolve per-index layer classes without any model instantiation.
+
+        Qwen3.5's fla-based GatedDeltaNet layers are incompatible with
+        init_empty_weights — their __init__ silently fails on meta device,
+        leaving an empty ModuleList.  This method sidesteps instantiation
+        entirely by reading from the module already loaded in sys.modules
+        by AutoConfig.from_pretrained(trust_remote_code=True).
+
+        Steps
+        -----
+        1. Look up the model class via config.auto_map in sys.modules.
+        2. Read _no_split_modules to get the set of distinct layer class names.
+        3. Homogeneous (1 class): return [cls] * num_hidden_layers.
+        4. Hybrid (multiple classes): find the per-layer pattern list in
+           config.text_config (fla encodes it as e.g. attn_mode of length
+           num_hidden_layers), then map each pattern token to a class by
+           keyword overlap with the class name.
+        """
+        n = getattr(config, 'num_hidden_layers', None)
+        if not n:
+            return None
+
+        # ── Step 1: get model class from already-loaded sys.modules ──────────
+        # trust_remote_code models always declare config.auto_map.
+        # The module was already imported by _load_config_with_driver so
+        # no I/O or imports happen here.
+        model_cls = None
+        auto_map = getattr(config, 'auto_map', {}) or {}
+        for key in ('AutoModelForCausalLM', 'AutoModel', 'AutoModelForSeq2SeqLM'):
+            dotted = auto_map.get(key)
+            if not dotted:
+                continue
+            try:
+                mod_path, cls_name = dotted.rsplit('.', 1)
+                mod = sys.modules.get(mod_path)
+                if mod:
+                    model_cls = getattr(mod, cls_name, None)
+                    if model_cls:
+                        break
+            except (ValueError, AttributeError):
+                continue
+
+        if model_cls is None:
+            return None
+
+        # ── Step 2: _no_split_modules → class objects ─────────────────────────
+        no_split: List[str] = getattr(model_cls, '_no_split_modules', None) or []
+        if not no_split:
+            return None
+
+        src_mod = sys.modules.get(model_cls.__module__)
+        cls_by_name: dict = {}
+        for name in no_split:
+            cls = getattr(src_mod, name, None) if src_mod else None
+            if cls is not None:
+                cls_by_name[name] = cls
+
+        if not cls_by_name:
+            return None
+
+        # ── Step 3: homogeneous model ─────────────────────────────────────────
+        if len(cls_by_name) == 1:
+            return [next(iter(cls_by_name.values()))] * n
+
+        # ── Step 4: hybrid model — match per-layer pattern from config ────────
+        # fla models encode the per-layer type sequence as a list-valued
+        # attribute of length num_hidden_layers in text_config.
+        pattern = None
+        for attr in ('attn_mode', 'attn_modes', 'layer_type', 'layer_types',
+                     'layer_mode', 'layer_modes', 'model_type_list'):
+            for cfg in (config, getattr(config, 'text_config', None)):
+                if cfg is None:
+                    continue
+                val = getattr(cfg, attr, None)
+                if isinstance(val, (list, tuple)) and len(val) == n:
+                    pattern = val
+                    break
+            if pattern is not None:
+                break
+
+        if pattern is None:
+            return None
+
+        # Map each distinct pattern value → best-matching class by keyword
+        # overlap.  e.g. "chunk_simple_gla" → GatedDeltaNet,
+        # "full_attn" → Qwen3_5AttentionDecoderLayer.
+        pattern_to_cls: dict = {}
+        for pval in set(pattern):
+            tokens = set(str(pval).lower().replace('_', ' ').split())
+            best: Optional[Type] = None
+            best_score = 0
+            for cls_name, cls in cls_by_name.items():
+                cls_lower = cls_name.lower()
+                score = sum(1 for t in tokens if len(t) > 3 and t in cls_lower)
+                if score > best_score:
+                    best_score = score
+                    best = cls
+            if best is None:
+                return None  # can't map this value; fall through to meta model
+            pattern_to_cls[pval] = best
+
+        return [pattern_to_cls[p] for p in pattern]
 
     # ── MoE ──────────────────────────────────────────────────────────────────
 
@@ -133,7 +254,6 @@ class Qwen35Driver(ModelDriver):
         We find the module through the module tree but return the flat
         checkpoint prefix so _save_module constructs the correct key.
         """
-        # Find the checkpoint key prefix (should be "lm_head")
         checkpoint_prefix = None
         for wk in weight_map:
             if wk.endswith("lm_head.weight"):
@@ -143,7 +263,6 @@ class Qwen35Driver(ModelDriver):
         if checkpoint_prefix is None:
             return None  # not found; generic scan will try
 
-        # Find the module — try VLM paths
         _vlm_paths = [
             "model.language_model.lm_head",
             "language_model.lm_head",

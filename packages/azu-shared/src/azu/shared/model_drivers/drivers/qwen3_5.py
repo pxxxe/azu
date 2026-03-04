@@ -140,10 +140,12 @@ class Qwen35Driver(ModelDriver):
         Steps
         -----
         1. Look up the model class via config.auto_map in sys.modules.
+            If auto_map is absent (Qwen3.5 does not declare it), fall back
+            to scanning sys.modules for the architecture class by name.
         2. Read _no_split_modules to get the set of distinct layer class names.
         3. Homogeneous (1 class): return [cls] * num_hidden_layers.
         4. Hybrid (multiple classes): find the per-layer pattern list in
-            config.text_config (fla encodes it as e.g. attn_mode of length
+            config.text_config (fla encodes it as e.g. layer_types of length
             num_hidden_layers), then map each pattern token to a class by
             keyword overlap with the class name.
         """
@@ -152,15 +154,9 @@ class Qwen35Driver(ModelDriver):
             return None
 
         # ── Step 1: get model class from already-loaded sys.modules ──────────
-        # trust_remote_code models always declare config.auto_map.
-        # The module was already imported by _load_config_with_driver so
-        # no I/O or imports happen here.
-        #
-        # IMPORTANT: transformers registers trust_remote_code modules under
-        # "transformers_modules.<model_id>.<filename>", but auto_map stores
-        # only the bare filename (e.g. "modeling_qwen3_5.ClassName").
-        # sys.modules.get(bare_name) therefore always returns None — we must
-        # search by suffix instead.
+        # trust_remote_code models may declare config.auto_map, but Qwen3.5
+        # does not — so after the auto_map probe we fall back to scanning
+        # sys.modules for the architecture class directly by name.
         model_cls = None
         auto_map = getattr(config, 'auto_map', {}) or {}
         for key in ('AutoModelForCausalLM', 'AutoModel', 'AutoModelForSeq2SeqLM',
@@ -170,11 +166,8 @@ class Qwen35Driver(ModelDriver):
                 continue
             try:
                 mod_path, cls_name = dotted.rsplit('.', 1)
-                # Exact lookup first (works if module was imported directly).
                 mod = sys.modules.get(mod_path)
                 if mod is None:
-                    # Fallback: transformers registers as
-                    # "transformers_modules.<model_id>.<mod_path>" — match by suffix.
                     suffix = '.' + mod_path
                     for k, v in sys.modules.items():
                         if k == mod_path or k.endswith(suffix):
@@ -186,6 +179,20 @@ class Qwen35Driver(ModelDriver):
                         break
             except (ValueError, AttributeError):
                 continue
+
+        # Fallback: Qwen3.5 has no auto_map — scan sys.modules for the
+        # architecture class by name (it was registered when AutoConfig
+        # loaded the trust_remote_code module).
+        if model_cls is None:
+            arch_name = (getattr(config, 'architectures', None) or [None])[0]
+            if arch_name:
+                for mod in sys.modules.values():
+                    if mod is None:
+                        continue
+                    cls = getattr(mod, arch_name, None)
+                    if cls is not None and isinstance(cls, type):
+                        model_cls = cls
+                        break
 
         if model_cls is None:
             return None
@@ -229,8 +236,8 @@ class Qwen35Driver(ModelDriver):
             return None
 
         # Map each distinct pattern value → best-matching class by keyword
-        # overlap.  e.g. "chunk_simple_gla" → GatedDeltaNet,
-        # "full_attn" → Qwen3_5AttentionDecoderLayer.
+        # overlap.  e.g. "linear_attention" → GatedDeltaNet layer class,
+        # "full_attention" → Qwen3_5AttentionDecoderLayer.
         pattern_to_cls: dict = {}
         for pval in set(pattern):
             tokens = set(str(pval).lower().replace('_', ' ').split())

@@ -155,6 +155,12 @@ class Qwen35Driver(ModelDriver):
         # trust_remote_code models always declare config.auto_map.
         # The module was already imported by _load_config_with_driver so
         # no I/O or imports happen here.
+        #
+        # IMPORTANT: transformers registers trust_remote_code modules under
+        # "transformers_modules.<model_id>.<filename>", but auto_map stores
+        # only the bare filename (e.g. "modeling_qwen3_5.ClassName").
+        # sys.modules.get(bare_name) therefore always returns None — we must
+        # search by suffix instead.
         model_cls = None
         auto_map = getattr(config, 'auto_map', {}) or {}
         for key in ('AutoModelForCausalLM', 'AutoModel', 'AutoModelForSeq2SeqLM',
@@ -164,7 +170,16 @@ class Qwen35Driver(ModelDriver):
                 continue
             try:
                 mod_path, cls_name = dotted.rsplit('.', 1)
+                # Exact lookup first (works if module was imported directly).
                 mod = sys.modules.get(mod_path)
+                if mod is None:
+                    # Fallback: transformers registers as
+                    # "transformers_modules.<model_id>.<mod_path>" — match by suffix.
+                    suffix = '.' + mod_path
+                    for k, v in sys.modules.items():
+                        if k == mod_path or k.endswith(suffix):
+                            mod = v
+                            break
                 if mod:
                     model_cls = getattr(mod, cls_name, None)
                     if model_cls:

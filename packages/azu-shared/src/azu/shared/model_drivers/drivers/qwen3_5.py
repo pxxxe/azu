@@ -128,132 +128,103 @@ class Qwen35Driver(ModelDriver):
         ] + super().layer_module_paths
 
     def get_layer_classes(self, config) -> Optional[List[Type]]:
-        """
-        Resolve per-index layer classes without any model instantiation.
+            n = getattr(config, 'num_hidden_layers', None)
+            print(f"   [Qwen35] get_layer_classes: n={n}, arch={getattr(config, 'architectures', None)}")
+            if not n:
+                return None
 
-        Qwen3.5's fla-based GatedDeltaNet layers are incompatible with
-        init_empty_weights — their __init__ silently fails on meta device,
-        leaving an empty ModuleList.  This method sidesteps instantiation
-        entirely by reading from the module already loaded in sys.modules
-        by AutoConfig.from_pretrained(trust_remote_code=True).
-
-        Steps
-        -----
-        1. Look up the model class via config.auto_map in sys.modules.
-            If auto_map is absent (Qwen3.5 does not declare it), fall back
-            to scanning sys.modules for the architecture class by name.
-        2. Read _no_split_modules to get the set of distinct layer class names.
-        3. Homogeneous (1 class): return [cls] * num_hidden_layers.
-        4. Hybrid (multiple classes): find the per-layer pattern list in
-            config.text_config (fla encodes it as e.g. layer_types of length
-            num_hidden_layers), then map each pattern token to a class by
-            keyword overlap with the class name.
-        """
-        n = getattr(config, 'num_hidden_layers', None)
-        if not n:
-            return None
-
-        # ── Step 1: get model class from already-loaded sys.modules ──────────
-        # trust_remote_code models may declare config.auto_map, but Qwen3.5
-        # does not — so after the auto_map probe we fall back to scanning
-        # sys.modules for the architecture class directly by name.
-        model_cls = None
-        auto_map = getattr(config, 'auto_map', {}) or {}
-        for key in ('AutoModelForCausalLM', 'AutoModel', 'AutoModelForSeq2SeqLM',
-                    'AutoModelForConditionalGeneration'):
-            dotted = auto_map.get(key)
-            if not dotted:
-                continue
-            try:
-                mod_path, cls_name = dotted.rsplit('.', 1)
-                mod = sys.modules.get(mod_path)
-                if mod is None:
-                    suffix = '.' + mod_path
-                    for k, v in sys.modules.items():
-                        if k == mod_path or k.endswith(suffix):
-                            mod = v
-                            break
-                if mod:
-                    model_cls = getattr(mod, cls_name, None)
-                    if model_cls:
-                        break
-            except (ValueError, AttributeError):
-                continue
-
-        # Fallback: Qwen3.5 has no auto_map — scan sys.modules for the
-        # architecture class by name (it was registered when AutoConfig
-        # loaded the trust_remote_code module).
-        if model_cls is None:
+            model_cls = None
             arch_name = (getattr(config, 'architectures', None) or [None])[0]
-            if arch_name:
-                for mod in sys.modules.values():
-                    if mod is None:
-                        continue
-                    cls = getattr(mod, arch_name, None)
+
+            for mod_name in (
+                'transformers.models.qwen3_5.modeling_qwen3_5',
+                'transformers.models.qwen3_5_text.modeling_qwen3_5_text',
+            ):
+                try:
+                    import importlib
+                    mod = importlib.import_module(mod_name)
+                    cls = getattr(mod, arch_name, None) if arch_name else None
+                    print(f"   [Qwen35] importlib {mod_name} → {cls}")
                     if cls is not None and isinstance(cls, type):
                         model_cls = cls
                         break
-
-        if model_cls is None:
-            return None
-
-        # ── Step 2: _no_split_modules → class objects ─────────────────────────
-        no_split: List[str] = getattr(model_cls, '_no_split_modules', None) or []
-        if not no_split:
-            return None
-
-        src_mod = sys.modules.get(model_cls.__module__)
-        cls_by_name: dict = {}
-        for name in no_split:
-            cls = getattr(src_mod, name, None) if src_mod else None
-            if cls is not None:
-                cls_by_name[name] = cls
-
-        if not cls_by_name:
-            return None
-
-        # ── Step 3: homogeneous model ─────────────────────────────────────────
-        if len(cls_by_name) == 1:
-            return [next(iter(cls_by_name.values()))] * n
-
-        # ── Step 4: hybrid model — match per-layer pattern from config ────────
-        # fla models encode the per-layer type sequence as a list-valued
-        # attribute of length num_hidden_layers in text_config.
-        pattern = None
-        for attr in ('attn_mode', 'attn_modes', 'layer_type', 'layer_types',
-                      'layer_mode', 'layer_modes', 'model_type_list'):
-            for cfg in (config, getattr(config, 'text_config', None)):
-                if cfg is None:
+                except (ImportError, AttributeError) as e:
+                    print(f"   [Qwen35] importlib {mod_name} failed: {e}")
                     continue
-                val = getattr(cfg, attr, None)
-                if isinstance(val, (list, tuple)) and len(val) == n:
-                    pattern = val
+
+            if model_cls is None and arch_name:
+                print(f"   [Qwen35] falling back to sys.modules scan for {arch_name}")
+                for k, mod in sys.modules.items():
+                    if mod is None:
+                        continue
+                    try:
+                        cls = getattr(mod, arch_name, None)
+                    except Exception:
+                        continue
+                    if cls is not None and isinstance(cls, type):
+                        print(f"   [Qwen35] found {arch_name} in sys.modules['{k}']")
+                        model_cls = cls
+                        break
+
+            print(f"   [Qwen35] model_cls={model_cls}")
+            if model_cls is None:
+                return None
+
+            no_split: List[str] = getattr(model_cls, '_no_split_modules', None) or []
+            print(f"   [Qwen35] _no_split_modules={no_split}")
+            if not no_split:
+                return None
+
+            src_mod = sys.modules.get(model_cls.__module__)
+            print(f"   [Qwen35] src_mod={src_mod}")
+            cls_by_name: dict = {}
+            for name in no_split:
+                cls = getattr(src_mod, name, None) if src_mod else None
+                print(f"   [Qwen35] no_split class '{name}' → {cls}")
+                if cls is not None:
+                    cls_by_name[name] = cls
+
+            print(f"   [Qwen35] cls_by_name={list(cls_by_name.keys())}")
+            if not cls_by_name:
+                return None
+
+            if len(cls_by_name) == 1:
+                return [next(iter(cls_by_name.values()))] * n
+
+            pattern = None
+            for attr in ('attn_mode', 'attn_modes', 'layer_type', 'layer_types',
+                         'layer_mode', 'layer_modes', 'model_type_list'):
+                for cfg in (config, getattr(config, 'text_config', None)):
+                    if cfg is None:
+                        continue
+                    val = getattr(cfg, attr, None)
+                    if isinstance(val, (list, tuple)) and len(val) == n:
+                        pattern = val
+                        break
+                if pattern is not None:
                     break
-            if pattern is not None:
-                break
 
-        if pattern is None:
-            return None
+            print(f"   [Qwen35] pattern attr found: {pattern is not None}, sample={pattern[:4] if pattern else None}")
+            if pattern is None:
+                return None
 
-        # Map each distinct pattern value → best-matching class by keyword
-        # overlap.  e.g. "linear_attention" → GatedDeltaNet layer class,
-        # "full_attention" → Qwen3_5AttentionDecoderLayer.
-        pattern_to_cls: dict = {}
-        for pval in set(pattern):
-            tokens = set(str(pval).lower().replace('_', ' ').split())
-            best: Optional[Type] = None
-            best_score = 0
-            for cls_name, cls in cls_by_name.items():
-                cls_lower = cls_name.lower()
-                score = sum(1 for t in tokens if len(t) > 3 and t in cls_lower)
-                if score > best_score:
-                    best_score = score
-                    best = cls
-            if best is None:
-                return None  # can't map this value; fall through to meta model
-            pattern_to_cls[pval] = best
+            pattern_to_cls: dict = {}
+            for pval in set(pattern):
+                tokens = set(str(pval).lower().replace('_', ' ').split())
+                best: Optional[Type] = None
+                best_score = 0
+                for cls_name, cls in cls_by_name.items():
+                    cls_lower = cls_name.lower()
+                    score = sum(1 for t in tokens if len(t) > 3 and t in cls_lower)
+                    if score > best_score:
+                        best_score = score
+                        best = cls
+                print(f"   [Qwen35] pattern '{pval}' → {best}")
+                if best is None:
+                    return None
+                pattern_to_cls[pval] = best
 
-        return [pattern_to_cls[p] for p in pattern]
+            return [pattern_to_cls[p] for p in pattern]
 
     # ── MoE ──────────────────────────────────────────────────────────────────
 

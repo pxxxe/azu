@@ -171,23 +171,30 @@ class Qwen35Driver(ModelDriver):
                 return None
 
             no_split: List[str] = getattr(model_cls, '_no_split_modules', None) or []
-            print(f"   [Qwen35] _no_split_modules={no_split}")
             if not no_split:
                 return None
 
             src_mod = sys.modules.get(model_cls.__module__)
-            print(f"   [Qwen35] src_mod={src_mod}")
             cls_by_name: dict = {}
             for name in no_split:
                 cls = getattr(src_mod, name, None) if src_mod else None
-                print(f"   [Qwen35] no_split class '{name}' → {cls}")
                 if cls is not None:
                     cls_by_name[name] = cls
 
-            print(f"   [Qwen35] cls_by_name={list(cls_by_name.keys())}")
             if not cls_by_name:
                 return None
 
+            # Filter out vision-encoder classes — they appear in _no_split_modules
+            # due to the VLM wrapper but are not part of the language-model layer
+            # sequence.  e.g. Qwen3_5VisionBlock is not one of the 24 LM layers.
+            text_cls_by_name = {
+                name: cls for name, cls in cls_by_name.items()
+                if 'vision' not in name.lower()
+            }
+            if text_cls_by_name:
+                cls_by_name = text_cls_by_name
+
+            # ── Step 3: homogeneous model ─────────────────────────────────────────
             if len(cls_by_name) == 1:
                 return [next(iter(cls_by_name.values()))] * n
 

@@ -287,13 +287,21 @@ class Qwen35Driver(ModelDriver):
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
-    def init_rope(self, config, device: str, dtype) -> None:
+    def init_rope(self, config, device: str, dtype) -> Optional["torch.nn.Module"]:
         """
-        Qwen3.5 layers compute RoPE internally.
-        Returning None tells ModelManager to skip external RoPE construction.
-        position_ids are still passed to each layer; they use them directly.
+        Qwen3.5 full-attention layers require position_embeddings=(cos, sin)
+        to be passed by the caller.  Return the model's own rotary embedding
+        so prepare_inputs() can compute it.
         """
-        return None
+        import importlib
+        mod = importlib.import_module(
+            "transformers.models.qwen3_5.modeling_qwen3_5"
+        )
+        rope_cls = getattr(mod, "Qwen3_5RotaryEmbedding", None)
+        if rope_cls is None:
+            # Fallback to generic LlamaRotaryEmbedding
+            from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding as rope_cls
+        return rope_cls(config=config, device=device).to(dtype)
 
     def build_forward_kwargs(
         self,
@@ -306,8 +314,8 @@ class Qwen35Driver(ModelDriver):
         layer_idx: int,
     ) -> dict:
         """
-        Qwen3.5 layers do NOT accept position_embeddings — they compute RoPE
-        from position_ids internally.  Omit it unconditionally.
+        Qwen3.5 layers require position_embeddings=(cos, sin) for full-attention
+        layers and accept position_ids for linear-attention layers.
         """
         has_var = "_has_var_keyword" in layer_forward_params
 
@@ -322,7 +330,7 @@ class Qwen35Driver(ModelDriver):
             _include("attention_mask", attention_mask),
             _include("position_ids", position_ids),
             _include("past_key_value", past_kv),
-            # position_embeddings intentionally omitted
+            _include("position_embeddings", position_embeddings),
             _include("use_cache", True),
         ]:
             if pair is not None:

@@ -52,6 +52,7 @@ from azu.worker.config import (
     IDLE_TIMEOUT,
 )
 from azu.worker.layer_loader import LayerLoader
+from azu.shared.model_drivers import get_driver
 from azu.worker.model_manager import ModelManager
 from azu.worker.job_context import JobContext
 from azu.worker.p2p_server import P2PServer
@@ -805,20 +806,17 @@ class MoEWorker:
                     )
 
                     with torch.no_grad():
-                        # Build kwargs dynamically so that layers with non-standard
-                        # forward() signatures (e.g. Qwen3.5 Gated-DeltaNet layers
-                        # that don't accept position_embeddings) don't raise TypeError.
+                        _driver = get_driver(await self.loader._load_config_with_driver(model_id))
                         _fwd_params = self.model_manager._get_layer_forward_params(dense_layer)
-                        _accept_all = "_has_var_keyword" in _fwd_params
-                        _call_kw: dict = {"use_cache": True}
-                        if _accept_all or "past_key_values"     in _fwd_params:
-                            _call_kw["past_key_values"]     = ctx.kv_cache
-                        if _accept_all or "position_embeddings" in _fwd_params:
-                            _call_kw["position_embeddings"] = pos_emb
-                        if _accept_all or "attention_mask"      in _fwd_params:
-                            _call_kw["attention_mask"]      = attn_mask
-                        if _accept_all or "position_ids"        in _fwd_params:
-                            _call_kw["position_ids"]        = pos_ids
+                        _call_kw = _driver.build_forward_kwargs(
+                            _fwd_params,
+                            hidden_states,
+                            pos_emb,
+                            attn_mask,
+                            pos_ids,
+                            ctx.kv_cache,
+                            layer_idx,
+                        )
                         layer_out = dense_layer(hidden_states, **_call_kw)
 
                     if isinstance(layer_out, tuple):

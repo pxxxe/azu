@@ -132,7 +132,6 @@ class Qwen35Driver(ModelDriver):
 
     def get_layer_classes(self, config) -> Optional[List[Type]]:
             n = getattr(config, 'num_hidden_layers', None)
-            print(f"   [Qwen35] get_layer_classes: n={n}, arch={getattr(config, 'architectures', None)}")
             if not n:
                 return None
 
@@ -147,17 +146,14 @@ class Qwen35Driver(ModelDriver):
                     import importlib
                     mod = importlib.import_module(mod_name)
                     cls = getattr(mod, arch_name, None) if arch_name else None
-                    print(f"   [Qwen35] importlib {mod_name} → {cls}")
-                    if cls is not None and isinstance(cls, type):
+                            if cls is not None and isinstance(cls, type):
                         model_cls = cls
                         break
                 except (ImportError, AttributeError) as e:
-                    print(f"   [Qwen35] importlib {mod_name} failed: {e}")
-                    continue
+                            continue
 
             if model_cls is None and arch_name:
-                print(f"   [Qwen35] falling back to sys.modules scan for {arch_name}")
-                for k, mod in sys.modules.items():
+                    for k, mod in sys.modules.items():
                     if mod is None:
                         continue
                     try:
@@ -165,11 +161,9 @@ class Qwen35Driver(ModelDriver):
                     except Exception:
                         continue
                     if cls is not None and isinstance(cls, type):
-                        print(f"   [Qwen35] found {arch_name} in sys.modules['{k}']")
-                        model_cls = cls
+                                    model_cls = cls
                         break
 
-            print(f"   [Qwen35] model_cls={model_cls}")
             if model_cls is None:
                 return None
 
@@ -214,7 +208,6 @@ class Qwen35Driver(ModelDriver):
                 if pattern is not None:
                     break
 
-            print(f"   [Qwen35] pattern attr found: {pattern is not None}, sample={pattern[:4] if pattern else None}")
             if pattern is None:
                 return None
 
@@ -229,9 +222,8 @@ class Qwen35Driver(ModelDriver):
                     if score > best_score:
                         best_score = score
                         best = cls
-                print(f"   [Qwen35] pattern '{pval}' → {best}")
-                if best is None:
-                    return None
+                    if best is None:
+                        return None
                 pattern_to_cls[pval] = best
 
             return [pattern_to_cls[p] for p in pattern]

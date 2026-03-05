@@ -85,6 +85,7 @@ _PROXY_ATTRS = [
     "n_routed_experts",
     # Architecture must be propagated so downstream code sees it
     "architectures",
+    "layer_types"
 ]
 
 

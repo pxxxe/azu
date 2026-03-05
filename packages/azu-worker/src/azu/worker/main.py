@@ -813,7 +813,7 @@ class MoEWorker:
                         _call_kw: dict = {"use_cache": True}
                         if _accept_all or "past_key_values"     in _fwd_params:
                             _call_kw["past_key_values"]     = ctx.kv_cache
-                        if _accept_all or "position_embeddings" in _fwd_params:
+                        if pos_emb is not None and (_accept_all or "position_embeddings" in _fwd_params):
                             _call_kw["position_embeddings"] = pos_emb
                         if _accept_all or "attention_mask"      in _fwd_params:
                             _call_kw["attention_mask"]      = attn_mask

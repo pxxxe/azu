@@ -102,20 +102,22 @@ class Qwen35Driver(ModelDriver):
 
     def normalize_config(self, config) -> None:
         """
-        Proxy language-model attrs from config.text_config to the top level.
+        Proxy all language-model attrs from config.text_config to the top level.
         Idempotent — already-present attrs are never overwritten.
         """
         text_cfg = getattr(config, "text_config", None)
         if text_cfg is None:
             return
-        for attr in _PROXY_ATTRS:
+        for attr, val in vars(text_cfg).items():
+            if attr.startswith("_"):
+                continue
             try:
-                getattr(config, attr)   # raises AttributeError if missing
+                getattr(config, attr)   # already present — skip
             except AttributeError:
                 try:
-                    setattr(config, attr, getattr(text_cfg, attr))
+                    setattr(config, attr, val)
                 except AttributeError:
-                    pass  # not on text_config either — skip silently
+                    pass
 
     # ── Layer discovery ───────────────────────────────────────────────────────
 

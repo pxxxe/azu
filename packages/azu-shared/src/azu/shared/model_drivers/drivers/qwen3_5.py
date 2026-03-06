@@ -85,7 +85,6 @@ _PROXY_ATTRS = [
     "n_routed_experts",
     # Architecture must be propagated so downstream code sees it
     "architectures",
-    "layer_types"
 ]
 
 
@@ -102,22 +101,20 @@ class Qwen35Driver(ModelDriver):
 
     def normalize_config(self, config) -> None:
         """
-        Proxy all language-model attrs from config.text_config to the top level.
+        Proxy language-model attrs from config.text_config to the top level.
         Idempotent — already-present attrs are never overwritten.
         """
         text_cfg = getattr(config, "text_config", None)
         if text_cfg is None:
             return
-        for attr, val in vars(text_cfg).items():
-            if attr.startswith("_"):
-                continue
+        for attr in _PROXY_ATTRS:
             try:
-                getattr(config, attr)   # already present — skip
+                getattr(config, attr)   # raises AttributeError if missing
             except AttributeError:
                 try:
-                    setattr(config, attr, val)
+                    setattr(config, attr, getattr(text_cfg, attr))
                 except AttributeError:
-                    pass
+                    pass  # not on text_config either — skip silently
 
     # ── Layer discovery ───────────────────────────────────────────────────────
 
@@ -131,102 +128,109 @@ class Qwen35Driver(ModelDriver):
         ] + super().layer_module_paths
 
     def get_layer_classes(self, config) -> Optional[List[Type]]:
-            n = getattr(config, 'num_hidden_layers', None)
-            if not n:
-                return None
+        """
+        Resolve per-index layer classes without any model instantiation.
 
-            model_cls = None
-            arch_name = (getattr(config, 'architectures', None) or [None])[0]
+        Qwen3.5's fla-based GatedDeltaNet layers are incompatible with
+        init_empty_weights — their __init__ silently fails on meta device,
+        leaving an empty ModuleList.  This method sidesteps instantiation
+        entirely by reading from the module already loaded in sys.modules
+        by AutoConfig.from_pretrained(trust_remote_code=True).
 
-            for mod_name in (
-                'transformers.models.qwen3_5.modeling_qwen3_5',
-                'transformers.models.qwen3_5_text.modeling_qwen3_5_text',
-            ):
-                try:
-                    import importlib
-                    mod = importlib.import_module(mod_name)
-                    cls = getattr(mod, arch_name, None) if arch_name else None
-                            if cls is not None and isinstance(cls, type):
-                        model_cls = cls
+        Steps
+        -----
+        1. Look up the model class via config.auto_map in sys.modules.
+        2. Read _no_split_modules to get the set of distinct layer class names.
+        3. Homogeneous (1 class): return [cls] * num_hidden_layers.
+        4. Hybrid (multiple classes): find the per-layer pattern list in
+           config.text_config (fla encodes it as e.g. attn_mode of length
+           num_hidden_layers), then map each pattern token to a class by
+           keyword overlap with the class name.
+        """
+        n = getattr(config, 'num_hidden_layers', None)
+        if not n:
+            return None
+
+        # ── Step 1: get model class from already-loaded sys.modules ──────────
+        # trust_remote_code models always declare config.auto_map.
+        # The module was already imported by _load_config_with_driver so
+        # no I/O or imports happen here.
+        model_cls = None
+        auto_map = getattr(config, 'auto_map', {}) or {}
+        for key in ('AutoModelForCausalLM', 'AutoModel', 'AutoModelForSeq2SeqLM'):
+            dotted = auto_map.get(key)
+            if not dotted:
+                continue
+            try:
+                mod_path, cls_name = dotted.rsplit('.', 1)
+                mod = sys.modules.get(mod_path)
+                if mod:
+                    model_cls = getattr(mod, cls_name, None)
+                    if model_cls:
                         break
-                except (ImportError, AttributeError) as e:
-                            continue
+            except (ValueError, AttributeError):
+                continue
 
-            if model_cls is None and arch_name:
-                    for k, mod in sys.modules.items():
-                    if mod is None:
-                        continue
-                    try:
-                        cls = getattr(mod, arch_name, None)
-                    except Exception:
-                        continue
-                    if cls is not None and isinstance(cls, type):
-                                    model_cls = cls
-                        break
+        if model_cls is None:
+            return None
 
-            if model_cls is None:
-                return None
+        # ── Step 2: _no_split_modules → class objects ─────────────────────────
+        no_split: List[str] = getattr(model_cls, '_no_split_modules', None) or []
+        if not no_split:
+            return None
 
-            no_split: List[str] = getattr(model_cls, '_no_split_modules', None) or []
-            if not no_split:
-                return None
+        src_mod = sys.modules.get(model_cls.__module__)
+        cls_by_name: dict = {}
+        for name in no_split:
+            cls = getattr(src_mod, name, None) if src_mod else None
+            if cls is not None:
+                cls_by_name[name] = cls
 
-            src_mod = sys.modules.get(model_cls.__module__)
-            cls_by_name: dict = {}
-            for name in no_split:
-                cls = getattr(src_mod, name, None) if src_mod else None
-                if cls is not None:
-                    cls_by_name[name] = cls
+        if not cls_by_name:
+            return None
 
-            if not cls_by_name:
-                return None
+        # ── Step 3: homogeneous model ─────────────────────────────────────────
+        if len(cls_by_name) == 1:
+            return [next(iter(cls_by_name.values()))] * n
 
-            # Filter out vision-encoder classes — they appear in _no_split_modules
-            # due to the VLM wrapper but are not part of the language-model layer
-            # sequence.  e.g. Qwen3_5VisionBlock is not one of the 24 LM layers.
-            text_cls_by_name = {
-                name: cls for name, cls in cls_by_name.items()
-                if 'vision' not in name.lower()
-            }
-            if text_cls_by_name:
-                cls_by_name = text_cls_by_name
-
-            # ── Step 3: homogeneous model ─────────────────────────────────────────
-            if len(cls_by_name) == 1:
-                return [next(iter(cls_by_name.values()))] * n
-
-            pattern = None
-            for attr in ('attn_mode', 'attn_modes', 'layer_type', 'layer_types',
-                         'layer_mode', 'layer_modes', 'model_type_list'):
-                for cfg in (config, getattr(config, 'text_config', None)):
-                    if cfg is None:
-                        continue
-                    val = getattr(cfg, attr, None)
-                    if isinstance(val, (list, tuple)) and len(val) == n:
-                        pattern = val
-                        break
-                if pattern is not None:
+        # ── Step 4: hybrid model — match per-layer pattern from config ────────
+        # fla models encode the per-layer type sequence as a list-valued
+        # attribute of length num_hidden_layers in text_config.
+        pattern = None
+        for attr in ('attn_mode', 'attn_modes', 'layer_type', 'layer_types',
+                     'layer_mode', 'layer_modes', 'model_type_list'):
+            for cfg in (config, getattr(config, 'text_config', None)):
+                if cfg is None:
+                    continue
+                val = getattr(cfg, attr, None)
+                if isinstance(val, (list, tuple)) and len(val) == n:
+                    pattern = val
                     break
+            if pattern is not None:
+                break
 
-            if pattern is None:
-                return None
+        if pattern is None:
+            return None
 
-            pattern_to_cls: dict = {}
-            for pval in set(pattern):
-                tokens = set(str(pval).lower().replace('_', ' ').split())
-                best: Optional[Type] = None
-                best_score = 0
-                for cls_name, cls in cls_by_name.items():
-                    cls_lower = cls_name.lower()
-                    score = sum(1 for t in tokens if len(t) > 3 and t in cls_lower)
-                    if score > best_score:
-                        best_score = score
-                        best = cls
-                    if best is None:
-                        return None
-                pattern_to_cls[pval] = best
+        # Map each distinct pattern value → best-matching class by keyword
+        # overlap.  e.g. "chunk_simple_gla" → GatedDeltaNet,
+        # "full_attn" → Qwen3_5AttentionDecoderLayer.
+        pattern_to_cls: dict = {}
+        for pval in set(pattern):
+            tokens = set(str(pval).lower().replace('_', ' ').split())
+            best: Optional[Type] = None
+            best_score = 0
+            for cls_name, cls in cls_by_name.items():
+                cls_lower = cls_name.lower()
+                score = sum(1 for t in tokens if len(t) > 3 and t in cls_lower)
+                if score > best_score:
+                    best_score = score
+                    best = cls
+            if best is None:
+                return None  # can't map this value; fall through to meta model
+            pattern_to_cls[pval] = best
 
-            return [pattern_to_cls[p] for p in pattern]
+        return [pattern_to_cls[p] for p in pattern]
 
     # ── MoE ──────────────────────────────────────────────────────────────────
 
@@ -279,21 +283,13 @@ class Qwen35Driver(ModelDriver):
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
-    def init_rope(self, config, device: str, dtype) -> Optional["torch.nn.Module"]:
+    def init_rope(self, config, device: str, dtype) -> None:
         """
-        Qwen3.5 full-attention layers require position_embeddings=(cos, sin)
-        to be passed by the caller.  Return the model's own rotary embedding
-        so prepare_inputs() can compute it.
+        Qwen3.5 layers compute RoPE internally.
+        Returning None tells ModelManager to skip external RoPE construction.
+        position_ids are still passed to each layer; they use them directly.
         """
-        import importlib
-        mod = importlib.import_module(
-            "transformers.models.qwen3_5.modeling_qwen3_5"
-        )
-        rope_cls = getattr(mod, "Qwen3_5RotaryEmbedding", None)
-        if rope_cls is None:
-            # Fallback to generic LlamaRotaryEmbedding
-            from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding as rope_cls
-        return rope_cls(config=config, device=device).to(dtype)
+        return None
 
     def build_forward_kwargs(
         self,
@@ -306,8 +302,8 @@ class Qwen35Driver(ModelDriver):
         layer_idx: int,
     ) -> dict:
         """
-        Qwen3.5 layers require position_embeddings=(cos, sin) for full-attention
-        layers and accept position_ids for linear-attention layers.
+        Qwen3.5 layers do NOT accept position_embeddings — they compute RoPE
+        from position_ids internally.  Omit it unconditionally.
         """
         has_var = "_has_var_keyword" in layer_forward_params
 
@@ -322,7 +318,7 @@ class Qwen35Driver(ModelDriver):
             _include("attention_mask", attention_mask),
             _include("position_ids", position_ids),
             _include("past_key_value", past_kv),
-            _include("position_embeddings", position_embeddings),
+            # position_embeddings intentionally omitted
             _include("use_cache", True),
         ]:
             if pair is not None:

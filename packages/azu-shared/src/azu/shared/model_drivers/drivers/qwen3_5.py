@@ -152,10 +152,14 @@ class Qwen35Driver(ModelDriver):
             return None
 
         # ── Step 1: get model class from already-loaded sys.modules ──────────
-        # trust_remote_code models always declare config.auto_map.
-        # The module was already imported by _load_config_with_driver so
-        # no I/O or imports happen here.
+        # AutoConfig.from_pretrained(trust_remote_code=True) imported the model
+        # module before we get here.  Transformers registers it under
+        # transformers_modules.<org>/<repo>/<filename> — auto_map only has the
+        # bare filename, so sys.modules.get(mod_path) always returns None.
+        # Match by suffix instead.
+        arch = config.architectures[0]
         model_cls = None
+
         auto_map = getattr(config, 'auto_map', {}) or {}
         for key in ('AutoModelForCausalLM', 'AutoModel', 'AutoModelForSeq2SeqLM'):
             dotted = auto_map.get(key)
@@ -163,13 +167,27 @@ class Qwen35Driver(ModelDriver):
                 continue
             try:
                 mod_path, cls_name = dotted.rsplit('.', 1)
-                mod = sys.modules.get(mod_path)
-                if mod:
-                    model_cls = getattr(mod, cls_name, None)
-                    if model_cls:
-                        break
+                for sys_key, mod in list(sys.modules.items()):
+                    if mod is not None and sys_key.endswith(mod_path):
+                        candidate = getattr(mod, cls_name, None)
+                        if candidate is not None and isinstance(candidate, type):
+                            model_cls = candidate
+                            break
             except (ValueError, AttributeError):
                 continue
+            if model_cls is not None:
+                break
+
+        # Fallback: scan all loaded modules for the architecture class by name.
+        if model_cls is None:
+            for mod in list(sys.modules.values()):
+                try:
+                    candidate = getattr(mod, arch, None)
+                    if candidate is not None and isinstance(candidate, type):
+                        model_cls = candidate
+                        break
+                except Exception:
+                    continue
 
         if model_cls is None:
             return None

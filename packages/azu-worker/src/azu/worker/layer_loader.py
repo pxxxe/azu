@@ -397,17 +397,12 @@ class LayerLoader:
 
         driver = get_driver(config)
 
-        # ── Path 1: ask the driver ─────────────────────────────────────────────
-        classes = driver.get_layer_classes(config)
-        if classes is not None:
-            self._layer_class_cache[arch] = classes
-            print(
-                f"   ✅ Layer-class cache built via driver: "
-                f"{len(classes)} layers, {len(set(classes))} distinct class(es)"
-            )
-            return
-
-        # ── Path 2: meta-device model ─────────────────────────────────────────
+        # ── Path 1: meta-device model ─────────────────────────────────────────
+        # Run this first — as a side effect, AutoModel.from_config imports the
+        # trust_remote_code modeling module into sys.modules.  This matters for
+        # Path 2: driver.get_layer_classes() reads classes out of sys.modules,
+        # which are not present until the modeling module is imported.
+        # (AutoConfig.from_pretrained only loads the config class, not modeling.)
         from accelerate import init_empty_weights
         from transformers import AutoModelForCausalLM, AutoModel
 
@@ -434,19 +429,34 @@ class LayerLoader:
             except Exception:
                 continue
 
-        if layers is None:
-            raise ValueError(
-                f"Could not locate layer list for {arch}. "
-                f"Driver.get_layer_classes() returned None and meta-device "
-                f"model gave empty layers. Tried paths: {layer_paths}"
+        if layers is not None:
+            self._layer_class_cache[arch] = [type(layers[i]) for i in range(len(layers))]
+            print(
+                f"   ✅ Layer-class cache built: {len(self._layer_class_cache[arch])} layers, "
+                f"{len(set(self._layer_class_cache[arch]))} distinct class(es)"
             )
+            del layers
+            return
 
-        self._layer_class_cache[arch] = [type(layers[i]) for i in range(len(layers))]
-        print(
-            f"   ✅ Layer-class cache built: {len(self._layer_class_cache[arch])} layers, "
-            f"{len(set(self._layer_class_cache[arch]))} distinct class(es)"
+        # ── Path 2: ask the driver ────────────────────────────────────────────
+        # Meta model loaded but layers were empty (fla/custom kernels that fail
+        # under init_empty_weights).  The modeling module is now in sys.modules
+        # as a side effect of the attempt above, so the driver can find its
+        # classes without any further instantiation.
+        classes = driver.get_layer_classes(config)
+        if classes is not None:
+            self._layer_class_cache[arch] = classes
+            print(
+                f"   ✅ Layer-class cache built via driver: "
+                f"{len(classes)} layers, {len(set(classes))} distinct class(es)"
+            )
+            return
+
+        raise ValueError(
+            f"Could not locate layer list for {arch}. "
+            f"Meta-device model gave empty layers and driver.get_layer_classes() "
+            f"returned None. Tried paths: {layer_paths}"
         )
-        del layers
 
     def _get_layer_class_for_idx(self, config: AutoConfig, layer_idx: int) -> Type[torch.nn.Module]:
         """

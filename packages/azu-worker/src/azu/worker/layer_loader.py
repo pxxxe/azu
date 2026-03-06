@@ -656,15 +656,27 @@ class LayerLoader:
             return self.loaded_cache[cache_key]
 
         config = await self._load_config_with_driver(model_id)
+        driver = get_driver(config)
 
         filename = f"layer_{layer_idx}_dense.safetensors"
         path, url = self._get_paths(model_id, filename)
         await self._download(url, path, model_id=model_id)
 
-        # Per-index class resolution: required for hybrid architectures such as
-        # Qwen3.5 where even-positioned layers are Gated-DeltaNet and
-        # every-fourth layer is Gated-Attention.
-        LayerClass = self._get_layer_class_for_idx(config, layer_idx)
+        # Per-index class resolution.  Try the fast path first: if the driver
+        # can determine the class from the weight key names (e.g. Qwen3.5 which
+        # has "linear_attn" vs "self_attn" in keys), use that directly — no
+        # model instantiation needed.  Fall back to the cache (meta-device model
+        # or driver.get_layer_classes) for architectures that don't implement it.
+        from safetensors import safe_open
+        try:
+            with safe_open(str(path), framework="pt") as f:
+                weight_keys = list(f.keys())
+            LayerClass = driver.get_layer_class_from_keys(weight_keys)
+        except Exception:
+            LayerClass = None
+
+        if LayerClass is None:
+            LayerClass = self._get_layer_class_for_idx(config, layer_idx)
 
         # Some custom layer constructors accept only (config) without layer_idx.
         try:

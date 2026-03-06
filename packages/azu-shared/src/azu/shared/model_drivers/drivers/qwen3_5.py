@@ -127,128 +127,42 @@ class Qwen35Driver(ModelDriver):
             "model.language_model.layers",  # Qwen3.5 primary path
         ] + super().layer_module_paths
 
-    def get_layer_classes(self, config) -> Optional[List[Type]]:
+    def get_layer_class_from_keys(self, weight_keys: List[str]) -> Optional[Type]:
         """
-        Resolve per-index layer classes without any model instantiation.
+        Determine the layer class directly from the safetensors weight key names.
 
-        Qwen3.5's fla-based GatedDeltaNet layers are incompatible with
-        init_empty_weights — their __init__ silently fails on meta device,
-        leaving an empty ModuleList.  This method sidesteps instantiation
-        entirely by reading from the module already loaded in sys.modules
-        by AutoConfig.from_pretrained(trust_remote_code=True).
+        Qwen3.5 layers are one of two types, distinguishable without any model
+        instantiation by the presence of a discriminating submodule name in the
+        weight keys:
 
-        Steps
-        -----
-        1. Look up the model class via config.auto_map in sys.modules.
-        2. Read _no_split_modules to get the set of distinct layer class names.
-        3. Homogeneous (1 class): return [cls] * num_hidden_layers.
-        4. Hybrid (multiple classes): find the per-layer pattern list in
-           config.text_config (fla encodes it as e.g. attn_mode of length
-           num_hidden_layers), then map each pattern token to a class by
-           keyword overlap with the class name.
+          "linear_attn"  →  GatedDeltaNet layer  (fla hybrid attention)
+          "self_attn"    →  standard attention layer
+
+        The modeling module is already in sys.modules because AutoModel.from_config
+        ran (even with empty layers) before this is called.
         """
-        n = getattr(config, 'num_hidden_layers', None)
-        if not n:
-            return None
+        has_linear_attn = any("linear_attn" in k for k in weight_keys)
+        has_self_attn = any("self_attn" in k for k in weight_keys)
 
-        # ── Step 1: get model class from already-loaded sys.modules ──────────
-        # AutoConfig.from_pretrained(trust_remote_code=True) imported the model
-        # module before we get here.  Transformers registers it under
-        # transformers_modules.<org>/<repo>/<filename> — auto_map only has the
-        # bare filename, so sys.modules.get(mod_path) always returns None.
-        # Match by suffix instead.
-        arch = config.architectures[0]
-        model_cls = None
+        if not has_linear_attn and not has_self_attn:
+            return None  # unrecognised — fall back
 
-        auto_map = getattr(config, 'auto_map', {}) or {}
-        for key in ('AutoModelForCausalLM', 'AutoModel', 'AutoModelForSeq2SeqLM'):
-            dotted = auto_map.get(key)
-            if not dotted:
+        # Find the modeling module: search sys.modules for the Qwen3.5 module.
+        target_cls_name = (
+            "Qwen3_5GatedDeltaNetDecoderLayer" if has_linear_attn
+            else "Qwen3_5AttentionDecoderLayer"
+        )
+        for mod in sys.modules.values():
+            if mod is None:
                 continue
             try:
-                mod_path, cls_name = dotted.rsplit('.', 1)
-                for sys_key, mod in list(sys.modules.items()):
-                    if mod is not None and sys_key.endswith(mod_path):
-                        candidate = getattr(mod, cls_name, None)
-                        if candidate is not None and isinstance(candidate, type):
-                            model_cls = candidate
-                            break
-            except (ValueError, AttributeError):
+                cls = getattr(mod, target_cls_name, None)
+                if cls is not None and isinstance(cls, type):
+                    return cls
+            except Exception:
                 continue
-            if model_cls is not None:
-                break
 
-        # Fallback: scan all loaded modules for the architecture class by name.
-        if model_cls is None:
-            for mod in list(sys.modules.values()):
-                try:
-                    candidate = getattr(mod, arch, None)
-                    if candidate is not None and isinstance(candidate, type):
-                        model_cls = candidate
-                        break
-                except Exception:
-                    continue
-
-        if model_cls is None:
-            return None
-
-        # ── Step 2: _no_split_modules → class objects ─────────────────────────
-        no_split: List[str] = getattr(model_cls, '_no_split_modules', None) or []
-        if not no_split:
-            return None
-
-        src_mod = sys.modules.get(model_cls.__module__)
-        cls_by_name: dict = {}
-        for name in no_split:
-            cls = getattr(src_mod, name, None) if src_mod else None
-            if cls is not None:
-                cls_by_name[name] = cls
-
-        if not cls_by_name:
-            return None
-
-        # ── Step 3: homogeneous model ─────────────────────────────────────────
-        if len(cls_by_name) == 1:
-            return [next(iter(cls_by_name.values()))] * n
-
-        # ── Step 4: hybrid model — match per-layer pattern from config ────────
-        # fla models encode the per-layer type sequence as a list-valued
-        # attribute of length num_hidden_layers in text_config.
-        pattern = None
-        for attr in ('attn_mode', 'attn_modes', 'layer_type', 'layer_types',
-                     'layer_mode', 'layer_modes', 'model_type_list'):
-            for cfg in (config, getattr(config, 'text_config', None)):
-                if cfg is None:
-                    continue
-                val = getattr(cfg, attr, None)
-                if isinstance(val, (list, tuple)) and len(val) == n:
-                    pattern = val
-                    break
-            if pattern is not None:
-                break
-
-        if pattern is None:
-            return None
-
-        # Map each distinct pattern value → best-matching class by keyword
-        # overlap.  e.g. "chunk_simple_gla" → GatedDeltaNet,
-        # "full_attn" → Qwen3_5AttentionDecoderLayer.
-        pattern_to_cls: dict = {}
-        for pval in set(pattern):
-            tokens = set(str(pval).lower().replace('_', ' ').split())
-            best: Optional[Type] = None
-            best_score = 0
-            for cls_name, cls in cls_by_name.items():
-                cls_lower = cls_name.lower()
-                score = sum(1 for t in tokens if len(t) > 3 and t in cls_lower)
-                if score > best_score:
-                    best_score = score
-                    best = cls
-            if best is None:
-                return None  # can't map this value; fall through to meta model
-            pattern_to_cls[pval] = best
-
-        return [pattern_to_cls[p] for p in pattern]
+        return None  # class not found — fall back
 
     # ── MoE ──────────────────────────────────────────────────────────────────
 

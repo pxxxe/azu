@@ -85,6 +85,23 @@ class ModelDriver:
         """
         return None
 
+    def get_layer_class_from_keys(self, weight_keys: List[str]) -> Optional[Type]:
+        """
+        Return the layer class for a single layer given its safetensors weight
+        keys, or None to fall back to the standard class resolution path.
+
+        This is the preferred override point for architectures (like Qwen3.5)
+        where layer type is directly readable from the weight key names —
+        e.g. presence of "linear_attn" vs "self_attn" in the keys.
+
+        Called by LayerLoader after the layer file is downloaded, before
+        instantiation. The keys come from safetensors metadata only (no
+        tensor data is loaded).
+
+        Default: None.
+        """
+        return None
+
     def reconcile_layer_weight_prefix(
         self, layer_prefix_base: str, weight_map: dict
     ) -> str:

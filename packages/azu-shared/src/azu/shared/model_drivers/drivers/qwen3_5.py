@@ -128,23 +128,27 @@ def _decoder_layer_classes_from_module(modeling_mod, arch: str) -> List[Tuple[st
         found = []
         for cls_name in model_cls._no_split_modules:
             cls = getattr(modeling_mod, cls_name, None)
+            if not (cls is not None and isinstance(cls, type) and issubclass(cls, nn.Module)):
+                # Class may be defined in a fla submodule not re-exported on modeling_mod.
+                for m in sys.modules.values():
+                    if m is None:
+                        continue
+                    try:
+                        candidate = getattr(m, cls_name, None)
+                        if candidate is not None and isinstance(candidate, type) and issubclass(candidate, nn.Module):
+                            cls = candidate
+                            break
+                    except Exception:
+                        continue
             if cls is not None and isinstance(cls, type) and issubclass(cls, nn.Module):
                 found.append((cls_name, cls))
         if found:
             return found
 
-    # Fallback: scan all names in the module for nn.Module subclasses that
-    # contain "Layer", "Block", or "Decoder" in their name.
-    results = []
-    for name in dir(modeling_mod):
-        if not any(tok in name for tok in ("Layer", "Block", "Decoder")):
-            continue
-        obj = getattr(modeling_mod, name, None)
-        if obj is None or not isinstance(obj, type):
-            continue
-        if issubclass(obj, nn.Module) and obj is not nn.Module:
-            results.append((name, obj))
-    return results
+    # No safe fallback — dir() scanning is too broad and picks up unrelated
+    # transformers classes (e.g. BertGenerationDecoder) that happen to be
+    # imported into the same namespace.
+    return []
 
 
 @register

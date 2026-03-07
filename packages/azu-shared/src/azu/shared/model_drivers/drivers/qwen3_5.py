@@ -86,6 +86,11 @@ _PROXY_ATTRS = [
     "n_routed_experts",
     "architectures",
     "layer_types",
+    "linear_conv_kernel_dim",
+    "linear_key_head_dim",
+    "linear_num_key_heads",
+    "linear_num_value_heads",
+    "linear_value_head_dim",
 ]
 
 # Name substrings (lowercased) used to classify a decoder-layer class as

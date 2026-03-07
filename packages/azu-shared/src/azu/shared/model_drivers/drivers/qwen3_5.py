@@ -85,6 +85,7 @@ _PROXY_ATTRS = [
     "num_experts_per_tok",
     "n_routed_experts",
     "architectures",
+    "layer_types",
 ]
 
 # Name substrings (lowercased) used to classify a decoder-layer class as

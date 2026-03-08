@@ -375,7 +375,7 @@ class Qwen35Driver(ModelDriver):
                 return (name, value)
             return None
 
-        kwargs: dict = {"hidden_states": hidden_states}
+        kwargs: dict = {}
 
         for pair in [
             _include("attention_mask", attention_mask),

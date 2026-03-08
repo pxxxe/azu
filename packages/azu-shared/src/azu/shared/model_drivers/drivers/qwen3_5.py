@@ -355,8 +355,16 @@ class Qwen35Driver(ModelDriver):
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
-    def init_rope(self, config, device: str, dtype) -> None:
-        return None
+    def init_rope(self, config, device: str, dtype):
+        try:
+            from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RotaryEmbedding
+            return Qwen3_5RotaryEmbedding(config=config, device=device).to(dtype)
+        except Exception:
+            try:
+                from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
+                return Qwen2RotaryEmbedding(config=config, device=device).to(dtype)
+            except Exception:
+                return None
 
     def build_forward_kwargs(
         self,
@@ -381,7 +389,7 @@ class Qwen35Driver(ModelDriver):
             _include("attention_mask", attention_mask),
             _include("position_ids", position_ids),
             _include("past_key_value", past_kv),
-            # position_embeddings intentionally omitted
+            _include("position_embeddings", position_embeddings),
             _include("use_cache", True),
         ]:
             if pair is not None:

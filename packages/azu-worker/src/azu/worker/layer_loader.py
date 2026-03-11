@@ -778,8 +778,24 @@ class LayerLoader:
         driver = get_driver(config)
 
         if driver.is_lm_head_tied(config):
-            self.loaded_cache[cache_key] = None
-            return None
+            # lm_head shares weights with embed_tokens — no separate lm_head.safetensors.
+            # Load from embeddings.safetensors and extract the embed_tokens weight.
+            path, url = self._get_paths(model_id, "embeddings.safetensors")
+            await self._download(url, path, model_id=model_id)
+            state_dict = await self._load_weights_safe(path)
+            embed_key = next((k for k in state_dict if "embed_tokens.weight" in k), None)
+            if embed_key is None:
+                raise RuntimeError(
+                    f"[{model_id}] tie_word_embeddings=True but no embed_tokens.weight "
+                    f"found in embeddings.safetensors"
+                )
+            weight = state_dict[embed_key].to(self.device).to(self.dtype)
+            vocab_size, hidden_size = weight.shape
+            head = torch.nn.Linear(hidden_size, vocab_size, bias=False).to(self.device).to(self.dtype)
+            head.weight = torch.nn.Parameter(weight)
+            head.eval()
+            self.loaded_cache[cache_key] = head
+            return head
 
         path, url = self._get_paths(model_id, "lm_head.safetensors")
         await self._download(url, path, model_id=model_id)

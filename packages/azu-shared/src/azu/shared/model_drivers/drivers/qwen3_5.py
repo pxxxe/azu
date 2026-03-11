@@ -72,6 +72,7 @@ _PROXY_ATTRS = [
     "num_key_value_heads",
     "max_position_embeddings",
     "rms_norm_eps",
+    "head_dim",
     "layer_norm_eps",
     "rope_theta",
     "rope_scaling",

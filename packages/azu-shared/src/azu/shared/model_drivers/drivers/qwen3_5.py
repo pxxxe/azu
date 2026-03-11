@@ -328,13 +328,30 @@ class Qwen35Driver(ModelDriver):
         backbone_weight_prefix: str,
     ) -> Optional[Tuple[Any, str]]:
         checkpoint_prefix = None
+        embed_prefix = None
+
         for wk in weight_map:
             if wk.endswith("lm_head.weight"):
                 checkpoint_prefix = wk[: -len(".weight")]
                 break
+            if wk.endswith("embed_tokens.weight"):
+                embed_prefix = wk[: -len(".weight")]
 
+        # tie_word_embeddings=True → lm_head.weight is omitted from the checkpoint.
+        # Fall back to the embed_tokens key so the loader uses those weights.
         if checkpoint_prefix is None:
-            return None
+            cfg = getattr(model, "config", None)
+            text_cfg = getattr(cfg, "text_config", cfg) if cfg else None
+            tied = (
+                getattr(text_cfg, "tie_word_embeddings", False)
+                or getattr(cfg, "tie_word_embeddings", False)
+            )
+            if tied and embed_prefix is not None:
+                checkpoint_prefix = embed_prefix
+                print(f"      🔧 [Qwen35] tie_word_embeddings: using embed_tokens weight "
+                      f"('{embed_prefix}') as lm_head checkpoint prefix")
+            else:
+                return None
 
         _vlm_paths = [
             "model.language_model.lm_head",

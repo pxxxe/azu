@@ -70,9 +70,9 @@ _PROXY_ATTRS = [
     "num_hidden_layers",
     "num_attention_heads",
     "num_key_value_heads",
+    "head_dim",
     "max_position_embeddings",
     "rms_norm_eps",
-    "head_dim",
     "layer_norm_eps",
     "rope_theta",
     "rope_scaling",
@@ -407,7 +407,10 @@ class Qwen35Driver(ModelDriver):
             _include("attention_mask", attention_mask),
             _include("position_ids", position_ids),
             _include("past_key_value", past_kv),
-            _include("position_embeddings", position_embeddings),
+            # position_embeddings intentionally omitted — Qwen3.5 computes RoPE
+            # internally per-layer and does not accept an external tensor.
+            # Passing it corrupts attention on full_attention layers that accept
+            # **kwargs, causing garbled output.
             _include("use_cache", True),
         ]:
             if pair is not None:

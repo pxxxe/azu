@@ -39,17 +39,27 @@ Key differences from standard transformers layout:
 
   RoPE
   ----
-  Qwen3.5 layers compute RoPE internally; they do not accept an external
-  position_embeddings tensor.  init_rope() returns None unconditionally
-  so ModelManager skips external RoPE construction entirely.
+  Qwen3.5 is a hybrid model with two distinct layer types:
+
+    • Qwen3_5DecoderLayer (full_attention) — requires position_embeddings
+      as a positional argument; RoPE is applied inside this layer using
+      the externally-built tensor.
+
+    • GatedDeltaNet (linear_attention) — does NOT accept position_embeddings;
+      has **kwargs in its forward signature so it silently swallows unknown
+      kwargs, corrupting output if position_embeddings is passed.
+
+  build_forward_kwargs() uses _include_explicit() for position_embeddings,
+  which only passes it when the parameter is literally declared in the
+  layer's forward signature — never via **kwargs catch-all.  This means:
+    - full_attention layers receive position_embeddings ✓
+    - linear_attention layers do not receive it ✓
 
   Forward kwargs
   --------------
-  Qwen3.5 layers accept standard kwargs (hidden_states, attention_mask,
-  position_ids, past_key_value, use_cache) but NOT position_embeddings.
-  build_forward_kwargs() omits position_embeddings regardless of what
-  layer introspection says to avoid silent failures on layers that accept
-  **kwargs.
+  All other kwargs (attention_mask, position_ids, past_key_value, use_cache)
+  use the normal _include() which respects **kwargs.  Only position_embeddings
+  uses _include_explicit() because passing it to GatedDeltaNet corrupts output.
 """
 
 from __future__ import annotations
@@ -128,15 +138,12 @@ def _decoder_layer_classes_from_module(modeling_mod, arch: str) -> List[Tuple[st
 
     Returns a list of (name, cls) pairs, may be empty.
     """
-    # Primary: _no_split_modules lists exactly the classes that should not be
-    # split across devices — these are the decoder-layer classes.
     model_cls = getattr(modeling_mod, arch, None)
     if model_cls is not None and hasattr(model_cls, "_no_split_modules"):
         found = []
         for cls_name in model_cls._no_split_modules:
             cls = getattr(modeling_mod, cls_name, None)
             if not (cls is not None and isinstance(cls, type) and issubclass(cls, nn.Module)):
-                # Class may be defined in a fla submodule not re-exported on modeling_mod.
                 for m in sys.modules.values():
                     if m is None:
                         continue
@@ -152,9 +159,6 @@ def _decoder_layer_classes_from_module(modeling_mod, arch: str) -> List[Tuple[st
         if found:
             return found
 
-    # No safe fallback — dir() scanning is too broad and picks up unrelated
-    # transformers classes (e.g. BertGenerationDecoder) that happen to be
-    # imported into the same namespace.
     return []
 
 
@@ -220,14 +224,12 @@ class Qwen35Driver(ModelDriver):
         num_layers = len(layer_types)
         arch = (getattr(config, "architectures", None) or [""])[0]
 
-        # ── Find the modeling module ──────────────────────────────────────
         modeling_mod = _find_modeling_module(arch)
         if modeling_mod is None:
             print(f"   ⚠️ [Qwen35Driver] get_layer_classes: "
                   f"could not find modeling module for {arch} in sys.modules")
             return None
 
-        # ── Collect candidate decoder-layer classes ───────────────────────
         candidates = _decoder_layer_classes_from_module(modeling_mod, arch)
 
         if not candidates:
@@ -235,14 +237,11 @@ class Qwen35Driver(ModelDriver):
                   f"no decoder-layer classes found in {getattr(modeling_mod, '__name__', repr(modeling_mod))!r}")
             return None
 
-        # ── Case 1: single unified decoder layer ──────────────────────────
         if len(candidates) == 1:
             cls = candidates[0][1]
             print(f"   ✅ [Qwen35Driver] unified decoder layer: {candidates[0][0]}")
             return [cls] * num_layers
 
-        # ── Case 2: multiple classes — map to linear_attention / full_attention
-        # Match by name heuristics.
         linear_cls: Optional[type] = None
         attn_cls: Optional[type] = None
 
@@ -264,8 +263,7 @@ class Qwen35Driver(ModelDriver):
                 for lt in layer_types
             ]
 
-        # Heuristics inconclusive — assign positionally by distinct layer_types.
-        distinct_types = list(dict.fromkeys(layer_types))  # ordered, deduplicated
+        distinct_types = list(dict.fromkeys(layer_types))
         if len(distinct_types) <= len(candidates):
             type_to_cls = {lt: candidates[i][1] for i, lt in enumerate(distinct_types)}
             print(
@@ -275,7 +273,6 @@ class Qwen35Driver(ModelDriver):
             )
             return [type_to_cls[lt] for lt in layer_types]
 
-        # Last resort: use the first candidate for all layers.
         cls = candidates[0][1]
         print(f"   ⚠️ [Qwen35Driver] using {candidates[0][0]} for all layers (fallback)")
         return [cls] * num_layers
@@ -337,8 +334,6 @@ class Qwen35Driver(ModelDriver):
             if wk.endswith("embed_tokens.weight"):
                 embed_prefix = wk[: -len(".weight")]
 
-        # tie_word_embeddings=True → lm_head.weight is omitted from the checkpoint.
-        # Fall back to the embed_tokens key so the loader uses those weights.
         if checkpoint_prefix is None:
             cfg = getattr(model, "config", None)
             text_cfg = getattr(cfg, "text_config", cfg) if cfg else None
@@ -397,7 +392,20 @@ class Qwen35Driver(ModelDriver):
         has_var = "_has_var_keyword" in layer_forward_params
 
         def _include(name, value):
+            """Include if explicitly declared OR if layer accepts **kwargs."""
             if has_var or name in layer_forward_params:
+                return (name, value)
+            return None
+
+        def _include_explicit(name, value):
+            """Include only if explicitly declared — never via **kwargs catch-all.
+
+            Used for position_embeddings: Qwen3_5DecoderLayer (full_attention)
+            declares it explicitly and requires it; GatedDeltaNet (linear_attention)
+            does not declare it but has **kwargs and would silently swallow it,
+            corrupting its output.
+            """
+            if name in layer_forward_params:
                 return (name, value)
             return None
 
@@ -407,10 +415,7 @@ class Qwen35Driver(ModelDriver):
             _include("attention_mask", attention_mask),
             _include("position_ids", position_ids),
             _include("past_key_value", past_kv),
-            # position_embeddings intentionally omitted — Qwen3.5 computes RoPE
-            # internally per-layer and does not accept an external tensor.
-            # Passing it corrupts attention on full_attention layers that accept
-            # **kwargs, causing garbled output.
+            _include_explicit("position_embeddings", position_embeddings),
             _include("use_cache", True),
         ]:
             if pair is not None:

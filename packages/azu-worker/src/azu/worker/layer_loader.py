@@ -783,7 +783,10 @@ class LayerLoader:
             path, url = self._get_paths(model_id, "embeddings.safetensors")
             await self._download(url, path, model_id=model_id)
             state_dict = await self._load_weights_safe(path)
-            embed_key = next((k for k in state_dict if "embed_tokens.weight" in k), None)
+            embed_key = next(
+                (k for k in state_dict if "embed_tokens.weight" in k or k == "weight"),
+                None
+            )
             if embed_key is None:
                 raise RuntimeError(
                     f"[{model_id}] tie_word_embeddings=True but no embed_tokens.weight "

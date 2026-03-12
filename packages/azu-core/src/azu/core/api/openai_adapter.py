@@ -52,6 +52,7 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     max_tokens: Optional[int] = 256
     temperature: Optional[float] = 1.0
+    top_p: Optional[float] = 1.0
     # Any extra fields are silently ignored — keeps compatibility wide.
     model_config = {"extra": "allow"}
 
@@ -75,6 +76,8 @@ async def _submit_job(
     model_id: str,
     prompt: str,
     est_tokens: int,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
 ) -> tuple[str, float]:
     """Validate balance, lock funds, push to job_queue. Returns (job_id, cost)."""
     MIN_BALANCE = 0.001
@@ -113,6 +116,8 @@ async def _submit_job(
         "tokens": est_tokens,
         "owner": user_pubkey,
         "cost": estimated_cost,
+        "temperature": temperature,
+        "top_p": top_p,
     }
     await r.rpush("job_queue", json.dumps(job))
     return job_id, estimated_cost
@@ -231,11 +236,22 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
     body = await request.json()
     req = ChatCompletionRequest(**body)
 
+    # Serialize messages as a JSON array and pass them raw to the job queue.
+    # The embed worker owns chat-template formatting — the API must not know
+    # anything about model-specific token formats.
     prompt = json.dumps([{"role": m.role, "content": m.content} for m in req.messages])
     est_tokens = req.max_tokens or 256
 
     r = await _get_redis()
-    job_id, _ = await _submit_job(r, user_pubkey, req.model, prompt, est_tokens)
+    job_id, _ = await _submit_job(
+        r,
+        user_pubkey,
+        req.model,
+        prompt,
+        est_tokens,
+        temperature=req.temperature if req.temperature is not None else 1.0,
+        top_p=req.top_p if req.top_p is not None else 1.0,
+    )
 
     result = await _poll_result(r, job_id)
 

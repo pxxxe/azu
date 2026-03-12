@@ -43,6 +43,8 @@ class JobState:
     topology: List[dict]
     max_tokens: int = 50
     auth_token: Optional[str] = None
+    temperature: float = 1.0
+    top_p: float = 1.0
 
 class MoEScheduler:
     def __init__(self, registry_url: str):
@@ -498,7 +500,16 @@ class MoEScheduler:
                     await r.rpush("job_queue", item[1])
                     continue
 
-                job = JobState(raw_job['id'], model_id, raw_job['input_prompt'], raw_job['owner'], plan, max_tokens=raw_job.get('tokens', 50))
+                job = JobState(
+                    raw_job['id'],
+                    model_id,
+                    raw_job['input_prompt'],
+                    raw_job['owner'],
+                    plan,
+                    max_tokens=raw_job.get('tokens', 50),
+                    temperature=raw_job.get('temperature', 1.0),
+                    top_p=raw_job.get('top_p', 1.0),
+                )
                 self.active_jobs[job_id] = job
                 await self._dispatch(job)
 
@@ -638,6 +649,8 @@ class MoEScheduler:
                     "is_first": role == 'embed',
                     "is_last": role == 'decode',
                     "max_tokens": job.max_tokens,
+                    "temperature": job.temperature,
+                    "top_p": job.top_p,
                     "first_node_endpoint": first_node_endpoint if role == 'decode' else None
                 })
                 await self._dispatch_control(w, payload)
@@ -881,39 +894,31 @@ async def register_worker_http(req: RegisterWorkerReq):
     """
     Register or update a worker endpoint record in the durable registry.
 
-    Persistent workers self-register via the WebSocket handshake; this
-    endpoint exists primarily for serverless workers registered at deploy
-    time by operators or CI pipelines.
-
-    Calling this for an existing worker_id is an idempotent upsert.
+    open here so the operator can layer their own access control on top.
     """
-    try:
-        wtype = WorkerType(req.worker_type)
-    except ValueError:
-        raise HTTPException(400, f"Invalid worker_type '{req.worker_type}'. Must be 'persistent' or 'serverless'.")
+    wtype = WorkerType.SERVERLESS if req.worker_type == "serverless" else WorkerType.PERSISTENT
 
     endpoint = WorkerEndpoint(
         worker_id       = req.worker_id,
         worker_type     = wtype,
         endpoint_url    = req.endpoint_url,
         vram_mb         = req.vram_mb,
-        capabilities    = req.capabilities or ["dense", "moe_router", "moe_expert"],
+        capabilities    = req.capabilities or ['dense', 'moe_router', 'moe_expert'],
         platform        = req.platform or "self_hosted",
         payment_address = req.payment_address,
         p2p_url         = req.p2p_url,
-        wake_url        = req.wake_url,  # NEW
+        wake_url        = req.wake_url,
     )
-
     await scheduler.worker_registry.register(endpoint)
 
-    # If a serverless worker is being registered, materialise it in the
-    # in-memory pool immediately so the planner can use it right away.
-    if wtype == WorkerType.SERVERLESS and req.worker_id not in scheduler.workers:
+    # Also upsert into the live in-memory pool so the scheduler can plan
+    # jobs for this worker immediately without waiting for a WebSocket.
+    if req.worker_id not in scheduler.workers:
         specs = {
             "pubkey":       req.worker_id,
             "vram_mb":      req.vram_mb,
-            "capabilities": endpoint.capabilities,
-            "platform":     endpoint.platform,
+            "capabilities": req.capabilities or ['dense', 'moe_router', 'moe_expert'],
+            "platform":     req.platform,
             "p2p_url":      req.p2p_url,
             "endpoint_url": req.endpoint_url,
             "worker_type":  "serverless",

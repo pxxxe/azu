@@ -601,6 +601,11 @@ class MoEWorker:
         max_tokens = msg.get('max_tokens', 50)
         first_node_endpoint = msg.get('first_node_endpoint')
 
+        # Sampling parameters — threaded through from the original API request.
+        # temperature=0 means greedy; anything above uses nucleus sampling.
+        temperature = msg.get('temperature', 1.0)
+        top_p = msg.get('top_p', 1.0)
+
         # Capture prompt into local scope immediately — before any await.
         # Multiple EXECUTE_DENSE tasks for the same job share the same msg dict;
         # reading msg['input'] after an await risks it already being cleared.
@@ -649,18 +654,17 @@ class MoEWorker:
                         print(f"   📝 Encoding Prompt...")
                         ctx.kv_cache = None   # model creates DynamicCache or HybridCache on first forward
 
-                        # ----------------------------------------------------------------
+                        # ------------------------------------------------------------------
                         # CHAT TEMPLATE FIX
                         #
                         # The API passes messages as a JSON array when the request came
-                        # through /v1/chat/completions.  The embed worker is the right
-                        # place to apply the model's chat template — the API must not
-                        # know anything about model-specific token formats.
+                        # through /v1/chat/completions.  Plain strings from /submit are
+                        # also wrapped here so every path gets a properly formatted prompt.
                         #
                         # If the input is a JSON array of {role, content} dicts, apply
                         # the tokenizer's built-in chat template (e.g. ChatML for Qwen).
-                        # Plain prompt strings (from /submit) pass through unchanged.
-                        # ----------------------------------------------------------------
+                        # If it's a plain string, wrap it as a single user turn first.
+                        # ------------------------------------------------------------------
                         input_text = initial_prompt
                         try:
                             parsed = json.loads(initial_prompt)
@@ -670,14 +674,28 @@ class MoEWorker:
                                 and isinstance(parsed[0], dict)
                                 and "role" in parsed[0]
                             ):
+                                # Already a messages array from /v1/chat/completions
                                 input_text = self.model_manager.tokenizer.apply_chat_template(
                                     parsed,
                                     tokenize=False,
                                     add_generation_prompt=True,
                                 )
-                                print(f"   💬 Applied chat template (first 120 chars): {input_text[:120]}")
-                        except (json.JSONDecodeError, KeyError, IndexError, TypeError):
-                            pass  # not a messages payload — treat as a raw prompt string
+                            else:
+                                # JSON but not a messages array — treat as plain string
+                                input_text = self.model_manager.tokenizer.apply_chat_template(
+                                    [{"role": "user", "content": initial_prompt}],
+                                    tokenize=False,
+                                    add_generation_prompt=True,
+                                )
+                        except (json.JSONDecodeError, TypeError):
+                            # Plain string from /submit — wrap as a user message
+                            input_text = self.model_manager.tokenizer.apply_chat_template(
+                                [{"role": "user", "content": initial_prompt}],
+                                tokenize=False,
+                                add_generation_prompt=True,
+                            )
+
+                        print(f"   💬 Formatted prompt (first 120 chars): {input_text[:120]}")
 
                         input_tensor = self.model_manager.tokenizer.encode(
                             input_text, return_tensors='pt'
@@ -741,7 +759,37 @@ class MoEWorker:
                             hidden_states = self.model_manager.final_norm(hidden_states)
                         logits = self.model_manager.lm_head(hidden_states)
 
-                    next_token = torch.argmax(logits[:, -1, :], dim=-1)
+                    # ------------------------------------------------------------------
+                    # SAMPLING FIX
+                    #
+                    # Old code used torch.argmax (pure greedy decoding).  Greedy
+                    # decoding causes small models to fall into repetition loops once
+                    # a repeated phrase gets assigned high probability.
+                    #
+                    # New code:
+                    #   temperature == 0  → greedy (argmax), good for structured output
+                    #   temperature  > 0  → top-p (nucleus) sampling, avoids loops
+                    #
+                    # temperature and top_p come from the original API request and are
+                    # threaded through the job payload and EXECUTE_DENSE message so
+                    # large and small models alike use whatever the caller requested.
+                    # ------------------------------------------------------------------
+                    if temperature < 0.01:
+                        # Greedy — deterministic, best for code / structured output
+                        next_token = torch.argmax(logits[:, -1, :], dim=-1)
+                    else:
+                        logits_last = logits[:, -1, :].float() / temperature
+                        probs = torch.nn.functional.softmax(logits_last, dim=-1)
+
+                        # Top-p (nucleus) filtering
+                        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+                        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                        # Remove tokens that push cumulative probability above top_p
+                        sorted_probs[cumulative_probs - sorted_probs > top_p] = 0.0
+                        sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
+                        sampled = torch.multinomial(sorted_probs, num_samples=1)
+                        next_token = sorted_idx.gather(-1, sampled).squeeze(-1)
+
                     token_id = next_token.item()
 
                     if not hasattr(ctx, 'generated_ids'):

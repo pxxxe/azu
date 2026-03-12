@@ -648,8 +648,39 @@ class MoEWorker:
                     if should_encode:
                         print(f"   📝 Encoding Prompt...")
                         ctx.kv_cache = None   # model creates DynamicCache or HybridCache on first forward
+
+                        # ----------------------------------------------------------------
+                        # CHAT TEMPLATE FIX
+                        #
+                        # The API passes messages as a JSON array when the request came
+                        # through /v1/chat/completions.  The embed worker is the right
+                        # place to apply the model's chat template — the API must not
+                        # know anything about model-specific token formats.
+                        #
+                        # If the input is a JSON array of {role, content} dicts, apply
+                        # the tokenizer's built-in chat template (e.g. ChatML for Qwen).
+                        # Plain prompt strings (from /submit) pass through unchanged.
+                        # ----------------------------------------------------------------
+                        input_text = initial_prompt
+                        try:
+                            parsed = json.loads(initial_prompt)
+                            if (
+                                isinstance(parsed, list)
+                                and parsed
+                                and isinstance(parsed[0], dict)
+                                and "role" in parsed[0]
+                            ):
+                                input_text = self.model_manager.tokenizer.apply_chat_template(
+                                    parsed,
+                                    tokenize=False,
+                                    add_generation_prompt=True,
+                                )
+                                print(f"   💬 Applied chat template (first 120 chars): {input_text[:120]}")
+                        except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                            pass  # not a messages payload — treat as a raw prompt string
+
                         input_tensor = self.model_manager.tokenizer.encode(
-                            initial_prompt, return_tensors='pt'
+                            input_text, return_tensors='pt'
                         ).to(self.device)
 
                         ctx.prompt_token_count = input_tensor.shape[1]

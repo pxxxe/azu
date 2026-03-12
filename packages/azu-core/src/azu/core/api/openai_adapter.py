@@ -69,25 +69,6 @@ async def _get_redis() -> redis.Redis:
     )
 
 
-def _messages_to_prompt(messages: list[ChatMessage]) -> str:
-    """
-    Collapse the message list into a single prompt string.
-
-    Uses the ChatML-ish format that most azu-supported models understand.
-    System message is prepended verbatim; then alternating Human/Assistant turns.
-    """
-    parts: list[str] = []
-    for m in messages:
-        if m.role == "system":
-            parts.append(f"<|system|>\n{m.content}")
-        elif m.role == "user":
-            parts.append(f"<|user|>\n{m.content}")
-        elif m.role == "assistant":
-            parts.append(f"<|assistant|>\n{m.content}")
-    parts.append("<|assistant|>")  # prime the model to respond
-    return "\n".join(parts)
-
-
 async def _submit_job(
     r: redis.Redis,
     user_pubkey: str,
@@ -250,7 +231,7 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
     body = await request.json()
     req = ChatCompletionRequest(**body)
 
-    prompt = _messages_to_prompt(req.messages)
+    prompt = json.dumps([{"role": m.role, "content": m.content} for m in req.messages])
     est_tokens = req.max_tokens or 256
 
     r = await _get_redis()

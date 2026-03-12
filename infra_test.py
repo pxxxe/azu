@@ -99,7 +99,7 @@ GPU_VRAM_MAP = {
 
 # TARGET_TOTAL_VRAM = 120  # GB needed for Mixtral test
 # TARGET_TOTAL_VRAM = 24  # GB needed for Mixtral test
-TARGET_TOTAL_VRAM = 24
+TARGET_TOTAL_VRAM = 10 # Qwen3.5-0.8B Test
 
 runpod.api_key = RUNPOD_API_KEY
 RUNPOD_REST_URL = "https://rest.runpod.io/v1"

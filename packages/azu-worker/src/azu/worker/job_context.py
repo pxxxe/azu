@@ -1,16 +1,11 @@
-"""
-Job context management module.
-Manages state for each inference job including queues, KV cache, and peer tracking.
-"""
-
 import asyncio
-from typing import Dict, Tuple, List, Optional, Set
+from typing import Any, Dict, Tuple, List, Optional, Set
 
 
 class JobContext:
     """
     Manages the state for a single inference job.
-    Tracks topology, peers, layer queues, expert queues, KV cache, and generation state.
+    Tracks topology, peers, layer queues, expert queues, model state, and generation state.
     """
 
     def __init__(self, job_id: str, topology: List[str] = None):
@@ -37,15 +32,16 @@ class JobContext:
         # Pending expert requests - futures waiting for expert results
         self.pending_expert_requests: Dict[Tuple[int, int], asyncio.Future] = {}
 
-        # KV / recurrent-state cache.
+        # Opaque per-job inference state managed entirely by the driver.
         #
-        # Intentionally initialised to None rather than DynamicCache().
-        # Forcing DynamicCache breaks hybrid architectures (e.g. Qwen3.5) whose
-        # DeltaNet recurrent layers require HybridCache.  Setting None lets the
-        # model create the correct cache type on its first forward pass; azu
-        # captures and stores whatever cache object comes back in the layer
-        # output tuple, so subsequent steps reuse the model-native cache type.
-        self.kv_cache = None
+        # Created via driver.init_job_state() on the first forward pass and
+        # passed back into driver.get_layer_cache(), driver.update_state(), and
+        # driver.advance_position() — workers never inspect it directly.
+        #
+        # Replaces the former single shared kv_cache which was incorrect for
+        # hybrid architectures (e.g. Qwen3.5) where different layers require
+        # incompatible cache types (DynamicCache vs recurrent state tensors).
+        self.model_state: Any = None
 
         # Generated token IDs for this job
         self.generated_ids: List[int] = []
@@ -91,7 +87,7 @@ class JobContext:
         self.layer_input_queues.clear()
         self.expert_input_queues.clear()
         self.pending_expert_requests.clear()
-        self.kv_cache = None          # see __init__ comment
+        self.model_state = None
         self.generated_ids.clear()
         self.done = False
         self.auth_token = None

@@ -617,6 +617,9 @@ class MoEWorker:
         ctx = await self._get_context(job_id, create=True)
         self.model_manager._print_vram_stats(f"Dense Start {layer_idx}", ctx)
 
+        # Obtain driver once — self.model_manager._driver is set by ensure_model.
+        _driver = self.model_manager._driver
+
         while not ctx.done:
             try:
                 # ==== First Node: Embedding ====
@@ -652,7 +655,10 @@ class MoEWorker:
 
                     if should_encode:
                         print(f"   📝 Encoding Prompt...")
-                        ctx.kv_cache = None   # model creates DynamicCache or HybridCache on first forward
+                        # Initialise per-job driver state.  Replaces the former
+                        # ctx.kv_cache = None; the driver allocates the correct
+                        # cache type(s) for this architecture on first forward.
+                        ctx.model_state = self.model_manager.init_job_state()
 
                         # ------------------------------------------------------------------
                         # CHAT TEMPLATE FIX
@@ -704,6 +710,11 @@ class MoEWorker:
                         ctx.prompt_token_count = input_tensor.shape[1]
                         print(f"   📊 Prompt tokens: {ctx.prompt_token_count}")
 
+                        # Advance position so that decode-step position_ids start
+                        # from prompt_token_count for recurrent layers whose cache
+                        # carries no sequence-length information.
+                        _driver.advance_position(ctx.model_state, ctx.prompt_token_count)
+
                     elif ctx.generated_ids:
                         try:
                             token_id = await asyncio.wait_for(ctx.token_queue.get(), timeout=300)
@@ -711,6 +722,10 @@ class MoEWorker:
                                 print(f"   🏁 [Job {job_id[:8]}] EOS signal received")
                                 ctx.done = True
                                 break
+                            # Advance position for each new decode token before the
+                            # layers process it so position_ids are correct for
+                            # recurrent layers (e.g. Qwen3.5 GatedDeltaNet).
+                            _driver.advance_position(ctx.model_state, 1)
                             input_tensor = torch.tensor([[token_id]], device=self.device)
                         except asyncio.TimeoutError:
                             if ctx.done:
@@ -881,29 +896,28 @@ class MoEWorker:
                     self.model_manager._print_vram_stats(f"Loaded Dense {layer_idx}", ctx)
 
                     pos_emb, attn_mask, pos_ids = self.model_manager.prepare_inputs(
-                        hidden_states, ctx.kv_cache, layer_idx
+                        hidden_states, ctx.model_state, layer_idx
                     )
 
                     with torch.no_grad():
-                        _driver = get_driver(await self.loader._load_config_with_driver(model_id))
                         _fwd_params = self.model_manager._get_layer_forward_params(dense_layer)
-                        _call_kw = _driver.build_forward_kwargs(
-                            _fwd_params,
+                        _call_kw = self.model_manager.build_forward_kwargs(
+                            dense_layer,
                             hidden_states,
                             pos_emb,
                             attn_mask,
                             pos_ids,
-                            ctx.kv_cache,
+                            ctx.model_state,
                             layer_idx,
                         )
                         layer_out = dense_layer(hidden_states, **_call_kw)
 
-                    if isinstance(layer_out, tuple):
-                        hidden_states = layer_out[0]
-                        if len(layer_out) > 1 and layer_out[1] is not None:
-                            ctx.kv_cache = layer_out[1]
-                    else:
-                        hidden_states = layer_out
+                    # Extract hidden states and persist the new per-layer cache.
+                    # Replaces the former tuple-unpacking + assignment to a single
+                    # shared ctx.kv_cache, which broke hybrid architectures by
+                    # mixing incompatible cache types across layers.
+                    hidden_states = _driver.extract_hidden(layer_out)
+                    _driver.update_state(ctx.model_state, layer_idx, layer_out)
 
                     if next_hop:
                         await self.p2p_server.send_tensor(next_hop, {
@@ -932,6 +946,9 @@ class MoEWorker:
         ctx = await self._get_context(job_id, create=True)
         self.model_manager._print_vram_stats(f"Router Start {layer_idx}", ctx)
 
+        # Obtain driver once — set by ensure_model.
+        _driver = self.model_manager._driver
+
         while not ctx.done:
             try:
                 queue = ctx.get_layer_input_queue(layer_idx)
@@ -950,7 +967,7 @@ class MoEWorker:
                 self.model_manager._print_vram_stats(f"Loaded Shared {layer_idx}", ctx)
 
                 pos_emb, attn_mask, pos_ids = self.model_manager.prepare_inputs(
-                    hidden_states, ctx.kv_cache, layer_idx
+                    hidden_states, ctx.model_state, layer_idx
                 )
 
                 residual = hidden_states
@@ -963,10 +980,12 @@ class MoEWorker:
                         position_embeddings=pos_emb,
                         attention_mask=attn_mask,
                         position_ids=pos_ids,
-                        past_key_values=ctx.kv_cache,
+                        past_key_values=_driver.get_layer_cache(ctx.model_state, layer_idx),
                         use_cache=True
                     )
                     hidden_states = attn_out
+                    # Persist the updated attention cache for this MoE layer.
+                    _driver.update_state(ctx.model_state, layer_idx, (attn_out, new_kv))
 
                 hidden_states = residual + hidden_states
                 post_attn_residual = hidden_states

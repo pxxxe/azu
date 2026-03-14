@@ -16,6 +16,7 @@ from transformers import AutoTokenizer, AutoConfig
 from azu.worker.layer_loader import LayerLoader
 from azu.worker.config import LAYER_CACHE_DIR
 from azu.shared.model_drivers import get_driver, ModelDriver
+from azu.shared.model_drivers.base import JobState
 
 
 class ModelManager:
@@ -260,20 +261,68 @@ class ModelManager:
 
         return 0
 
-    def prepare_inputs(self, hidden_states: torch.Tensor, past_kv: Any, layer_idx: int = 0) -> tuple:
+    def init_job_state(self) -> JobState:
+        """
+        Create a fresh JobState for one inference job via the active driver.
+
+        Called once per job at the start of the first forward pass (prompt
+        encoding).  The returned JobState is stored on JobContext and passed
+        into every subsequent prepare_inputs / build_forward_kwargs call for
+        the lifetime of the job.
+        """
+        if self._driver is not None and self.config is not None:
+            return self._driver.init_job_state(self.config)
+        return JobState()
+
+    def prepare_inputs(self, hidden_states: torch.Tensor, state: JobState, layer_idx: int = 0) -> tuple:
         """
         Prepare inputs for transformer layer: position embeddings, attention mask, position IDs.
 
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden]
-            past_kv: Past key/value cache (may be None on the first forward pass)
-            layer_idx: Index of the layer being processed, used to get correct per-layer past length
+            state:         JobState for this job (driver-owned, per-layer caches + seq_position)
+            layer_idx:     Index of the layer being processed
 
         Returns:
             Tuple of (position_embeddings, attention_mask, position_ids)
         """
         seq_len = hidden_states.shape[1]
-        past_len = self._get_past_len(past_kv, layer_idx)
+
+        # Retrieve the per-layer cache for this specific layer.
+        # For standard attention layers this is a DynamicCache whose
+        # get_seq_length(layer_idx) gives the exact past length.
+        # For recurrent / linear-attention layers it is an opaque state tensor
+        # with no length API — handled by the fallbacks below.
+        layer_cache = (
+            self._driver.get_layer_cache(state, layer_idx)
+            if self._driver is not None
+            else state.layer_caches.get(layer_idx)
+        )
+        past_len = self._get_past_len(layer_cache, layer_idx)
+
+        if past_len == 0 and seq_len == 1:
+            # Decode step on a layer whose cache carries no length information
+            # (recurrent / linear-attention layers, e.g. Qwen3.5 GatedDeltaNet).
+            #
+            # Fallback 1: explicit position tracker maintained by the embed worker.
+            #   Correct on the embed worker and on single-worker deployments.
+            if state.seq_position > 0:
+                past_len = state.seq_position
+
+            else:
+                # Fallback 2: infer from any DynamicCache that IS present in
+                #   state for co-located full-attention layers on this worker.
+                #   Covers middle/decode workers in multi-worker deployments
+                #   where advance_position() is never called.
+                for cached_layer_idx, cached_val in state.layer_caches.items():
+                    if hasattr(cached_val, 'get_seq_length'):
+                        try:
+                            inferred = cached_val.get_seq_length(cached_layer_idx)
+                            if inferred > 0:
+                                past_len = inferred
+                                break
+                        except Exception:
+                            pass
 
         position_ids = torch.arange(
             past_len, past_len + seq_len, dtype=torch.long, device=self.device
@@ -355,20 +404,29 @@ class ModelManager:
         position_embeddings,
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
-        past_kv: Any,
+        state: JobState,
         layer_idx: int,
     ) -> dict:
         """
         Build the kwargs dict for layer.forward() by delegating to the active driver.
 
-        The driver knows which kwargs each architecture's layers accept, preventing
-        TypeError on layers that don't take every standard arg (e.g. Qwen3.5 layers
-        that compute RoPE internally and have no use for position_embeddings).
+        Extracts the per-layer cache from state before calling the driver so
+        that driver.build_forward_kwargs() receives the concrete cache object
+        (DynamicCache, recurrent state tensor, or None) rather than the opaque
+        JobState.  This keeps the driver interface model-agnostic with respect
+        to the state container.
 
         Falls back to signature introspection via _get_layer_forward_params if
         _driver is somehow None.
         """
         layer_forward_params = self._get_layer_forward_params(layer)
+
+        # Extract the per-layer cache for this specific layer.
+        layer_cache = (
+            self._driver.get_layer_cache(state, layer_idx)
+            if self._driver is not None
+            else state.layer_caches.get(layer_idx)
+        )
 
         if self._driver is not None:
             return self._driver.build_forward_kwargs(
@@ -377,7 +435,7 @@ class ModelManager:
                 position_embeddings,
                 attention_mask,
                 position_ids,
-                past_kv,
+                layer_cache,
                 layer_idx,
             )
 
@@ -389,7 +447,7 @@ class ModelManager:
             position_embeddings,
             attention_mask,
             position_ids,
-            past_kv,
+            layer_cache,
             layer_idx,
         )
 
@@ -409,15 +467,16 @@ class ModelManager:
             allocated_gb = torch.cuda.memory_allocated() / (1024**3)
             reserved_gb = torch.cuda.memory_reserved() / (1024**3)
 
-            # KV Cache Size
+            # KV Cache Size — iterate over all per-layer caches in model_state
             kv_mb = 0.0
-            if ctx and hasattr(ctx, 'kv_cache') and ctx.kv_cache is not None:
+            if ctx and hasattr(ctx, 'model_state') and ctx.model_state is not None:
                 try:
-                    if hasattr(ctx.kv_cache, 'key_cache') and hasattr(ctx.kv_cache, 'value_cache'):
-                        for t_list in ctx.kv_cache.key_cache + ctx.kv_cache.value_cache:
-                            if torch.is_tensor(t_list):
-                                kv_mb += (t_list.element_size() * t_list.nelement()) / (1024**2)
-                except:
+                    for cached_val in ctx.model_state.layer_caches.values():
+                        if hasattr(cached_val, 'key_cache') and hasattr(cached_val, 'value_cache'):
+                            for t_list in cached_val.key_cache + cached_val.value_cache:
+                                if torch.is_tensor(t_list):
+                                    kv_mb += (t_list.element_size() * t_list.nelement()) / (1024**2)
+                except Exception:
                     pass
 
             print(f"   📊 [{tag}] Used: {used_gb:.2f}GB (Alloc: {allocated_gb:.2f}GB | Res: {reserved_gb:.2f}GB) | Free: {free_gb:.2f}GB | KV: {kv_mb:.1f}MB")

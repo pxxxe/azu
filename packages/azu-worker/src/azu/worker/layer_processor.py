@@ -14,8 +14,7 @@ from azu.worker.config import P2P_TIMEOUT
 from azu.worker.job_context import JobContext
 from azu.worker.model_manager import ModelManager
 from azu.worker.layer_loader import LayerLoader
-from transformers import DynamicCache
-
+from azu.shared.model_drivers.base import JobState
 
 
 class DenseLayerProcessor:
@@ -56,6 +55,8 @@ class DenseLayerProcessor:
         await self.model_manager.ensure_model(model_id)
         self.model_manager._print_vram_stats(f"Dense Start {layer_idx}", job_context)
 
+        _driver = self.model_manager._driver
+
         while not job_context.done:
             try:
                 # --- JIT Embedding ---
@@ -70,11 +71,12 @@ class DenseLayerProcessor:
 
                     if not job_context.generated_ids and msg.get('input'):
                         print(f"   📝 Encoding Prompt...")
-                        job_context.kv_cache = DynamicCache()
+                        job_context.model_state = self.model_manager.init_job_state()
                         input_tensor = self.model_manager.tokenizer.encode(
                             msg['input'], return_tensors='pt'
                         ).to(self.device)
                         msg['input'] = None
+                        _driver.advance_position(job_context.model_state, input_tensor.shape[1])
                     else:
                         # Feedback Token (Loop)
                         try:
@@ -82,6 +84,7 @@ class DenseLayerProcessor:
                                 job_context.token_queue.get(),
                                 timeout=P2P_TIMEOUT
                             )
+                            _driver.advance_position(job_context.model_state, 1)
                             input_tensor = torch.tensor([[token_id]], device=self.device)
                         except asyncio.TimeoutError:
                             if job_context.done:
@@ -117,7 +120,7 @@ class DenseLayerProcessor:
 
                     # Prepare positional args
                     pos_emb, attn_mask, pos_ids = self.model_manager.prepare_inputs(
-                        hidden_states, job_context.kv_cache, layer_idx
+                        hidden_states, job_context.model_state, layer_idx
                     )
 
                     layer = self.model_manager.dense_layers[layer_idx]
@@ -131,17 +134,15 @@ class DenseLayerProcessor:
                         pos_emb,
                         attn_mask,
                         pos_ids,
-                        job_context.kv_cache,
+                        job_context.model_state,
                         layer_idx,
                     )
 
                     with torch.no_grad():
-                        out = layer(**kwargs)
+                        raw_out = layer(**kwargs)
 
-                        if isinstance(out, tuple):
-                            layer_out = out[0]
-                        else:
-                            layer_out = out
+                    layer_out = _driver.extract_hidden(raw_out)
+                    _driver.update_state(job_context.model_state, layer_idx, raw_out)
 
                     self.model_manager._print_vram_stats(f"Dense Inf {layer_idx}", job_context)
 
@@ -244,6 +245,8 @@ class MoERouterProcessor:
         await self.model_manager.ensure_model(model_id)
         self.model_manager._print_vram_stats(f"Router Start {layer_idx}", job_context)
 
+        _driver = self.model_manager._driver
+
         while not job_context.done:
             try:
                 queue = job_context.get_layer_input_queue(layer_idx)
@@ -265,7 +268,7 @@ class MoERouterProcessor:
 
                 # Prepare positional args
                 pos_emb, attn_mask, pos_ids = self.model_manager.prepare_inputs(
-                    hidden_states, job_context.kv_cache, layer_idx
+                    hidden_states, job_context.model_state, layer_idx
                 )
 
                 # A. Input Residual & Norm
@@ -281,11 +284,12 @@ class MoERouterProcessor:
                         pos_emb,
                         attn_mask,
                         pos_ids,
-                        job_context.kv_cache,
+                        job_context.model_state,
                         layer_idx,
                     )
                     attn_out = shared_layer.self_attn(**attn_kwargs)
                     hidden_states = attn_out[0] if isinstance(attn_out, tuple) else attn_out
+                    _driver.update_state(job_context.model_state, layer_idx, attn_out)
 
                 # C. First Residual Connection
                 hidden_states = residual + hidden_states
@@ -332,7 +336,6 @@ class MoERouterProcessor:
                     local_pending[expert_idx] = future
                     job_context.pending_expert_requests[(layer_idx, expert_idx)] = future
 
-                    # Dispatch to experts in PARALLEL
                     send_tasks.append(asyncio.create_task(
                         send_p2p_fn(f"{target_url}/tensor_in", {
                             "job_id": job_id,

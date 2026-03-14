@@ -7,10 +7,36 @@ The core (LayerStore, LayerLoader, ModelManager) stays model-agnostic.
 
 from __future__ import annotations
 
-from typing import Optional, List, Tuple, Any, Type, TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import Optional, List, Tuple, Any, Type, Dict, TYPE_CHECKING
 
 if TYPE_CHECKING:
     import torch
+
+
+@dataclass
+class JobState:
+    """
+    Opaque per-job inference state managed entirely by the driver.
+
+    Workers create one instance via driver.init_job_state() at the start of
+    each job and pass it back into every driver call — they never inspect or
+    mutate it directly.
+
+    layer_caches  — maps layer_idx → the cache object returned by that layer's
+                    last forward pass.  For standard transformers this is a
+                    DynamicCache; for recurrent / linear-attention layers it is
+                    whatever recurrent state tensor the layer returns.  Stored
+                    per-layer so that mixed-architecture models (e.g. Qwen3.5)
+                    never share state between incompatible layer types.
+
+    seq_position  — number of tokens that have completed a full forward pass
+                    through the pipeline so far.  Set explicitly on the embed
+                    worker; used as a positional fallback for recurrent layers
+                    whose state carries no sequence-length information.
+    """
+    layer_caches: Dict[int, Any] = field(default_factory=dict)
+    seq_position: int = 0
 
 
 class ModelDriver:
@@ -258,7 +284,81 @@ class ModelDriver:
         """Attribute name of the final norm on the backbone module."""
         return "norm"
 
-    # ── Inference ─────────────────────────────────────────────────────────────
+    # ── Inference — job state lifecycle ───────────────────────────────────────
+
+    def init_job_state(self, config) -> JobState:
+        """
+        Create and return a fresh JobState for one inference job.
+
+        Called once per job on the worker that handles the first layer.
+        The returned object is stored on JobContext and passed back into
+        every subsequent driver call for that job.
+
+        Default: returns a JobState with empty per-layer caches and
+        seq_position=0.  Override to pre-populate architecture-specific
+        fields (e.g. pre-allocated recurrent state buffers).
+        """
+        return JobState()
+
+    def get_layer_cache(self, state: JobState, layer_idx: int) -> Any:
+        """
+        Return the cached state for a specific layer from the job state.
+
+        Workers call this to retrieve the correct past_key_value / recurrent
+        state to pass into a layer's forward().  Because state is per-layer,
+        hybrid architectures (e.g. Qwen3.5) never accidentally pass a
+        DynamicCache to a recurrent layer or vice-versa.
+
+        Default: simple dict lookup; returns None if the layer has never run.
+        """
+        return state.layer_caches.get(layer_idx)
+
+    def update_state(self, state: JobState, layer_idx: int, layer_output: Any) -> None:
+        """
+        Extract the new cache from a layer's output and store it in state.
+
+        Called by the worker immediately after every layer.forward() call.
+        Replaces direct assignment to a shared ctx.kv_cache.
+
+        Default: if layer_output is a tuple, stores element [1] (the new
+        cache) under layer_idx.  Element [0] is the hidden states and is
+        extracted separately via extract_hidden().  No-op if output is a
+        plain tensor (layer returned no cache).
+        """
+        if isinstance(layer_output, tuple) and len(layer_output) > 1:
+            new_cache = layer_output[1]
+            if new_cache is not None:
+                state.layer_caches[layer_idx] = new_cache
+
+    def extract_hidden(self, layer_output: Any) -> "torch.Tensor":
+        """
+        Extract the hidden-states tensor from a layer's output.
+
+        Layer forward() may return a plain tensor or a tuple
+        (hidden_states, cache, ...).  This method normalises both cases
+        so the worker never needs to know the output format.
+
+        Default: returns element [0] for tuples, the value itself otherwise.
+        """
+        if isinstance(layer_output, tuple):
+            return layer_output[0]
+        return layer_output
+
+    def advance_position(self, state: JobState, n: int) -> None:
+        """
+        Advance the explicit sequence-position counter by n tokens.
+
+        Called on the embed worker:
+          • after encoding the prompt          (n = prompt_token_count)
+          • before embedding each feedback token (n = 1)
+
+        seq_position is used as a positional fallback in prepare_inputs()
+        for recurrent / linear-attention layers whose cached state carries
+        no sequence-length information (unlike DynamicCache).
+        """
+        state.seq_position += n
+
+    # ── Inference — forward kwargs ────────────────────────────────────────────
 
     def init_rope(self, config, device: str, dtype) -> Optional["torch.nn.Module"]:
         """
@@ -297,6 +397,9 @@ class ModelDriver:
 
         Override to hard-code the exact kwargs for a known architecture
         instead of relying on signature introspection.
+
+        Note: past_kv here is the per-layer cache already extracted from
+        JobState by ModelManager.build_forward_kwargs — not the raw JobState.
         """
         has_var = "_has_var_keyword" in layer_forward_params
 
